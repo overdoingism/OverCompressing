@@ -1124,6 +1124,40 @@ la.rename_no_replace = _rival"""
            "" if ok else f"{before} -> {after} {out2[-200:]} {out3[-200:]}")
 
 
+def check_selected_files():
+    """pack --file and restore --file (used by the window for single files), and a source folder and archive that
+    hold one another."""
+    print("selected files")
+    root = os.path.join(scratch, "selected")
+    shutil.rmtree(root, ignore_errors=True)
+    files = {"a.txt": b"A", "sub/b.txt": b"B", "c.bin": b"C" * 3000}
+    src = make_folder(os.path.join(root, "src"), files)
+    os.makedirs(os.path.join(root, "elsewhere"))
+    link_dir(os.path.join(src, "folder-link"), os.path.join(root, "elsewhere"))  # would stop a pack of the whole folder
+    archive = os.path.join(root, "archive")
+    code, out = pack(src, archive, "t/S", "--file", "a.txt", "--file", os.path.join("sub", "b.txt"))
+    stored = sorted(e["path"] for e in la.load_manifest(archive, "t/S")["files"]) if code == 0 else []
+    ok = code == 0 and stored == ["a.txt", "sub/b.txt"]
+    expect("pack --file stores just the files named (a folder link elsewhere does not matter)", ok,
+           "" if ok else out[-300:] if code else str(stored))
+    for argv, words in ((("--file", "missing.txt"), "cannot be read"), (("--file", "../a.txt"), "unsafe file path"),
+                        (("--file", "a.txt", "--exclude", "*.bin"), "not both")):
+        code, out = pack(src, archive, "t/S2", *argv)
+        ok = code != 0 and words in out and "Traceback" not in out
+        expect(f"pack {' '.join(argv)}: refused", ok, "" if ok else out[-200:])
+    dest = os.path.join(root, "dest")
+    code, out = tool("restore", archive, "t/S", dest, "--file", "sub/b.txt")
+    ok = code == 0 and same_tree(dest, {"sub/b.txt": b"B"})
+    expect("restore --file writes just that file", ok, "" if ok else out[-200:])
+    code, out = tool("restore", archive, "t/S", dest, "--file", "c.bin")
+    ok = code != 0 and "has no file" in out
+    expect("restore --file of a file the model does not have: refused", ok, "" if ok else out[-200:])
+    for what, folder in (("holding the archive", root), ("inside the archive", os.path.join(archive, "t__S"))):
+        code, out = pack(folder, archive, "t/X")
+        ok = code != 0 and "in one another" in out
+        expect(f"pack of a folder {what}: refused", ok, "" if ok else out[-200:])
+
+
 def bf16_reference(value):
     """BF16 bits of a float32 value by round-to-nearest-even, worked out from the two neighbouring BF16 values with
     exact float arithmetic instead of bit tricks: an independent check of convert_bits."""
@@ -1288,6 +1322,7 @@ def main():
     check_safety()
     check_accidents()
     check_hardening()
+    check_selected_files()
 
     print("ALL PASSED" if not failures else f"{failures} FAILURE(S)")
     sys.exit(1 if failures else 0)

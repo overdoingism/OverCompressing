@@ -26,6 +26,10 @@ sh _kit/install_linux.sh
 ~/overcompressing-venv/bin/python -I _kit/tools/llm_archive.py restore <archive_root> Qwen/Qwen2.5-0.5B-Instruct <dest_dir>
 ```
 
+Or open a window to look through the archive and extract models or single files: `<venv>\Scripts\pythonw.exe -I
+_kit\tools\llm_archive_gui.py` on Windows, `~/overcompressing-venv/bin/python -I _kit/tools/llm_archive_gui.py` on
+Linux (the install scripts print both commands).
+
 `restore` writes byte-identical files and checks each against the manifest's SHA-256. Files can depend on other
 repos in the archive: a delta (`delta_base` / `delta_files` in the manifest) needs its base model's files, and a file
 identical to one archived elsewhere (`"method": "same"`) is restored from that copy. **Do not delete a repo
@@ -50,6 +54,7 @@ weight file if the system temp folder is small. `OC_WORKERS` limits the CPU core
 | `wheels/win_amd64/` | Windows wheels (numpy, zstandard) |
 | `wheels/linux_x86_64/` | Linux wheels (numpy, zstandard) |
 | `tools/llm_archive.py` | the archiver: pack / verify / restore |
+| `tools/llm_archive_gui.py` | a small window for it (Tkinter, part of the bundled Python): pack, verify, extract |
 | `tools/ARCHIVE_FORMAT.md` | on-disk format; enough to restore by hand if the tool itself is unusable |
 | `tools/test_ans16.py` | self-test of the ans16 delta decoder: `python -I tools/test_ans16.py` (prints ALL PASSED) |
 | `tools/test_formats.py` | self-test of the safetensors/GGUF/other-file containers: `python -I tools/test_formats.py <scratch_dir>` |

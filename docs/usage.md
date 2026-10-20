@@ -3,7 +3,7 @@
 **English** · [中文](#使用方式)
 
 Everything goes through one script, `tools/llm_archive.py`, with four commands: `pack`, `rebase`, `verify`,
-`restore`. It never downloads anything: get the model files however you like (Hugging Face, ModelScope, git, a
+`restore` (or, for pack, verify and restore, a small window: see below). It never downloads anything: get the model files however you like (Hugging Face, ModelScope, git, a
 mirror, a USB drive), then pack the folder. Run it with the Python environment from the offline kit or from a
 development setup ([Windows](build-windows.md) / [Linux](build-linux.md)). Below, `python` means that environment's
 interpreter; `-I` (isolated mode) keeps it from importing stray files from the current folder.
@@ -21,6 +21,22 @@ Pack the models, verify everything, restore when needed. Each file is stored as 
 that compresses it best (here the Instruct model picks Qwen2.5-7B by itself), so pack bases before the models
 derived from them. If a base arrives later, `rebase` re-chooses the bases afterwards (section 3).
 
+## A window instead of commands
+
+```bash
+python -I tools/llm_archive_gui.py [<archive_root>]
+```
+
+(On Windows, `pythonw` instead of `python` opens it without a console window.) Open or create an archive folder, then:
+**Pack a folder…** or **Pack files…** (some files of one folder, which then make up the model; one file is named after
+itself by default), **Extract…** the models or files selected in the list (each model goes into a folder named after
+it, e.g. `<dest>/Qwen/Qwen2.5-7B`; files with other contents already there are replaced only after you agree), and
+**Verify** the selection or the whole archive. The list shows every model and file with its size, stored size and how
+it is stored. Each action runs `llm_archive.py` exactly as below and shows its output; **Cancel** stops it as Ctrl+C
+would, so nothing half-done stays in the archive. Delta bases are always chosen automatically; `--base`, `rebase`
+and the other options are on the command line only. The window is in Chinese where the system is, else in English
+(`OC_LANG=zh` or `OC_LANG=en` picks one). Run from an offline kit, it opens the kit's archive.
+
 ## 1. `pack` — compress a folder into the archive
 
 ```bash
@@ -30,13 +46,15 @@ python -I tools/llm_archive.py pack <source_dir> <archive_root> [--name NAME] [-
 Every file under `<source_dir>` is hashed (SHA-256), parsed (safetensors, GGUF, other), compressed per tensor and
 written to `<archive_root>/<NAME>/` (a `/` in the name becomes `__`). Each file is then decoded back from disk and
 checked against its SHA-256 before the next one starts. A `manifest.json` is written at the end. `.git/` and
-`.cache/` folders (bookkeeping of git and download tools) are always skipped.
+`.cache/` folders (bookkeeping of git and download tools) are always skipped. The folder and the archive must not be
+inside one another.
 
 | option | meaning |
 |---|---|
 | `--name NAME` | name of the model in the archive, e.g. `Qwen/Qwen2.5-7B` (default: the folder name); `--base`, `verify` and `restore` use it. Parts separated by `/`, made of letters, digits, `-_.+@()[]` and spaces; no part may be empty, start or end with a space or end with a dot; not a Windows device name (`CON`, `NUL`, …) or `_kit` |
 | `--revision TEXT` | free-text note stored in the manifest, e.g. the upstream commit you downloaded |
 | `--exclude GLOB` | skip files whose path or name matches (repeatable), e.g. `--exclude "*.bin"` |
+| `--file PATH` | pack only this file of `<source_dir>`, a path relative to it (repeatable): the model then holds just the files named; not with `--exclude` |
 | `--base NAME` | use this archived model as the base of every file instead of choosing one per file |
 | `--no-base` | store every file without a delta base |
 | `--delta-codec ans16\|xor` | for 16-bit float tensors: ans16 (default, smaller) or the XOR with the base in byte planes (faster) |
@@ -192,11 +210,13 @@ to time on cold storage.
 ## 5. `restore`
 
 ```bash
-python -I tools/llm_archive.py restore <archive_root> <name> <dest_dir> [--overwrite] [--no-lock]
+python -I tools/llm_archive.py restore <archive_root> <name> <dest_dir> [--overwrite] [--file PATH ...] [--no-lock]
 ```
 
 Writes the original files, byte-identical, and checks each SHA-256. Deltas need their base models in the same archive
-root; ans16 deltas first restore the base files they read into `OC_TMP`.
+root; ans16 deltas first restore the base files they read into `OC_TMP`. `--file PATH` (repeatable) restores only
+those files, named by their paths in the archive (as `verify` lists them after `<name>:`); each lands where a full
+restore would put it.
 
 Before writing anything, every path in the manifest is checked: it must be relative, without `..`, and land inside
 `<dest_dir>`; restore never writes through a link, so if a folder on the way below `<dest_dir>` is a symlink or a
@@ -287,6 +307,7 @@ none is found) and print the exact `restore` / `verify` commands to use. Details
 | `… is a link or not a folder: not followed` | a folder in the archive or the destination is a symlink or junction: replace it with a real folder (or restore elsewhere) |
 | `a file of that name appeared in the destination while restoring` | another program wrote there: run restore again, or add `--overwrite` |
 | `cannot put … in place … without the risk of replacing a file` | the file system has no hard links and no rename that refuses an existing name: restore into an empty folder with `--overwrite`; keep the archive itself on another file system |
+| `… and the archive … are in one another` (pack) | pack a folder outside the archive, into an archive outside that folder |
 | `the archive is in use …` or `… is being changed …` | another `pack`, `rebase`, `verify` or `restore` runs on the archive: run this when it has finished |
 | `… is a link to a folder`, `… is not a regular file`, `… cannot be read` (pack) | skip it with `--exclude`, or pack the link's target as a folder of its own |
 
@@ -296,7 +317,8 @@ none is found) and print the exact `restore` / `verify` commands to use. Details
 
 [English](#usage) · **中文**
 
-所有功能都在 `tools/llm_archive.py` 這支程式裡，共四個指令：`pack`、`rebase`、`verify`、`restore`。本工具不會下載任何東西：
+所有功能都在 `tools/llm_archive.py` 這支程式裡，共四個指令：`pack`、`rebase`、`verify`、`restore`（打包、驗證與還原也可以用
+圖形介面，見下文）。本工具不會下載任何東西：
 請用你習慣的方式取得模型檔（Hugging Face、ModelScope、git、鏡像站、隨身碟皆可），再打包整個資料夾。請用離線工具包
 安裝出來的 Python 環境，或依建置頁面（[Windows](build-windows.md) / [Linux](build-linux.md)）建立的開發環境來執行。
 以下的 `python` 指的都是該環境的直譯器；`-I`（隔離模式）可避免它載入目前資料夾裡來路不明的檔案。
@@ -313,6 +335,20 @@ python -I tools/llm_archive.py restore archive Qwen/Qwen2.5-7B-Instruct restored
 依序打包模型、驗證全部、需要時還原。每個檔案會自動以歸檔中「壓得最小」的模型為 base 存成 delta（這裡 Instruct
 會自己選到 Qwen2.5-7B），所以 base 要比衍生自它的模型先打包。若 base 較晚才加入，可事後用 `rebase` 重新挑選（第 3 節）。
 
+## 圖形介面
+
+```bash
+python -I tools/llm_archive_gui.py [<archive_root>]
+```
+
+（Windows 上把 `python` 換成 `pythonw` 就不會多開一個主控台視窗。）開啟或建立歸檔資料夾後，可以：**壓縮資料夾…** 或
+**壓縮檔案…**（選同一資料夾內的部分檔案，這些檔案就組成一個模型；只選一個檔案時，預設以檔名命名）、把清單中選取的模型或
+檔案 **解壓縮…**（每個模型放在以其名稱命名的資料夾中，例如 `<目的地>/Qwen/Qwen2.5-7B`；目的地已有內容不同的同名檔案時，
+經你同意才會取代），以及 **驗證** 選取的模型或整個歸檔。清單會列出每個模型與檔案的原始大小、壓縮後大小與儲存方式。
+每個動作都是照下文的方式執行 `llm_archive.py`，並顯示它的輸出；**取消** 的效果等同按 Ctrl+C，歸檔裡不會留下做一半的東西。
+差異基底一律自動選擇；`--base`、`rebase` 等其他選項只能用命令列。系統為中文時介面為中文，否則為英文
+（可用 `OC_LANG=zh` 或 `OC_LANG=en` 指定）。從離線工具包執行時，會直接開啟工具包所在的歸檔。
+
 ## 1. `pack`：把資料夾打包進歸檔
 
 ```bash
@@ -321,13 +357,14 @@ python -I tools/llm_archive.py pack <來源資料夾> <archive_root> [--name 名
 
 `<來源資料夾>` 底下的每個檔案都會先計算 SHA-256、解析格式（safetensors、GGUF、其他）、逐 tensor 壓縮，寫入
 `<archive_root>/<名稱>/`（名稱中的 `/` 會轉成 `__`）。每個檔案都會再從磁碟解回並核對 SHA-256，確認無誤才處理下一個。
-最後寫出 `manifest.json`。`.git/` 與 `.cache/` 資料夾（git 與下載工具的管理資料）一律略過。
+最後寫出 `manifest.json`。`.git/` 與 `.cache/` 資料夾（git 與下載工具的管理資料）一律略過。來源資料夾與歸檔不可互相包含。
 
 | 選項 | 說明 |
 |---|---|
 | `--name 名稱` | 模型在歸檔中的名稱，例如 `Qwen/Qwen2.5-7B`（預設為資料夾名稱）；`--base`、`verify`、`restore` 都用這個名稱。以 `/` 分段，每段只能用文字、數字、`-_.+@()[]` 與空白；不可為空、不可以空白開頭或結尾、不可以句點結尾；不可為 Windows 裝置名稱（`CON`、`NUL` 等）或 `_kit` |
 | `--revision 文字` | 寫進 manifest 的備註，例如你下載的上游 commit |
 | `--exclude 樣式` | 略過路徑或檔名符合的檔案（可重複指定），例如 `--exclude "*.bin"` |
+| `--file 路徑` | 只打包 `<來源資料夾>` 裡的這個檔案，路徑相對於該資料夾（可重複指定）：模型就只包含指定的檔案；不可與 `--exclude` 併用 |
 | `--base 名稱` | 所有檔案都以這個已歸檔模型為 base，不再逐檔自動挑選 |
 | `--no-base` | 所有檔案都不使用 base |
 | `--delta-codec ans16\|xor` | 16-bit 浮點 tensor 的 delta 方式：ans16（預設，較小）或與 base 的 XOR 以位元平面壓縮（較快） |
@@ -465,11 +502,12 @@ python -I tools/llm_archive.py verify <archive_root> [<名稱> ...] [--no-lock]
 ## 5. `restore`：還原
 
 ```bash
-python -I tools/llm_archive.py restore <archive_root> <名稱> <目的資料夾> [--overwrite] [--no-lock]
+python -I tools/llm_archive.py restore <archive_root> <名稱> <目的資料夾> [--overwrite] [--file 路徑 ...] [--no-lock]
 ```
 
 寫回與原檔逐 byte 相同的檔案並核對 SHA-256。delta 需要 base 模型在同一個歸檔根目錄裡；ans16 delta 會先把用到的
-base 檔還原到 `OC_TMP`。
+base 檔還原到 `OC_TMP`。`--file 路徑`（可重複指定）只還原這些檔案，路徑以歸檔中的為準（即 `verify` 列出的 `<名稱>:` 之後的部分）；
+每個檔案會放在完整還原時的同一個位置。
 
 寫入任何東西之前，會先檢查 manifest 裡的每個路徑：必須是相對路徑、不含 `..`，而且必須落在 `<目的資料夾>` 之內；
 還原絕不經過連結寫入，所以 `<目的資料夾>` 底下途經的資料夾若是符號連結或 junction，就會停止。這個系統不允許的檔名會像其他解壓縮工具一樣調整：在 Windows 上，
@@ -549,5 +587,6 @@ sh _kit/install_linux.sh
 | `… is a link or not a folder: not followed` | 歸檔或目的資料夾中有資料夾是符號連結或 junction：改成實際的資料夾（或還原到別處） |
 | `a file of that name appeared in the destination while restoring` | 有其他程式寫入了目的地：重跑還原，或加上 `--overwrite` |
 | `cannot put … in place … without the risk of replacing a file` | 檔案系統既不支援 hard link，也不支援遇到同名就失敗的改名：還原到空資料夾並加上 `--overwrite`；歸檔本身請放在其他檔案系統上 |
+| 打包時出現 `… and the archive … are in one another` | 打包歸檔以外的資料夾，並存到該資料夾以外的歸檔 |
 | `the archive is in use …` 或 `… is being changed …` | 另一個 `pack`、`rebase`、`verify` 或 `restore` 正在使用這個歸檔：等它結束後再執行 |
 | 打包時出現 `… is a link to a folder`、`… is not a regular file`、`… cannot be read` | 用 `--exclude` 略過，或把連結指向的資料夾另外打包 |

@@ -60,3 +60,4 @@ Write-Host 'restore environment OK'
 Write-Host ""
 Write-Host "Restore a model:   & '$py' -I '$kit\tools\llm_archive.py' restore '$(Split-Path $kit -Parent)' <name> <dest_dir>"
 Write-Host "Check the archive: & '$py' -I '$kit\tools\llm_archive.py' verify '$(Split-Path $kit -Parent)'"
+Write-Host "Or use a window:  & '$(Join-Path $Venv 'Scripts\pythonw.exe')' -I '$kit\tools\llm_archive_gui.py'"

@@ -5,10 +5,13 @@ also exists in a base model already in the archive (same name, in any of its fil
 picks its base by sampling every model in the archive, unless --base names one or --no-base turns deltas off. Files
 larger than 1 MiB that are identical to one already in the archive are stored as a reference. See ARCHIVE_FORMAT.md.
 
-    python -I llm_archive.py pack    <source_dir> <archive_root> [--name NAME] [--base NAME | --no-base] [--exclude GLOB ...]
+    python -I llm_archive.py pack    <source_dir> <archive_root> [--name NAME] [--base NAME | --no-base]
+                                     [--exclude GLOB ... | --file PATH ...]
     python -I llm_archive.py rebase  <archive_root> (<name> ... | --all) [--base NAME | --no-base] [--dry-run]
     python -I llm_archive.py verify  <archive_root> [<name> ...]
-    python -I llm_archive.py restore <archive_root> <name> <dest_dir> [--overwrite]
+    python -I llm_archive.py restore <archive_root> <name> <dest_dir> [--overwrite] [--file PATH ...]
+
+llm_archive_gui.py is a small window for pack, verify and restore.
 
 The tool never downloads anything: get the model files however you like, then pack the folder. rebase re-chooses the
 bases of models already in the archive (e.g. after a closer ancestor was packed), restoring each file it re-packs.
@@ -1742,6 +1745,35 @@ def source_files(source, patterns):
     return found, problems
 
 
+def listed_files(source, paths):
+    """(files, problems) as source_files, for the files named with --file only: paths relative to `source` ("/" or
+    the system's separator), each a regular file reached without going through a folder link."""
+    found, problems = set(), []
+    is_junction = getattr(os.path, "isjunction", lambda p: False)
+    for given in paths:
+        rel = given.replace(os.sep, "/")
+        problem = path_problem(rel)
+        if problem:
+            problems.append(f"{given}: {problem}")
+            continue
+        parts, full = rel.split("/"), source
+        for i, part in enumerate(parts[:-1]):
+            full = os.path.join(full, part)
+            if os.path.islink(full) or is_junction(full):
+                problems.append(f"{'/'.join(parts[:i + 1])}/ is a link to a folder")
+                break
+        else:
+            full = os.path.join(full, parts[-1])
+            try:
+                if stat.S_ISREG(os.stat(full).st_mode):
+                    found.add(rel)
+                else:
+                    problems.append(f"{rel} is not a regular file")
+            except OSError as e:
+                problems.append(f"{rel} cannot be read ({e.strerror or e})")
+    return sorted(found), problems
+
+
 LOCK_NAME = ".overcompressing.lock"  # empty file at the archive root; the lock is the OS's, on this file
 _HELD_LOCK = []  # the open lock file, kept open (so locked) until the program ends
 
@@ -1870,15 +1902,34 @@ def lock_archive(archive_root, exclusive, skip=False):
     _HELD_LOCK.append(fd)
 
 
+def holds(folder, path):
+    """Whether `path` is `folder` or inside it (real paths compared, so through links too)."""
+    folder, path = (os.path.normcase(os.path.realpath(p)) for p in (folder, path))
+    try:
+        return os.path.commonpath([folder, path]) == folder
+    except ValueError:  # another drive
+        return False
+
+
 def cmd_pack(args):
     source = os.path.abspath(args.source_dir)
     if not os.path.isdir(source):
         sys.exit(f"{source} is not a folder")
+    if holds(source, args.archive_root) or holds(args.archive_root, source):
+        sys.exit(f"{source} and the archive {args.archive_root} are in one another: pack a folder outside the archive, "
+                 "into an archive outside that folder")
     name = args.name or os.path.basename(source)
     problem = name_problem(name)
     if problem:
         sys.exit(problem + ("" if args.name else " (taken from the folder name: choose one with --name)"))
-    paths, problems = source_files(source, args.exclude)
+    if args.files and args.exclude:
+        sys.exit("use --file or --exclude, not both")
+    if args.files:
+        paths, problems = listed_files(source, args.files)
+        if problems:
+            sys.exit(f"cannot pack these files of {source}:\n  " + "\n  ".join(problems))
+    else:
+        paths, problems = source_files(source, args.exclude)
     if problems:
         sys.exit(f"cannot pack {source} as it is:\n  " + "\n  ".join(problems)
                  + "\nskip these with --exclude (e.g. --exclude \"" + problems[0].split(" ")[0].rstrip("/")
@@ -2660,9 +2711,14 @@ def cmd_restore(args):
         lock_archive(args.archive_root, exclusive=False, skip=args.no_lock)
     try:
         manifest = load_manifest(args.archive_root, args.repo)
-        plan = restore_plan(args.dest_dir, manifest["files"])
+        plan = restore_plan(args.dest_dir, manifest["files"])  # for all files, so that each lands where it always does
     except (OSError, ValueError) as e:
         sys.exit(f"cannot restore {args.repo}: {e}")
+    if args.files:
+        unknown = sorted(set(args.files) - {e["path"] for e in manifest["files"]})
+        if unknown:
+            sys.exit(f"{args.repo} has no file {unknown[0]!r} (paths as the archive lists them, with \"/\")")
+        plan = [p for p in plan if p[0]["path"] in set(args.files)]
     archive = os.path.realpath(args.archive_root)
 
     def in_archive(folder):
@@ -2703,7 +2759,8 @@ def cmd_restore(args):
     if renamed:
         print(f"  {renamed} file(s) restored under another name: a character this system does not allow in names "
               "became \"_\", or a \" (n)\" keeps two files apart")
-    print(f"restored {args.repo}" + (f" @ {manifest['revision']}" if manifest.get("revision") else "") + f" into {args.dest_dir}")
+    what = f"{len(plan)} of {len(manifest['files'])} files of {args.repo}" if args.files else args.repo
+    print(f"restored {what}" + (f" @ {manifest['revision']}" if manifest.get("revision") else "") + f" into {args.dest_dir}")
 
 
 def whole_number(lo, hi):
@@ -2741,6 +2798,9 @@ def main():
     s.add_argument("--revision", help="free-text note stored in the manifest, e.g. the upstream commit")
     s.add_argument("--exclude", action="append", default=[], metavar="GLOB",
                    help="skip files whose path or name matches (repeatable); .git/ and .cache/ are always skipped")
+    s.add_argument("--file", action="append", default=[], metavar="PATH", dest="files",
+                   help="pack only this file of the folder, a path relative to it (repeatable): the model then holds "
+                        "just the files named")
     base = s.add_mutually_exclusive_group()
     base.add_argument("--base", metavar="NAME",
                       help="store tensors as deltas against this model in the archive (default: each file picks the "
@@ -2775,6 +2835,8 @@ def main():
     s.add_argument("dest_dir")
     s.add_argument("--overwrite", action="store_true",
                    help="replace files in dest_dir that have other contents (files already right are always kept)")
+    s.add_argument("--file", action="append", default=[], metavar="PATH", dest="files",
+                   help="restore only this file of the model, its path as the archive lists it (repeatable)")
     s.add_argument("--no-lock", action="store_true", help=no_lock)
     s.set_defaults(func=cmd_restore)
     args = p.parse_args()

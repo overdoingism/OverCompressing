@@ -44,6 +44,7 @@ REPO_FILES = [
     (f"kit/provenance/attestation-cpython-3.13.16+20261001-x86_64-linux-install_only_stripped.json",
      "python/linux/attestation-cpython-3.13.16+20261001-x86_64-linux-install_only_stripped.json"),
     ("tools/llm_archive.py", "tools/llm_archive.py"),
+    ("tools/llm_archive_gui.py", "tools/llm_archive_gui.py"),
     ("tools/ARCHIVE_FORMAT.md", "tools/ARCHIVE_FORMAT.md"),
     ("tools/test_ans16.py", "tools/test_ans16.py"),
     ("tools/test_formats.py", "tools/test_formats.py"),
