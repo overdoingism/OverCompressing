@@ -4,8 +4,8 @@ on the command line (delta bases are chosen automatically); rebase, --base and t
 
     python -I llm_archive_gui.py [<archive_root>]
 
-Run from an offline kit (<archive_root>/_kit/tools), it opens that archive. The window is in Chinese where the
-system is, else in English; OC_LANG=zh or OC_LANG=en picks one.
+Run from an offline kit (<archive_root>/_kit/tools), it opens that archive. Its text is Unicode symbols where they
+say it, else English: nothing depends on the system's language.
 """
 
 import os
@@ -39,92 +39,67 @@ except KeyboardInterrupt:
     sys.exit("cancelled")
 """
 
-TEXT = {  # key: (English, Chinese)
-    "archive": ("Archive:", "歸檔："),
-    "choose_archive": ("Open or create…", "開啟／建立…"),
-    "no_archive": ("(none chosen)", "（尚未選擇）"),
-    "pack_folder": ("Pack a folder…", "壓縮資料夾…"),
-    "pack_files": ("Pack files…", "壓縮檔案…"),
-    "extract": ("Extract…", "解壓縮…"),
-    "verify": ("Verify", "驗證"),
-    "refresh": ("Refresh", "重新整理"),
-    "cancel": ("Cancel", "取消"),
-    "stop_now": ("Stop now", "強制停止"),
-    "ok": ("OK", "確定"),
-    "col_name": ("Name", "名稱"),
-    "col_size": ("Size", "原始大小"),
-    "col_stored": ("Stored", "壓縮後"),
-    "col_ratio": ("Ratio", "比例"),
-    "col_how": ("Stored as", "儲存方式"),
-    "summary": ("{models} model(s), {files} file(s): {size} stored in {stored} ({ratio})",
-                "{models} 個模型、{files} 個檔案：{size} 壓縮為 {stored}（{ratio}）"),
-    "empty": ("No models in this archive yet: pack a folder or files into it.",
-              "這個歸檔還沒有模型：可以把資料夾或檔案壓縮進來。"),
-    "need_archive": ("Choose an archive folder first (Open or create…).", "請先選擇歸檔資料夾（開啟／建立…）。"),
-    "how_raw": ("as is", "原樣"),
-    "how_same": ("same as {ref}", "與 {ref} 相同"),
-    "how_delta": ("delta against {base}", "以 {base} 為基底的差異"),
-    "how_packed": ("compressed ({method})", "壓縮（{method}）"),
-    "model_files": ("{n} file(s)", "{n} 個檔案"),
-    "model_needs": ("needs {names}", "需要 {names}"),
-    "unreadable": ("cannot be read: {problem}", "無法讀取：{problem}"),
-    "bad_name": ("{problem}", "名稱由一或多段以 / 分隔組成，每段只能用文字、數字、空格與 -_.+@()[]，不能以空格開頭或結尾、"
-                 "不能以句點結尾，也不能是 CON、NUL 等 Windows 裝置名稱。\n({problem})"),
-    "pick_archive": ("Archive folder (an empty folder starts a new archive)", "歸檔資料夾（選空資料夾即建立新歸檔）"),
-    "not_archive": ("{folder} holds other things but no models. Use it as an archive anyway? Each model packed goes "
-                    "into a folder of its own in it.",
-                    "{folder} 裡有其他東西，但沒有任何模型。仍要把它當作歸檔嗎？之後壓縮的每個模型都會在其中各自建立一個資料夾。"),
-    "pick_folder": ("Folder to pack", "要壓縮的資料夾"),
-    "pick_files": ("Files to pack (from one folder)", "要壓縮的檔案（同一資料夾內）"),
-    "pick_dest": ("Extract into (each model goes into a folder named after it)",
-                  "解壓縮到（每個模型放在以其名稱命名的資料夾中）"),
-    "select_first": ("Select models or files in the list first.", "請先在清單中選取模型或檔案。"),
-    "name_title": ("Pack", "壓縮"),
-    "name_what": ("{n} file(s), {size}, from {folder}", "{n} 個檔案，共 {size}，來自 {folder}"),
-    "name_prompt": ("Name of this model in the archive (e.g. Qwen/Qwen2.5-7B):",
-                    "此模型在歸檔中的名稱（例如 Qwen/Qwen2.5-7B）："),
-    "name_hint": ("Delta bases are chosen automatically. For other options, use llm_archive.py (docs/usage.md).",
-                  "差異基底會自動選擇。其他選項請用命令列 llm_archive.py（見 docs/usage.md）。"),
-    "replace_q": ("The archive already holds a model named {name} ({n} file(s)). Packing replaces it with these "
-                  "files. Go on?",
-                  "歸檔中已有名為 {name} 的模型（{n} 個檔案）。壓縮後會以這次的檔案取代它。要繼續嗎？"),
-    "packing": ("Packing {name}", "正在壓縮 {name}"),
-    "extracting": ("Extracting {name}", "正在解壓縮 {name}"),
-    "verifying": ("Verifying {what}", "正在驗證 {what}"),
-    "everything": ("the whole archive", "整個歸檔"),
-    "cancelling": ("Cancelling: finishing the current step…", "正在取消：等目前步驟完成…"),
-    "force_q": ("It is still finishing the current step. Stop it right away? Unfinished temporary files "
-                "(.oc-*.part) may be left behind; they can simply be deleted.",
-                "仍在完成目前步驟。要立刻強制停止嗎？可能會留下未完成的暫存檔（.oc-*.part），直接刪除即可。"),
-    "quit_q": ("Something is still running. Cancel it and quit?", "還有作業在執行。要取消並離開嗎？"),
-    "done_pack": ("Packed {name}.", "已壓縮 {name}。"),
-    "done_extract_q": ("Extracted into {dest}. Open that folder?", "已解壓縮到 {dest}。要開啟該資料夾嗎？"),
-    "done_verify": ("Everything checked is intact.", "檢查的內容全部正確無誤。"),
-    "overwrite_q": ("{dest} already holds some of these files with other contents. Replace them?",
-                    "{dest} 裡已有部分同名但內容不同的檔案。要取代它們嗎？"),
-    "failed": ("Failed", "失敗"),
-    "cancelled": ("Cancelled.", "已取消。"),
+TEXT = {  # all of the window's text: symbols (Unicode BMP, which every Tk renders) where they say it, else English
+    "archive": "Archive",
+    "choose_archive": "Open…",
+    "no_archive": "—",
+    "pack_folder": "+ Folder…",
+    "pack_files": "+ Files…",
+    "extract": "⇩ Extract…",
+    "verify": "✔ Verify",
+    "refresh": "↻ Refresh",
+    "cancel": "✕ Cancel",
+    "stop_now": "✕ Stop now",
+    "ok": "OK",
+    "col_name": "Name",
+    "col_size": "Size",
+    "col_stored": "Stored",
+    "col_ratio": "%",
+    "col_how": "Stored as",
+    "summary": "{models} · {files} · {size} → {stored} ({ratio})",
+    "empty": "Empty archive: + Folder… or + Files… packs into it.",
+    "need_archive": "Open… an archive folder first.",
+    "how_raw": "as is",
+    "how_same": "= {ref}",
+    "how_delta": "Δ {base}",
+    "how_packed": "{method}",
+    "model_needs": "needs {names}",
+    "unreadable": "⚠ {problem}",
+    "pick_archive": "Archive folder (an empty one starts a new archive)",
+    "not_archive": "{folder} holds other things but no models. Use it as an archive anyway? Each model packed goes "
+                   "into a folder of its own in it.",
+    "pick_folder": "Folder to pack",
+    "pick_files": "Files to pack (from one folder)",
+    "pick_dest": "Extract into (each model goes into a folder named after it)",
+    "select_first": "Select models or files in the list first.",
+    "name_title": "Pack",
+    "name_what": "{files} · {size} · {folder}",
+    "name_prompt": "Name in the archive (e.g. Qwen/Qwen2.5-7B):",
+    "name_hint": "Δ bases are chosen automatically; for other options use llm_archive.py (docs/usage.md).",
+    "replace_q": "The archive already holds {name} ({files}). Replace it with these files?",
+    "packing": "▶ Packing {name}",
+    "extracting": "▶ Extracting {name}",
+    "verifying": "▶ Verifying {what}",
+    "everything": "everything",
+    "cancelling": "■ Cancelling: finishing the current step…",
+    "force_q": "It is still finishing the current step. Stop it right away? Unfinished temporary files (.oc-*.part) "
+               "may be left behind; they can simply be deleted.",
+    "quit_q": "Something is still running. Cancel it and quit?",
+    "done_pack": "✓ Packed {name}.",
+    "done_extract_q": "✓ Extracted into {dest}. Open that folder?",
+    "done_verify": "✓ Everything checked is intact.",
+    "overwrite_q": "{dest} already holds some of these files with other contents. Replace them?",
+    "failed": "✕ Failed",
+    "cancelled": "✕ Cancelled.",
 }
 
 
-def chinese():
-    choice = os.environ.get("OC_LANG", "").lower()
-    if choice:
-        return choice.startswith("zh")
-    if os.name == "nt":
-        import ctypes
-        return ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3FF == 0x04  # LANG_CHINESE
-    for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
-        if os.environ.get(var):
-            return os.environ[var].lower().startswith("zh")
-    return False
-
-
-ZH = chinese()
-
-
 def t(key, **values):
-    return TEXT[key][ZH].format(**values)
+    return TEXT[key].format(**values)
+
+
+def count(n, what):
+    return f"{n} {what}" + ("" if n == 1 else "s")
 
 
 def python_exe():
@@ -296,7 +271,7 @@ class App:
             entries = manifest["files"]
             total, kept = sum(e["size"] for e in entries), sum(e["stored_size"] for e in entries)
             size, stored, files = size + total, stored + kept, files + len(entries)
-            how = t("model_files", n=len(entries))
+            how = count(len(entries), "file")
             if needs[repo]:
                 how += "; " + t("model_needs", names=", ".join(sorted(needs[repo])))
             node = self.tree.insert("", "end", text=repo, tags=("model",),
@@ -309,7 +284,7 @@ class App:
         for folder, problem in problems:
             self.tree.insert("", "end", text=folder, values=("", "", "", t("unreadable", problem=problem)), tags=("problem",))
         if self.manifests:
-            self.status.configure(text=t("summary", models=len(self.manifests), files=files, size=size_text(size),
+            self.status.configure(text=t("summary", models=count(len(self.manifests), "model"), files=count(files, "file"), size=size_text(size),
                                          stored=size_text(stored), ratio=ratio(stored, size)))
         else:
             self.status.configure(text=t("empty"))
@@ -379,11 +354,11 @@ class App:
         self.load()
         found, _ = la.listed_files(folder, files) if files else la.source_files(folder, [])
         size = sum(os.path.getsize(os.path.join(folder, *rel.split("/"))) for rel in found)
-        name = self.ask_name(name, t("name_what", n=len(found), size=size_text(size), folder=folder))
+        name = self.ask_name(name, t("name_what", files=count(len(found), "file"), size=size_text(size), folder=folder))
         if not name:
             return
         if name in self.manifests and not messagebox.askyesno(
-                t("name_title"), t("replace_q", name=name, n=len(self.manifests[name]["files"])), parent=self.root):
+                t("name_title"), t("replace_q", name=name, files=count(len(self.manifests[name]["files"]), "file")), parent=self.root):
             return
         argv = ["pack", folder, self.archive, f"--name={name}", *[f"--file={f}" for f in files]]
         self.start([{"argv": argv, "title": t("packing", name=name)}],
@@ -413,7 +388,7 @@ class App:
         def accept(_=None):
             problem = la.name_problem(name.get().strip())
             if problem:
-                error.configure(text=t("bad_name", problem=problem))
+                error.configure(text=problem)
                 return
             result.append(name.get().strip())
             dialog.destroy()

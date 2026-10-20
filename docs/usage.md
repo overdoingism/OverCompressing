@@ -27,15 +27,16 @@ derived from them. If a base arrives later, `rebase` re-chooses the bases afterw
 python -I tools/llm_archive_gui.py [<archive_root>]
 ```
 
-(On Windows, `pythonw` instead of `python` opens it without a console window.) Open or create an archive folder, then:
-**Pack a folder…** or **Pack files…** (some files of one folder, which then make up the model; one file is named after
-itself by default), **Extract…** the models or files selected in the list (each model goes into a folder named after
-it, e.g. `<dest>/Qwen/Qwen2.5-7B`; files with other contents already there are replaced only after you agree), and
-**Verify** the selection or the whole archive. The list shows every model and file with its size, stored size and how
-it is stored. Each action runs `llm_archive.py` exactly as below and shows its output; **Cancel** stops it as Ctrl+C
-would, so nothing half-done stays in the archive. Delta bases are always chosen automatically; `--base`, `rebase`
-and the other options are on the command line only. The window is in Chinese where the system is, else in English
-(`OC_LANG=zh` or `OC_LANG=en` picks one). Run from an offline kit, it opens the kit's archive.
+(On Windows, `pythonw` instead of `python` opens it without a console window.) **Open…** an archive folder (an empty
+one starts a new archive), then: **+ Folder…** or **+ Files…** to pack (files picked from one folder make up the
+model on their own; one file is named after itself by default), **⇩ Extract…** the models or files selected in the
+list (each model goes into a folder named after it, e.g. `<dest>/Qwen/Qwen2.5-7B`; files with other contents already
+there are replaced only after you agree), and **✔ Verify** the selection or the whole archive. The list shows every
+model and file with its size, stored size, ratio and how it is stored (`Δ` a delta against that model, `=` the same
+as that file). Each action runs `llm_archive.py` exactly as below and shows its output; **✕ Cancel** stops it as
+Ctrl+C would, so nothing half-done stays in the archive. Delta bases are always chosen automatically; `--base`,
+`rebase` and the other options are on the command line only. The window's text is English and symbols, whatever the
+system language. Run from an offline kit, it opens the kit's archive.
 
 ## 1. `pack` — compress a folder into the archive
 
@@ -341,13 +342,14 @@ python -I tools/llm_archive.py restore archive Qwen/Qwen2.5-7B-Instruct restored
 python -I tools/llm_archive_gui.py [<archive_root>]
 ```
 
-（Windows 上把 `python` 換成 `pythonw` 就不會多開一個主控台視窗。）開啟或建立歸檔資料夾後，可以：**壓縮資料夾…** 或
-**壓縮檔案…**（選同一資料夾內的部分檔案，這些檔案就組成一個模型；只選一個檔案時，預設以檔名命名）、把清單中選取的模型或
-檔案 **解壓縮…**（每個模型放在以其名稱命名的資料夾中，例如 `<目的地>/Qwen/Qwen2.5-7B`；目的地已有內容不同的同名檔案時，
-經你同意才會取代），以及 **驗證** 選取的模型或整個歸檔。清單會列出每個模型與檔案的原始大小、壓縮後大小與儲存方式。
-每個動作都是照下文的方式執行 `llm_archive.py`，並顯示它的輸出；**取消** 的效果等同按 Ctrl+C，歸檔裡不會留下做一半的東西。
-差異基底一律自動選擇；`--base`、`rebase` 等其他選項只能用命令列。系統為中文時介面為中文，否則為英文
-（可用 `OC_LANG=zh` 或 `OC_LANG=en` 指定）。從離線工具包執行時，會直接開啟工具包所在的歸檔。
+（Windows 上把 `python` 換成 `pythonw` 就不會多開一個主控台視窗。）用 **Open…** 開啟歸檔資料夾（選空資料夾即建立新歸檔）
+後，可以：用 **+ Folder…** 或 **+ Files…** 壓縮（從同一資料夾選取的檔案會自成一個模型；只選一個檔案時，預設以檔名命名）、
+用 **⇩ Extract…** 解壓縮清單中選取的模型或檔案（每個模型放在以其名稱命名的資料夾中，例如 `<目的地>/Qwen/Qwen2.5-7B`；
+目的地已有內容不同的同名檔案時，經你同意才會取代），以及用 **✔ Verify** 驗證選取的模型或整個歸檔。清單會列出每個模型與
+檔案的原始大小、壓縮後大小、比例與儲存方式（`Δ` 表示以該模型為基底的差異，`=` 表示與該檔案相同）。每個動作都是照下文的
+方式執行 `llm_archive.py`，並顯示它的輸出；**✕ Cancel** 的效果等同按 Ctrl+C，歸檔裡不會留下做一半的東西。差異基底一律
+自動選擇；`--base`、`rebase` 等其他選項只能用命令列。介面文字只有英文與符號，與系統語系無關。從離線工具包執行時，會直接
+開啟工具包所在的歸檔。
 
 ## 1. `pack`：把資料夾打包進歸檔
 
