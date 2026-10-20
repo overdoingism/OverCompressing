@@ -250,16 +250,19 @@ def xor_bytes(a, b):
 
 
 def strict_json(data):
-    """json.loads that refuses duplicate keys (two readers could disagree on which value counts) and, for bytes,
-    anything that is not valid UTF-8 (ValueError either way)."""
+    """json.loads that refuses duplicate keys (two readers could disagree on which value counts), NaN and Infinity
+    (not JSON) and, for bytes, anything that is not valid UTF-8 (ValueError either way)."""
     def pairs(items):
         if len({k for k, _ in items}) != len(items):
             raise ValueError("duplicate key in JSON")
         return dict(items)
 
+    def constant(name):
+        raise ValueError(f"{name} in JSON")  # not JSON (RFC 8259), though Python's json would accept it
+
     if isinstance(data, (bytes, bytearray, memoryview)):
         data = bytes(data).decode("utf-8")
-    return json.loads(data, object_pairs_hook=pairs)
+    return json.loads(data, object_pairs_hook=pairs, parse_constant=constant)
 
 
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
@@ -996,7 +999,7 @@ def container_header_problem(header):
             return "malformed delta"
     pos = 0
     for r in regions:
-        if not isinstance(r, dict) or r.get("offset") != pos or not is_size(r.get("length")) or not 0 < r["length"] <= MAX_REGION \
+        if not isinstance(r, dict) or not is_size(r.get("offset")) or r["offset"] != pos or not is_size(r.get("length")) or not 0 < r["length"] <= MAX_REGION \
                 or r.get("kind") not in REGION_KINDS or not isinstance(r.get("dtype", ""), str):
             return f"region at {pos} malformed, out of order or too long"
         base = r.get("base")
@@ -1779,7 +1782,40 @@ if os.name == "nt":
                     and _kernel32.GetVolumeInformationW(root, None, 0, None, None, ctypes.byref(flags), None, 0)
                     and flags.value & 0x00080000)  # FILE_READ_ONLY_VOLUME
 else:
+    import ctypes
     import fcntl
+
+    def _rename_call():
+        """The C function that renames without replacing, with its flag: (None, 0) where there is none."""
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            if sys.platform.startswith("linux"):
+                call, flag = libc.renameat2, 1  # RENAME_NOREPLACE
+            elif sys.platform == "darwin":
+                call, flag = libc.renameatx_np, 4  # RENAME_EXCL
+            else:
+                return None, 0
+        except (OSError, AttributeError):
+            return None, 0
+        call.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        call.restype = ctypes.c_int
+        return call, flag
+
+    _RENAME_NO_REPLACE = _rename_call()
+
+    def rename_no_replace(src, dst, dir_fd):
+        """Rename src to dst, both in the folder dir_fd, only if nothing is at dst (FileExistsError if something is),
+        in one step: renameat2 RENAME_NOREPLACE on Linux, renameatx_np RENAME_EXCL on macOS. False if this system or
+        this file system cannot."""
+        call, flag = _RENAME_NO_REPLACE
+        if call is None:
+            return False
+        if call(dir_fd, os.fsencode(src), dir_fd, os.fsencode(dst), flag) == 0:
+            return True
+        error = ctypes.get_errno()
+        if error in (errno.EINVAL, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP):
+            return False
+        raise OSError(error, os.strerror(error), dst)  # EEXIST: a FileExistsError
 
     def _try_lock(fd, exclusive):
         """True if locked, False if someone else holds the lock; OSError if this file system cannot lock."""
@@ -2106,6 +2142,11 @@ class UnsafePath(OSError):
     """A folder on the way to a file is a link (or not a folder): refused, never followed."""
 
 
+class NoReplaceUnsupported(OSError):
+    """The file system can put a file in place only by replacing whatever is there: no hard links and no rename
+    that refuses an existing name, so "only if nothing is there" cannot be one step."""
+
+
 class SafeTree:
     """Creates, replaces and deletes files inside one folder (`root`, trusted as given) without following any link
     below it, so that another program swapping a folder for a link while this one runs cannot redirect a write or a
@@ -2175,7 +2216,8 @@ class SafeTree:
         """Write a new file at rel ("/"-separated, inside the tree): yields a binary file object on a fresh temporary
         file next to it. When the block ends without an exception, the file is synced to disk and put in place:
         over whatever is at rel if `replace`, else only if nothing is (FileExistsError otherwise; the check and the
-        placing are one step). On an exception the temporary file is deleted and rel is left as it was."""
+        placing are one step, or NoReplaceUnsupported where the file system cannot do that). On an exception the
+        temporary file is deleted and rel is left as it was."""
         parts = self._parts(rel)
         folder, name = parts[:-1], parts[-1]
         temp = f".oc-{secrets.token_hex(8)}.part"
@@ -2198,12 +2240,10 @@ class SafeTree:
                 os.fsync(f.fileno())
                 if not self.POSIX:
                     self._check_location(f.fileno(), dirpath)
-            renames = dict(src_dir_fd=dfd, dst_dir_fd=dfd) if self.POSIX else {}
             if replace:
-                os.replace(path(temp), path(name), **renames)
-            elif self.POSIX:  # reserve the name exclusively, then move the file onto that reservation
-                os.close(os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dfd))
-                os.replace(temp, name, **renames)
+                os.replace(path(temp), path(name), **(dict(src_dir_fd=dfd, dst_dir_fd=dfd) if self.POSIX else {}))
+            elif self.POSIX:
+                self._move_new(temp, name, dfd, rel)
             else:
                 os.rename(path(temp), path(name))  # Windows: fails if the name exists
             placed = True
@@ -2215,6 +2255,24 @@ class SafeTree:
                     pass
             if dfd is not None:
                 os.close(dfd)
+
+    def _move_new(self, temp, name, dfd, rel):
+        """POSIX: move temp to name, both in the folder dfd, only if nothing is at name (FileExistsError if something
+        is, a link included), the check and the move being one step: a hard link at name, then temp's own name
+        removed (stopped in between, name is complete and temp a leftover link to it); where the file system has no
+        hard links, a rename that never replaces (rename_no_replace). Neither: NoReplaceUnsupported, never a check
+        followed by a separate move."""
+        try:
+            os.link(temp, name, src_dir_fd=dfd, dst_dir_fd=dfd, follow_symlinks=False)
+        except FileExistsError:
+            raise
+        except OSError as e:
+            if not rename_no_replace(temp, name, dfd):
+                raise NoReplaceUnsupported(f"cannot put {rel} in place in {self.root} without the risk of replacing a file "
+                                           f"that appears there meanwhile: this file system has no hard links ({e.strerror or e}) "
+                                           f"and no rename that refuses an existing name") from e
+            return
+        os.unlink(temp, dir_fd=dfd)
 
     @staticmethod
     def _check_location(fd, dirpath):
@@ -2313,6 +2371,8 @@ def restore_entry(archive_root, repo, entry, tree, rel, replace):
         return "restored bytes differ from original sha256"
     except FileExistsError:
         return "a file of that name appeared in the destination while restoring: not overwritten (--overwrite replaces it)"
+    except NoReplaceUnsupported as e:
+        return f"{e}; restore into an empty folder with --overwrite instead"
     except UnsafePath as e:
         return str(e)
     except Exception as e:
@@ -2465,21 +2525,25 @@ def rebase_model(args, repo):
                 problem = restore_entry(args.archive_root, repo, old, SafeTree(tmp), name, replace=False)
                 if problem:
                     sys.exit(f"  cannot restore {rec['path']}: {problem}")
-                stored = names.fresh(rec["path"])
-                names.add(stored)
-                pending.append(stored)
-                entry, problem = pack_verified(args, src, rec, repo_path, repo, base, base_files, chunk_size, {}, stored)
+                # as in pack: a new container, or for a small file a copy as-is, each under a name nothing uses yet
+                container = names.fresh(rec["path"])
+                raw = names.fresh(rec["path"], "") if rec["size"] <= RAW_COPY_LIMIT else None
+                planned = [n for n in (container, raw) if n]
+                pending += planned
+                entry, problem = pack_verified(args, src, rec, repo_path, repo, base, base_files, chunk_size, {}, container, raw)
             finally:
                 SafeTree(tmp).remove(name)
             if problem:
                 sys.exit(f"  VERIFY FAILED {rec['path']}: {problem}")
+            names.add(entry["stored"])
             print_entry(rec, entry, t0)
             if forced or same or entry["stored_size"] < old["stored_size"]:
                 entries[-1] = entry
                 print(f"    replaces {stored_description(old)}")
             else:
-                SafeTree(repo_path).remove(pending.pop())
+                SafeTree(repo_path).remove(entry["stored"])
                 SafeTree(repo_path).prune(entry["stored"])
+                pending = [n for n in pending if n not in planned]
                 print(f"    not smaller than {stored_description(old)}: kept that")
         if any(e is not o for e, o in zip(entries, old_entries)):
             write_manifest(repo_path, {**manifest, "tool": TOOL_VERSION, "base_choice": base_choice(args),

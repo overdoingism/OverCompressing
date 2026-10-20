@@ -211,7 +211,10 @@ interrupted restore can simply be run again; a file with other contents stops th
 `--overwrite`. Each file is written to a new temporary file with a random name in its folder and moved into place
 only once its size and SHA-256 are right, so a failed file never replaces what was there; without `--overwrite`, a
 file that appears in the destination meanwhile (another program) is not replaced either, since checking and placing
-are one step. A destination inside the archive itself is refused, even with `--overwrite`.
+are one step (a hard link, or where the file system has none, a rename that refuses an existing name). On the rare
+file system that has neither (some FUSE or network mounts), restore without `--overwrite` stops and says so; restore
+into an empty folder with `--overwrite` there. A destination inside the archive itself is refused, even with
+`--overwrite`.
 
 ## 6. Protection and repair
 
@@ -283,6 +286,7 @@ none is found) and print the exact `restore` / `verify` commands to use. Details
 | leftover `.oc-*.part` after a killed run | delete it (an unfinished temporary file; nothing refers to it) |
 | `… is a link or not a folder: not followed` | a folder in the archive or the destination is a symlink or junction: replace it with a real folder (or restore elsewhere) |
 | `a file of that name appeared in the destination while restoring` | another program wrote there: run restore again, or add `--overwrite` |
+| `cannot put … in place … without the risk of replacing a file` | the file system has no hard links and no rename that refuses an existing name: restore into an empty folder with `--overwrite`; keep the archive itself on another file system |
 | `the archive is in use …` or `… is being changed …` | another `pack`, `rebase`, `verify` or `restore` runs on the archive: run this when it has finished |
 | `… is a link to a folder`, `… is not a regular file`, `… cannot be read` (pack) | skip it with `--exclude`, or pack the link's target as a folder of its own |
 
@@ -475,7 +479,9 @@ base 檔還原到 `OC_TMP`。
 落在同一個位置。目的資料夾裡已有內容正確的檔案會保留（顯示 `already there`），所以中斷的還原可以直接重跑；已有但內容不同
 的檔案會讓還原停止，除非加上 `--overwrite`。每個檔案都先寫到同資料夾裡以隨機名稱新建的暫存檔，確認大小與 SHA-256
 正確後才移到定位，所以失敗的檔案不會蓋掉原本的檔案；沒有 `--overwrite` 時，就算還原期間有其他程式在目的地建立了同名
-檔案，也不會被覆蓋，因為「確認不存在」與「放上檔案」是同一個步驟。目的資料夾若在歸檔之內，即使加上 `--overwrite` 也會拒絕。
+檔案，也不會被覆蓋，因為「確認不存在」與「放上檔案」是同一個步驟（用 hard link；檔案系統不支援時，改用遇到同名就失敗的
+改名）。少數兩者都不支援的檔案系統（某些 FUSE 或網路掛載）上，沒加 `--overwrite` 的還原會停止並說明原因；這時請還原到
+空資料夾並加上 `--overwrite`。目的資料夾若在歸檔之內，即使加上 `--overwrite` 也會拒絕。
 
 ## 6. 防護與修復
 
@@ -542,5 +548,6 @@ sh _kit/install_linux.sh
 | 程式被強制中斷後留下 `.oc-*.part` | 直接刪除（未完成的暫存檔，沒有任何東西引用它） |
 | `… is a link or not a folder: not followed` | 歸檔或目的資料夾中有資料夾是符號連結或 junction：改成實際的資料夾（或還原到別處） |
 | `a file of that name appeared in the destination while restoring` | 有其他程式寫入了目的地：重跑還原，或加上 `--overwrite` |
+| `cannot put … in place … without the risk of replacing a file` | 檔案系統既不支援 hard link，也不支援遇到同名就失敗的改名：還原到空資料夾並加上 `--overwrite`；歸檔本身請放在其他檔案系統上 |
 | `the archive is in use …` 或 `… is being changed …` | 另一個 `pack`、`rebase`、`verify` 或 `restore` 正在使用這個歸檔：等它結束後再執行 |
 | 打包時出現 `… is a link to a folder`、`… is not a regular file`、`… cannot be read` | 用 `--exclude` 略過，或把連結指向的資料夾另外打包 |

@@ -938,6 +938,73 @@ la.SafeTree.placing = _appear"""
     ok = run.returncode != 0 and clean(out) and "appeared" in out and open(os.path.join(dest, "x.txt"), "rb").read() == b"KEEP"
     expect("without --overwrite it is not overwritten (checked and placed in one step)", ok, "" if ok else out[-200:])
 
+    print("hardening: placing without replacing is one step, also when it fails")
+    commit = "rename" if os.name == "nt" else "link"  # how a new file goes in place without replacing
+    tidy = lambda folder: not [n for n in os.listdir(folder) if n.startswith(".oc-")]  # noqa: E731
+    restored = lambda folder: open(os.path.join(folder, "x.txt"), "rb").read()  # noqa: E731
+    rival = f"""_real = la.os.{commit}
+def _rival(src, dst, *a, **k):
+    where = {{"dir_fd": k["dst_dir_fd"]}} if k.get("dst_dir_fd") is not None else {{}}
+    fd = la.os.open(dst, la.os.O_WRONLY | la.os.O_CREAT | getattr(la.os, "O_BINARY", 0), 0o644, **where)
+    la.os.write(fd, b"RIVAL")
+    la.os.close(fd)
+    return _real(src, dst, *a, **k)
+la.os.{commit} = _rival"""
+    dest = os.path.join(root, "r5")
+    run = patched_process(rival, "restore", archive, "t/A", dest)
+    out = run.communicate(timeout=300)[0]
+    ok = run.returncode != 0 and clean(out) and "appeared" in out and restored(dest) == b"RIVAL" and tidy(dest)
+    expect("a file another program writes at the very moment of placing is kept", ok, "" if ok else out[-200:])
+    fail = f"""def _fail(*a, **k):
+    raise OSError(5, "simulated I/O error")
+la.os.{commit} = _fail
+la.rename_no_replace = _fail"""
+    dest = os.path.join(root, "r6")
+    run = patched_process(fail, "restore", archive, "t/A", dest)
+    out = run.communicate(timeout=300)[0]
+    left = os.listdir(dest)
+    code, out2 = tool("restore", archive, "t/A", dest)
+    ok = run.returncode != 0 and clean(out) and left == [] and code == 0 and restored(dest) == b"archived" and tidy(dest)
+    expect("placing that fails leaves nothing (no empty file in the way); restoring again works", ok,
+           "" if ok else f"{left} {out[-150:]} {out2[-150:]}")
+    if os.name == "nt":
+        print("  skip file systems without hard links (POSIX only)")
+    elif la._RENAME_NO_REPLACE[0] is None:
+        print("  skip file systems without hard links (no rename that refuses an existing name here)")
+    else:
+        no_links = """def _no_link(*a, **k):
+    raise PermissionError(1, "Operation not permitted")
+la.os.link = _no_link"""
+        dest = os.path.join(root, "r7")
+        run = patched_process(no_links, "restore", archive, "t/A", dest)
+        out = run.communicate(timeout=300)[0]
+        ok = run.returncode == 0 and restored(dest) == b"archived" and tidy(dest)
+        expect("without hard links, a rename that refuses an existing name places the file", ok, "" if ok else out[-200:])
+        rival_rename = no_links + """
+_real = la.rename_no_replace
+def _rival(src, dst, dir_fd):
+    fd = la.os.open(dst, la.os.O_WRONLY | la.os.O_CREAT, 0o644, dir_fd=dir_fd)
+    la.os.write(fd, b"RIVAL")
+    la.os.close(fd)
+    return _real(src, dst, dir_fd)
+la.rename_no_replace = _rival"""
+        dest = os.path.join(root, "r8")
+        run = patched_process(rival_rename, "restore", archive, "t/A", dest)
+        out = run.communicate(timeout=300)[0]
+        ok = run.returncode != 0 and clean(out) and "appeared" in out and restored(dest) == b"RIVAL" and tidy(dest)
+        expect("... and keeps a file another program writes at that moment", ok, "" if ok else out[-200:])
+        neither = no_links + "\nla.rename_no_replace = lambda *a: False"
+        dest = os.path.join(root, "r9")
+        run = patched_process(neither, "restore", archive, "t/A", dest)
+        out = run.communicate(timeout=300)[0]
+        left = os.listdir(dest)
+        run2 = patched_process(neither, "restore", archive, "t/A", dest, "--overwrite")
+        out2 = run2.communicate(timeout=300)[0]
+        ok = run.returncode != 0 and clean(out) and "hard links" in out and "--overwrite" in out and left == [] \
+            and run2.returncode == 0 and restored(dest) == b"archived" and tidy(dest)
+        expect("with neither, restore stops, says to use an empty folder with --overwrite, and that works", ok,
+               "" if ok else f"{left} {out[-200:]} {out2[-200:]}")
+
     print("hardening: malformed containers are refused before anything is decoded")
     cdir = os.path.join(root, "containers")
     os.makedirs(cdir)
@@ -973,6 +1040,11 @@ la.SafeTree.placing = _appear"""
         "an ans16 frame in a region that is not a delta": container(one(len(data)), [(la.CODEC_ANS16, len(data), data, 0)]),
         "a duplicate key in the header": container(b'{"original_size": 11, "original_size": 11, "regions": [{"offset": 0, "length": 11, "kind": "zstd"}], "delta": null}', [good]),
         "a header longer than the file": la.MAGIC + struct.pack("<I", 10 ** 9) + b"{}",
+        "an offset of false (for 0)": container({**one(len(data)), "regions": [{"offset": False, "length": len(data), "kind": "zstd"}]}, [good]),
+        "an offset of 0.0": container({**one(len(data)), "regions": [{"offset": 0.0, "length": len(data), "kind": "zstd"}]}, [good]),
+        "an offset of true (for 1)": container({**one(len(data)), "regions": [{"offset": 0, "length": 1, "kind": "zstd"}, {"offset": True, "length": len(data) - 1, "kind": "zstd"}]},
+                                               [(la.CODEC_RAW, 1, data[:1], zlib.crc32(data[:1])), (la.CODEC_RAW, len(data) - 1, data[1:], zlib.crc32(data[1:]))]),
+        "NaN in the header": container(json.dumps(one(len(data))).replace('"delta": null', '"delta": null, "x": NaN').encode(), [good]),
     }
     for name, blob in cases.items():
         tracemalloc.start()
@@ -1018,6 +1090,38 @@ la.SafeTree.placing = _appear"""
     open(path, "w", encoding="utf-8").write(text.replace('"repo": ', '"repo": "t/O", "repo": ', 1))
     code, out = tool("verify", archive)
     expect("a manifest with a duplicate key is a FAIL line", code != 0 and "FAIL" in out and "duplicate" in out and clean(out))
+    loose = []
+    for sample in ('{"a": NaN}', '{"a": Infinity}', '{"a": -Infinity}', b'[NaN]'):
+        try:
+            la.strict_json(sample)
+            loose.append(sample)
+        except ValueError:
+            pass
+    expect("NaN, Infinity and -Infinity are not JSON: refused", not loose, str(loose) if loose else "")
+    open(path, "w", encoding="utf-8").write(text.replace('"repo": ', '"x": NaN, "repo": ', 1))
+    code, out = tool("verify", archive)
+    ok = code != 0 and "FAIL" in out and "NaN" in out and clean(out)
+    expect("a manifest with NaN is a FAIL line", ok, "" if ok else out[-200:])
+
+    print("hardening: a rebase stopped before its manifest leaves no new file behind")
+    archive = os.path.join(root, "h6")
+    src = make_folder(os.path.join(root, "src6"), {"small.txt": b"a small file"})
+    pack(src, archive, "t/A")
+    pack(src, archive, "t/B")
+
+    def to_same(manifest):  # pack refers to a file only above RAW_COPY_LIMIT, but a manifest may hold a small one
+        manifest["files"][0].update(method="same", same_as={"repo": "t/A", "path": "small.txt"}, stored=None,
+                                    stored_size=0, stored_sha256=None)
+    edit_manifest(archive, "t__B", to_same)
+    os.remove(os.path.join(archive, "t__B", "small.txt"))
+    before = sorted(os.listdir(os.path.join(archive, "t__B")))
+    code, out = interrupted("before", "rebase", archive, "t/B", "--no-dedupe")
+    after = sorted(os.listdir(os.path.join(archive, "t__B")))
+    code2, out2 = tool("rebase", archive, "t/B", "--no-dedupe")
+    code3, out3 = tool("verify", archive)
+    ok = code != 0 and after == before and code2 == 0 and la.load_manifest(archive, "t/B")["files"][0]["method"] == "raw" and code3 == 0
+    expect("a small same-as file stored again (as-is) by rebase is removed when it stops; run again it works", ok,
+           "" if ok else f"{before} -> {after} {out2[-200:]} {out3[-200:]}")
 
 
 def bf16_reference(value):

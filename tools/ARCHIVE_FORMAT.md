@@ -198,17 +198,20 @@ Encoding is the exact inverse (symbols in reverse order; emit the low 32 bits an
   `stored_sha256`; for a delta, `delta_base` and a non-empty `delta_files` of paths and SHA-256s. No path may be
   listed twice. A manifest that fails is reported by `verify` and blocks `pack` and `rebase` until it is fixed.
 - Every container is checked before anything in it is decoded: magic; a header of at most 64 MiB that is valid
-  UTF-8 JSON without duplicate keys; at most 4,194,304 regions, each 1 byte to 1 GiB long, covering `original_size`
-  in order without gaps, of a known kind, with base references only on delta regions and only into `delta.files`;
-  one frame per region whose `raw_len` is the region's length and whose codec fits the region; every payload inside
-  the file; nothing after the last frame; and `original_size` equal to the manifest's `size`. A zstd payload must be
-  exactly one frame, its declared content size no larger than its region, and it is decoded with output capped at
-  that size. An ans16 payload's lengths must add up exactly, its header fields stay in range (precision 1–30, 1–65,536
-  lanes, 1–257 contexts) and its tables (at most 65,536 symbols per context, frequencies summing to `2^prec`) fit.
-  Manifests and safetensors headers with duplicate JSON keys are refused too; a GGUF file whose sizes overflow,
-  whose tensor names are not valid UTF-8 or repeat, is stored as plain bytes.
+  UTF-8 JSON without duplicate keys, `NaN` or `Infinity`; at most 4,194,304 regions, each 1 byte to 1 GiB long, with
+  whole-number offsets and lengths (not `true`, not `0.0`), covering `original_size` in order without gaps, of a
+  known kind, with base references only on delta regions and only into `delta.files`; one frame per region whose
+  `raw_len` is the region's length and whose codec fits the region; every payload inside the file; nothing after the
+  last frame; and `original_size` equal to the manifest's `size`. A zstd payload must be exactly one frame, its
+  declared content size no larger than its region, and it is decoded with output capped at that size. An ans16
+  payload's lengths must add up exactly, its header fields stay in range (precision 1–30, 1–65,536 lanes, 1–257
+  contexts) and its tables (at most 65,536 symbols per context, frequencies summing to `2^prec`) fit. Manifests and
+  safetensors headers with duplicate JSON keys, `NaN` or `Infinity` are refused too; a GGUF file whose sizes
+  overflow, whose tensor names are not valid UTF-8 or repeat, is stored as plain bytes.
 - Every file a tool writes goes first to a new, randomly named temporary file (`.oc-*.part`) created exclusively, and
-  is put in place only after it is synced to disk; links below the archive's model folders and the restore
-  destination are never followed (on Windows: checked as a best effort).
+  is put in place only after it is synced to disk. A new name is taken only if nothing is there, in one step (a hard
+  link, then the temporary name removed; where the file system has no hard links, a rename that refuses an existing
+  name; with neither, the tool stops rather than check first and rename after). Links below the archive's model
+  folders and the restore destination are never followed (on Windows: checked as a best effort).
 - Repair data is not part of the format; add your own (copies, PAR2, a self-healing file system, …) and rebuild
   it after re-packing or rebasing a repo. See `docs/protection.md`.
