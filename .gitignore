@@ -1,0 +1,12 @@
+# Data: downloaded models, the archive itself, scratch space
+models/
+archive/
+out/
+tmp/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Third-party files the kit build downloads (pinned by SHA-256 in kit/build_kit.py)
