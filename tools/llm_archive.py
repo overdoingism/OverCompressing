@@ -20,12 +20,16 @@ ans16 deltas restore their base into a temporary file, and rebase the file it re
 
 import argparse
 import bisect
+import contextlib
 import datetime
+import errno
 import fnmatch
 import hashlib
 import itertools
 import json
+import math
 import os
+import secrets
 import shutil
 import stat
 import struct
@@ -223,7 +227,7 @@ def safetensors_layout(path):
             n = struct.unpack("<Q", f.read(8))[0]
             if n > min(SAFETENSORS_MAX_HEADER, size - 8):
                 return None
-            header = json.loads(f.read(n))
+            header = strict_json(f.read(n))
         if not isinstance(header, dict):
             return None
         tensors = {}
@@ -243,6 +247,71 @@ def safetensors_layout(path):
 
 def xor_bytes(a, b):
     return np.bitwise_xor(np.frombuffer(a, np.uint8), np.frombuffer(b, np.uint8)).tobytes()
+
+
+def strict_json(data):
+    """json.loads that refuses duplicate keys (two readers could disagree on which value counts) and, for bytes,
+    anything that is not valid UTF-8 (ValueError either way)."""
+    def pairs(items):
+        if len({k for k, _ in items}) != len(items):
+            raise ValueError("duplicate key in JSON")
+        return dict(items)
+
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        data = bytes(data).decode("utf-8")
+    return json.loads(data, object_pairs_hook=pairs)
+
+
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+
+
+def zstd_frame_length(frame):
+    """Length of the zstd frame that `frame` starts with, from its block headers (RFC 8878 section 3.1)."""
+    if bytes(frame[:4]) != ZSTD_MAGIC or len(frame) < 6:
+        raise ValueError("not a zstd frame")
+    pos, checksum = zstandard.frame_header_size(frame), frame[4] & 0x04
+    while True:
+        if pos + 3 > len(frame):
+            raise ValueError("zstd frame cut short")
+        head = int.from_bytes(frame[pos:pos + 3], "little")
+        kind = (head >> 1) & 3
+        if kind == 3:
+            raise ValueError("zstd frame with a reserved block type")
+        pos += 3 + (1 if kind == 1 else head >> 3)  # an RLE block holds one byte
+        if head & 1:
+            return pos + (4 if checksum else 0)
+
+
+def zstd_bounded(frame, limit):
+    """The bytes of a payload that must be exactly one zstd frame (nothing after it) decoding to at most `limit`
+    bytes. Never produces more than limit + 1 bytes whatever the frame claims; ValueError otherwise."""
+    try:
+        if zstd_frame_length(frame) != len(frame):
+            raise ValueError("bytes after the zstd frame")
+        declared = zstandard.frame_content_size(frame)
+        if declared > limit:
+            raise ValueError("zstd frame declares more than its region holds")
+        reader = zstandard.ZstdDecompressor().stream_reader(bytes(frame), read_across_frames=False)
+        parts, got = [], 0
+        while got <= limit:
+            part = reader.read(min(limit + 1 - got, 16 << 20))
+            if not part:
+                break
+            parts.append(part)
+            got += len(part)
+    except zstandard.ZstdError as e:
+        raise ValueError(f"bad zstd frame ({e})") from e
+    if got > limit or declared not in (-1, got):
+        raise ValueError("zstd frame decodes to more than it should")
+    return b"".join(parts)
+
+
+def zstd_exact(frame, size):
+    """zstd_bounded for a frame that must decode to exactly `size` bytes."""
+    out = zstd_bounded(frame, size)
+    if len(out) != size:
+        raise ValueError("zstd frame decodes to the wrong length")
+    return out
 
 
 # ----------------------------------------------------------------------------------------------- byte planes (codec 1)
@@ -336,7 +405,7 @@ def planes_decode(payload, raw_len, dtype):
             if not d.eof or d.unconsumed_tail or d.unused_data:
                 raise ValueError("byte planes: DEFLATE stream does not end where it should")
         elif coding == PLANE_ZSTD:
-            raw = zstandard.ZstdDecompressor().decompress(body, max_output_size=expect)
+            raw = zstd_exact(body, expect)
         else:
             raise ValueError(f"byte planes: unknown coding {coding}")
         if len(raw) != expect:
@@ -351,7 +420,7 @@ def decode_payload(codec, payload, raw_len, dtype):
     if codec == CODEC_RAW:
         return bytes(payload)
     if codec == CODEC_ZSTD:
-        return zstandard.ZstdDecompressor().decompress(payload, max_output_size=raw_len)
+        return zstd_exact(payload, raw_len)
     if codec == CODEC_PLANES:
         return planes_decode(payload, raw_len, dtype)
     raise ValueError(f"unknown codec {codec}")
@@ -412,6 +481,7 @@ def ordered_map(fn, items, workers):
 GGUF_FLOAT_TYPES = {0: ("F32", 4), 1: ("F16", 2), 30: ("BF16", 2)}  # ggml_type -> (dtype, bytes per element)
 GGUF_SCALARS = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f", 7: "<?", 10: "<Q", 11: "<q", 12: "<d"}
 GGUF_STRING, GGUF_ARRAY = 8, 9
+GGUF_MAX_DIMS = 8  # GGML uses at most 4
 TEXT_SUFFIXES = (".json", ".txt", ".md", ".py", ".jinja", ".model", ".tiktoken", ".vocab", ".yaml", ".yml", ".csv")
 
 
@@ -452,11 +522,14 @@ def gguf_tensors(path):
                     return None
             tensors = []
             for _ in range(n_tensors):
-                name = f.read(read("<Q")).decode("utf-8", "replace")
-                dims = [read("<Q") for _ in range(read("<I"))]
+                name = f.read(read("<Q")).decode("utf-8")  # strict: an invalid name makes the file plain bytes
+                n_dims = read("<I")
+                if n_dims > GGUF_MAX_DIMS:
+                    return None
+                dims = [read("<Q") for _ in range(n_dims)]
                 tensors.append((name, read("<I"), dims, read("<Q")))
-            if alignment < 1:
-                return None  # not a valid file: stored as plain bytes
+            if alignment < 1 or len({t[0] for t in tensors}) != len(tensors):
+                return None  # not a valid file (or tensor names that do not say which is which): stored as plain bytes
             return -(-f.tell() // alignment) * alignment, tensors
     except (OSError, ValueError, struct.error, MemoryError, OverflowError):
         return None
@@ -479,7 +552,7 @@ def file_tensors(path, size):
                 next_start = next((s for s in starts if s > start), size)
                 if ggml_type in GGUF_FLOAT_TYPES:
                     dtype, element = GGUF_FLOAT_TYPES[ggml_type]
-                    end = start + element * int(np.prod(dims, dtype=np.int64))
+                    end = start + element * math.prod(dims)  # Python integers: no wrap-around
                 else:
                     dtype, end = f"ggml_type_{ggml_type}", next_start
                 if end > next_start:
@@ -810,22 +883,35 @@ def ans16_encode(base, target, dtype, prec=ANS16_PREC, min_context=ANS16_MIN_CON
 
 def ans16_decode(base, payload, dtype, stop=None):
     """The target weights coded in payload; with stop, only the first `stop` of them (cheaper, but unchecked)."""
+    if len(payload) < ANS16_HEAD.size:
+        raise ValueError("ans16 payload too short")
     prec, min_context, n, lanes, contexts, tables_zlen, counts_zlen, nwords = ANS16_HEAD.unpack_from(payload, 0)
     if n != base.size:
         raise ValueError("ans16 region size does not match its base")
+    if not (1 <= prec <= 30 and 1 <= lanes <= ANS16_MAX_LANES and 1 <= contexts <= ANS16_RARE_CONTEXT + 1):
+        raise ValueError("ans16 header out of range")
     pos = ANS16_HEAD.size
-    tables = zstandard.ZstdDecompressor().decompress(payload[pos : pos + tables_zlen])
+    if pos + tables_zlen + 8 * lanes + counts_zlen + 4 * nwords != len(payload):
+        raise ValueError("ans16 payload lengths do not add up")
+    # every table is bounded: at most 257 contexts of at most 65536 symbols, 6 bytes each, plus 6 bytes per context
+    tables = zstd_bounded(payload[pos : pos + tables_zlen], 6 * contexts * (1 + 65536))
     pos += tables_zlen
     states = np.frombuffer(payload, "<u8", lanes, pos)
     pos += 8 * lanes
-    lane_counts = np.frombuffer(zstandard.ZstdDecompressor().decompress(payload[pos : pos + counts_zlen]), "<u4")
+    lane_counts = np.frombuffer(zstd_exact(payload[pos : pos + counts_zlen], 4 * lanes), "<u4")
     pos += counts_zlen
     words = np.frombuffer(payload, "<u4", nwords, pos)
+    if len(tables) < 6 * contexts or int(lane_counts.sum()) != nwords:
+        raise ValueError("ans16 tables do not fit the header")
     ctx_ids = np.frombuffer(tables, "<u2", contexts, 0).astype(np.int64)
     k = np.frombuffer(tables, "<u4", contexts, 2 * contexts).astype(np.int64)
     total = int(k.sum())
+    if np.any(k < 1) or np.any(k > 65536) or len(tables) != 6 * contexts + 6 * total or np.any(np.diff(ctx_ids) <= 0):
+        raise ValueError("ans16 tables do not fit the header")
     sym_delta = np.frombuffer(tables, "<u2", total, 6 * contexts).astype(np.int64)
     freq = np.frombuffer(tables, "<u4", total, 6 * contexts + 2 * total).astype(np.int64)
+    if np.any(freq < 1) or np.any(np.add.reduceat(freq, group_starts(k)) != 1 << prec):
+        raise ValueError("ans16 frequencies do not add up")
     sym = (group_exclusive_cumsum(sym_delta, k) + sym_delta).astype(np.uint16)
     cum = group_exclusive_cumsum(freq, k).astype(np.uint64)
     freq = freq.astype(np.uint64)
@@ -888,11 +974,76 @@ def _ans16_decode_job(job):
 # ----------------------------------------------------------------------------------------------- container I/O
 
 
-def read_container_header(f):
+MAX_HEADER = 64 << 20  # bytes of container header JSON
+MAX_REGION = 1 << 30  # bytes one region restores to (--chunk-mib is at most 1024)
+MAX_REGIONS = 1 << 22
+REGION_KINDS = {"float", "zstd", "auto", "ans16", "xor"}
+
+
+def container_header_problem(header):
+    """None if a container header can be used: regions that cover original_size in order without gaps, each within
+    MAX_REGION, of a known kind, and base references that point into the delta's files; else why not."""
+    if not isinstance(header, dict) or not is_size(header.get("original_size")):
+        return "no original_size"
+    regions, delta = header.get("regions"), header.get("delta")
+    if not isinstance(regions, list) or len(regions) > MAX_REGIONS:
+        return "no list of regions, or too many"
+    files = []
+    if delta is not None:
+        files = delta.get("files") if isinstance(delta, dict) else None
+        if (name_problem(delta.get("repo")) if isinstance(delta, dict) else True) or not isinstance(files, list) or not files \
+                or not all(isinstance(f, dict) and not path_problem(f.get("path")) and is_sha256(f.get("sha256")) for f in files):
+            return "malformed delta"
+    pos = 0
+    for r in regions:
+        if not isinstance(r, dict) or r.get("offset") != pos or not is_size(r.get("length")) or not 0 < r["length"] <= MAX_REGION \
+                or r.get("kind") not in REGION_KINDS or not isinstance(r.get("dtype", ""), str):
+            return f"region at {pos} malformed, out of order or too long"
+        base = r.get("base")
+        if (base is not None) != (r["kind"] in ("ans16", "xor")):
+            return f"region at {pos}: a delta region needs a base reference, and only a delta region has one"
+        if base is not None:
+            if not (isinstance(base, list) and len(base) == 2 and type(base[0]) is int and 0 <= base[0] < len(files) and is_size(base[1])):
+                return f"region at {pos}: bad base reference"
+            if r.get("base_dtype", "BF16") not in FLOAT_BYTES or ("base_dtype" in r and r.get("dtype") not in ANS16_EXPONENT):
+                return f"region at {pos}: bad base_dtype"
+            if r["kind"] == "ans16" and (r.get("dtype") not in ANS16_EXPONENT or r["length"] % 2):
+                return f"region at {pos}: bad ans16 region"
+        pos += r["length"]
+    return None if pos == header["original_size"] else "regions do not add up to original_size"
+
+
+def read_container(f):
+    """(header, [(codec, raw_len, payload offset, payload_len, crc)]) of an open container, checked before anything
+    is decoded: the header (container_header_problem), one frame per region restoring to exactly its length with a
+    codec that fits the region, every payload inside the file, and nothing after the last one. ValueError if not."""
+    size = os.fstat(f.fileno()).st_size
     if f.read(4) != MAGIC:
         raise ValueError(f"not an {MAGIC.decode()} container")
-    (n,) = struct.unpack("<I", f.read(4))
-    return json.loads(f.read(n))
+    (n,) = struct.unpack("<I", f.read(4).ljust(4, b"\0"))
+    if n > min(MAX_HEADER, size - 8):
+        raise ValueError("container header too long for the file")
+    header = strict_json(f.read(n))
+    problem = container_header_problem(header)
+    if problem:
+        raise ValueError(f"container header: {problem}")
+    frames, pos = [], 8 + n
+    for region in header["regions"]:
+        if pos + FRAME_HEAD.size > size:
+            raise ValueError("container cut short")
+        f.seek(pos)
+        codec, raw_len, payload_len, crc = FRAME_HEAD.unpack(f.read(FRAME_HEAD.size))
+        pos += FRAME_HEAD.size
+        kind = codec & ~STANDALONE
+        fits = (kind in (CODEC_RAW, CODEC_ZSTD) or (kind == CODEC_PLANES and region_planes_dtype(region))
+                or (codec == CODEC_ANS16 and region["kind"] == "ans16")) and not (codec & STANDALONE and "base" not in region)
+        if raw_len != region["length"] or not fits or payload_len > size - pos:
+            raise ValueError(f"container frame at {region['offset']} does not fit its region")
+        frames.append((codec, raw_len, pos, payload_len, crc))
+        pos += payload_len
+    if pos != size:
+        raise ValueError("bytes after the last frame of the container")
+    return header, frames
 
 
 def find_entry(archive_root, repo, path):
@@ -919,7 +1070,7 @@ def iter_entry_bytes(archive_root, repo, entry, depth=0):
             while block := f.read(16 << 20):
                 yield block
     else:
-        yield from iter_original_chunks(archive_root, stored, depth)
+        yield from iter_original_chunks(archive_root, stored, depth, entry["size"])
 
 
 def materialize_file(archive_root, repo, path, sha256, depth=0):
@@ -972,17 +1123,14 @@ def base_paths_for(archive_root, delta, depth=0):
 STANDALONE = 0x80  # frame codec flag: this region of a delta was stored without using the base
 
 
-def iter_original_chunks(archive_root, container_path, depth=0):
+def iter_original_chunks(archive_root, container_path, depth=0, expected_size=None):
     """Yield the original file's bytes region by region, resolving deltas against base archives recursively.
     ans16 regions are decoded in parallel worker processes."""
     with open(container_path, "rb") as f:
-        header = read_container_header(f)
+        header, frames = read_container(f)
+        if expected_size is not None and header["original_size"] != expected_size:
+            raise ValueError(f"{container_path}: the container restores {header['original_size']} bytes, not {expected_size}")
         regions = header["regions"]
-        frames = []
-        for _ in regions:
-            codec, raw_len, payload_len, crc = FRAME_HEAD.unpack(f.read(FRAME_HEAD.size))
-            frames.append((codec, raw_len, f.tell(), payload_len, crc))
-            f.seek(payload_len, 1)
         delta = header.get("delta")
         base_paths, owned = base_paths_for(archive_root, delta, depth) if delta else ([], [])
         jobs = [
@@ -1024,11 +1172,13 @@ def iter_original_chunks(archive_root, container_path, depth=0):
                 os.remove(path)
 
 
-def write_container(src_path, dst_path, regions, levels, delta=None, base_paths=(), workers=1):
+def write_container(src_path, dst_path, regions, levels, delta=None, base_paths=(), workers=1, tree=None, replace=True):
     """One frame per region. Standalone regions are coded by kind. Regions with a "base" reference are coded
     against it (ans16 in parallel worker processes, or the original XOR base by byte planes/zstd) unless storing
     them standalone is smaller, in which case the frame's codec carries the STANDALONE flag. Other regions are coded
-    on threads (frame_workers), read and written here in order."""
+    on threads (frame_workers), read and written here in order. The container is written through tree.placing
+    (dst_path is then relative to the tree; without a tree, a path whose folder is the tree), replacing an existing
+    file only if `replace`. Returns (frame codecs used, container size, its SHA-256), counted as it is written."""
     header = {"original_size": os.path.getsize(src_path), "regions": regions, "delta": delta}
     hb = json.dumps(header).encode()
     codecs_used = {}
@@ -1047,9 +1197,12 @@ def write_container(src_path, dst_path, regions, levels, delta=None, base_paths=
         codec, payload = encode_chunk(data, dtype, level)
         return len(data), zlib.crc32(data), [encode_chunk(xor_bytes(data, base), dtype, level), (codec | STANDALONE, payload)]
 
+    if tree is None:
+        tree, dst_path = SafeTree(os.path.dirname(os.path.abspath(dst_path))), os.path.basename(dst_path)
     coded = None
     try:
-        with open(src_path, "rb") as src, open(src_path, "rb") as ahead, open(dst_path + ".part", "wb") as dst:
+        with open(src_path, "rb") as src, open(src_path, "rb") as ahead, tree.placing(dst_path, replace) as out:
+            dst = HashingWriter(out)
             dst.write(MAGIC + struct.pack("<I", len(hb)) + hb)
             encoded = pool.map(_ans16_encode_job, jobs) if pool else iter(())
 
@@ -1079,17 +1232,14 @@ def write_container(src_path, dst_path, regions, levels, delta=None, base_paths=
                 codecs_used[codec] = codecs_used.get(codec, 0) + 1
                 dst.write(FRAME_HEAD.pack(codec, length, len(payload), crc))
                 dst.write(payload)
-            dst.flush()
-            os.fsync(dst.fileno())  # on disk before a manifest can point at it (rebase then deletes the old file)
-    finally:
+    finally:  # placing() synced the file to disk before putting it in place (rebase then deletes the old one)
         if coded is not None:
             coded.close()
         for b in bases:
             b.close()
         if pool:
             pool.shutdown()
-    os.replace(dst_path + ".part", dst_path)
-    return codecs_used
+    return codecs_used, dst.size, dst.hash.hexdigest()
 
 
 # ----------------------------------------------------------------------------------------------- partial reads
@@ -1124,12 +1274,7 @@ def container_index(path):
     """(header, [(codec, raw_len, payload offset, payload_len, crc)], region offsets) of a container."""
     if path not in _CONTAINERS:
         with open(path, "rb") as f:
-            header = read_container_header(f)
-            frames = []
-            for _ in header["regions"]:
-                codec, raw_len, payload_len, crc = FRAME_HEAD.unpack(f.read(FRAME_HEAD.size))
-                frames.append((codec, raw_len, f.tell(), payload_len, crc))
-                f.seek(payload_len, 1)
+            header, frames = read_container(f)
         _CONTAINERS[path] = header, frames, [r["offset"] for r in header["regions"]]
     return _CONTAINERS[path]
 
@@ -1148,6 +1293,8 @@ def read_range(archive_root, repo, entry, start, length, depth=0):
             f.seek(start)
             return f.read(length)
     header, _, offsets = container_index(stored)
+    if header["original_size"] != entry["size"]:
+        raise ValueError(f"{stored}: the container restores {header['original_size']} bytes, not {entry['size']}")
     parts, end = [], start + length
     for i in range(max(0, bisect.bisect_right(offsets, start) - 1), len(offsets)):
         region = header["regions"][i]
@@ -1384,8 +1531,8 @@ def load_manifest(archive_root, repo_id):
     if problem:
         raise ValueError(problem)
     path = os.path.join(archive_root, repo_dir_name(repo_id), "manifest.json")
-    with open(path, encoding="utf-8") as f:
-        manifest = json.load(f)
+    with open(path, "rb") as f:
+        manifest = strict_json(f.read())
     problem = manifest_problem(manifest)
     if not problem and manifest["repo"] != repo_id:
         problem = f"this folder holds the model {manifest['repo']!r}, not {repo_id!r}"
@@ -1488,19 +1635,16 @@ def pack_file(args, src, rec, repo_path, base, base_files, delta_codec, chunk_si
         ref_repo, ref_path = same_index[rec["sha256"]]
         entry.update(method="same", same_as={"repo": ref_repo, "path": ref_path}, stored=None, stored_size=0, stored_sha256=None)
         return entry
+    tree = SafeTree(repo_path)  # stored files are new names: placed only where nothing is (replace=False)
     if rec["size"] <= RAW_COPY_LIMIT and fmt in ("auto", "zstd"):
         entry.update(stored=raw_stored or portable_path(rec["path"]), method="raw")
-        dst = os.path.join(repo_path, *entry["stored"].split("/"))
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        with open(src, "rb") as f, open(dst + ".part", "wb") as out:
-            shutil.copyfileobj(f, out)
-            out.flush()
-            os.fsync(out.fileno())  # on disk before a manifest can point at it, as for a container
-        os.replace(dst + ".part", dst)
+        with open(src, "rb") as f, tree.placing(entry["stored"], replace=False) as out:
+            dst = HashingWriter(out)
+            while block := f.read(16 << 20):
+                dst.write(block)
+        entry.update(stored_size=dst.size, stored_sha256=dst.hash.hexdigest())
     else:
         entry["stored"] = stored or portable_path(rec["path"]) + ".ocz"
-        dst = os.path.join(repo_path, *entry["stored"].split("/"))
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
         delta_regions, used = delta_layout(tensors, fmt, rec["size"], chunk_size, base_files, delta_codec)
         if used:
             files = [{"path": f["path"], "sha256": f["sha256"]} for f in used]
@@ -1510,19 +1654,18 @@ def pack_file(args, src, rec, repo_path, base, base_files, delta_codec, chunk_si
                 if key not in _BASE_CACHE:
                     _BASE_CACHE[key] = materialize_file(args.archive_root, base, f["path"], f["sha256"])
             base_paths = [_BASE_CACHE[(base, f["path"], f["sha256"])] for f in files]
-            codecs_used = write_container(src, dst, delta_regions, levels, delta, base_paths, args.workers)
+            codecs_used, size, sha = write_container(src, entry["stored"], delta_regions, levels, delta, base_paths,
+                                                     args.workers, tree, replace=False)
             matched = sum(r["length"] for r in delta_regions if "base" in r)
             kind = "ans16" if any(r["kind"] == "ans16" for r in delta_regions) else "xor"
             entry.update(method=f"{fmt}+{kind}", delta_base=base, delta_files=files, matched_bytes=matched)
         else:
-            codecs_used = write_container(src, dst, regions, levels)
+            codecs_used, size, sha = write_container(src, entry["stored"], regions, levels, tree=tree, replace=False)
             entry["method"] = fmt
         entry["frame_codecs"] = {
             CODEC_NAMES[c & ~STANDALONE] + ("/standalone" if c & STANDALONE else ""): n for c, n in sorted(codecs_used.items())
         }
-    dst = os.path.join(repo_path, *entry["stored"].split("/"))
-    entry["stored_size"] = os.path.getsize(dst)
-    entry["stored_sha256"] = sha256_file(dst)
+        entry.update(stored_size=size, stored_sha256=sha)  # of the bytes written, not of whatever the path holds now
     return entry
 
 
@@ -1531,33 +1674,29 @@ def remove_orphans(repo_path, old_entries, entries):
     containers, which were stored again under the other name, or turned into same-as references). Nothing else in
     the directory is touched, so files added by other tools (recovery data, notes) stay, though they may now describe
     outdated contents."""
-    keep = {os.path.normcase(os.path.normpath(e["stored"])) for e in entries if e.get("stored")}
-    removed = []
+    keep = {name_key(e["stored"]) for e in entries if e.get("stored")}
+    tree = SafeTree(repo_path)
     for e in old_entries:
         rel = e.get("stored")
-        if rel and os.path.normcase(os.path.normpath(rel)) not in keep and os.path.isfile(os.path.join(repo_path, rel)):
-            os.remove(os.path.join(repo_path, rel))
-            removed.append(rel)
+        if rel and name_key(rel) not in keep and tree.remove(rel):
+            tree.prune(rel)
             print(f"  removed {rel} (no longer used by the manifest)")
-    prune_empty_folders(repo_path, removed)
 
 
-def remove_unreferenced(archive_root, repo, paths):
-    """For a pack or rebase that stopped early: delete these new stored files (and their .part files), unless the
-    manifest on disk already uses them."""
-    repo_path = os.path.join(archive_root, repo_dir_name(repo))
+def remove_unreferenced(archive_root, repo, names):
+    """For a pack or rebase that stopped early: delete these new stored files (names inside the model folder),
+    unless the manifest on disk already uses them."""
     try:
-        in_use = {os.path.normcase(os.path.join(repo_path, *e["stored"].split("/")))
-                  for e in load_manifest(archive_root, repo)["files"] if e.get("stored")}
+        in_use = {name_key(e["stored"]) for e in load_manifest(archive_root, repo)["files"] if e.get("stored")}
     except FileNotFoundError:
         in_use = set()  # a first pack: no manifest refers to anything yet
     except (OSError, ValueError):
         return  # cannot tell: leave them
-    for path in paths:
-        for p in (path, path + ".part"):
-            if os.path.normcase(p) not in in_use and os.path.exists(p):
-                os.remove(p)
-    prune_empty_folders(repo_path, [os.path.relpath(p, repo_path).replace(os.sep, "/") for p in paths])
+    tree = SafeTree(os.path.join(archive_root, repo_dir_name(repo)))
+    for name in names:
+        if name_key(name) not in in_use:
+            tree.remove(name)
+            tree.prune(name)
 
 
 def excluded(rel, patterns):
@@ -1618,6 +1757,7 @@ if os.name == "nt":
                             ctypes.POINTER(_Overlapped)]
     _LockFileEx.restype = wintypes.BOOL
     _kernel32.GetVolumePathNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+    _kernel32.GetFinalPathNameByHandleW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
     _kernel32.GetVolumeInformationW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD, wintypes.LPDWORD,
                                                 wintypes.LPDWORD, wintypes.LPDWORD, wintypes.LPWSTR, wintypes.DWORD]
     ERROR_LOCK_VIOLATION = 33
@@ -1639,7 +1779,6 @@ if os.name == "nt":
                     and _kernel32.GetVolumeInformationW(root, None, 0, None, None, ctypes.byref(flags), None, 0)
                     and flags.value & 0x00080000)  # FILE_READ_ONLY_VOLUME
 else:
-    import errno
     import fcntl
 
     def _try_lock(fd, exclusive):
@@ -1771,7 +1910,7 @@ def cmd_pack(args):
             # new files only ever go under names nothing in the folder uses yet
             container = names.fresh(rec["path"])
             raw = names.fresh(rec["path"], "") if rec["size"] <= RAW_COPY_LIMIT else None
-            pending += [os.path.join(repo_path, *n.split("/")) for n in (container, raw) if n]
+            pending += [n for n in (container, raw) if n]
             entry, problem = pack_verified(args, src, rec, repo_path, name, base, base_files, chunk_size, same_index, container, raw)
             if problem:
                 sys.exit(f"  VERIFY FAILED {rec['path']}: {problem}")
@@ -1841,6 +1980,7 @@ def pack_verified(args, src, rec, repo_path, repo, base, base_files, chunk_size,
         problem = verify_entry(args.archive_root, repo, entry) if entry["method"] != "same" else None
         if problem and entry.get("delta_base") and args.delta_codec == "ans16":
             print(f"    ans16 failed verification ({problem}); redoing this file as an XOR delta")
+            SafeTree(repo_path).remove(entry["stored"])
             entry = pack_file(args, src, rec, repo_path, base, base_files, "xor", chunk_size, same_index, stored, raw_stored)
             problem = verify_entry(args.archive_root, repo, entry)
     finally:
@@ -1863,17 +2003,9 @@ def print_entry(rec, entry, t0):
 
 def write_manifest(repo_path, manifest):
     """Replace manifest.json in one step: a crash leaves either the old manifest or the new one. The new one is
-    written to a temporary file of its own, so no stored file can be in the way."""
-    fd, tmp = tempfile.mkstemp(prefix=".manifest-", suffix=".part", dir=repo_path)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(manifest, f, indent=1)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, os.path.join(repo_path, "manifest.json"))
-    except BaseException:
-        os.remove(tmp)
-        raise
+    written to a temporary file of its own (SafeTree.placing), so no stored file can be in the way."""
+    with SafeTree(repo_path).placing("manifest.json", replace=True) as f:
+        f.write(json.dumps(manifest, indent=1).encode("utf-8"))
 
 
 # ----------------------------------------------------------------------------------------------- rebase
@@ -1970,16 +2102,180 @@ class StoredNames:
                 return name
 
 
-def prune_empty_folders(repo_path, stored_paths):
-    """Remove the folders of these stored paths that are now empty, deepest first (never repo_path itself)."""
-    for rel in stored_paths:
-        parts = rel.split("/")[:-1]
+class UnsafePath(OSError):
+    """A folder on the way to a file is a link (or not a folder): refused, never followed."""
+
+
+class SafeTree:
+    """Creates, replaces and deletes files inside one folder (`root`, trusted as given) without following any link
+    below it, so that another program swapping a folder for a link while this one runs cannot redirect a write or a
+    delete outside the tree.
+
+    POSIX: every step goes through directory handles opened with O_NOFOLLOW (os.open/mkdir/rename/unlink with
+    dir_fd), so a link anywhere below root is refused, never followed. Windows (Python has no directory handles
+    there): each folder on the way is checked not to be a link (reparse point) just before use, and a new file's
+    real location is checked through its own handle before it is put in place; a best effort, since a folder can
+    still be swapped between a check and its use.
+
+    New files are written to a temporary file with a random name, created exclusively (an existing name, a link
+    included, makes the creation fail), and written through the open handle only."""
+
+    POSIX = os.name != "nt"
+
+    def __init__(self, root):
+        self.root = os.path.realpath(root)
+
+    @staticmethod
+    def _parts(rel):
+        parts = rel.split("/")
+        if any(p in ("", ".", "..") or "\0" in p or (os.name == "nt" and ("\\" in p or ":" in p)) for p in parts):
+            raise ValueError(f"unsafe path {rel!r}")
+        return parts
+
+    def _open_dir(self, parts, create):
+        """POSIX: a handle on root/parts, each level opened with O_NOFOLLOW (made first if `create`)."""
+        fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for i, name in enumerate(parts):
+                if create:
+                    try:
+                        os.mkdir(name, 0o777, dir_fd=fd)
+                    except FileExistsError:
+                        pass
+                try:
+                    child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                except OSError as e:
+                    if e.errno in (errno.ELOOP, errno.ENOTDIR):
+                        raise UnsafePath(f"{'/'.join(parts[:i + 1])} in {self.root} is a link or not a folder: not followed") from e
+                    raise
+                os.close(fd)
+                fd = child
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def _windows_dir(self, parts, create):
+        """Windows: root/parts, each level made if `create` and checked not to be a link (a reparse point)."""
+        path = self.root
+        for i, name in enumerate(parts):
+            path = os.path.join(path, name)
+            if create:
+                try:
+                    os.mkdir(path)
+                except FileExistsError:
+                    pass
+            st = os.lstat(path)
+            if not stat.S_ISDIR(st.st_mode) or st.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+                raise UnsafePath(f"{'/'.join(parts[:i + 1])} in {self.root} is a link or not a folder: not followed")
+        return path
+
+    @contextlib.contextmanager
+    def placing(self, rel, replace=True):
+        """Write a new file at rel ("/"-separated, inside the tree): yields a binary file object on a fresh temporary
+        file next to it. When the block ends without an exception, the file is synced to disk and put in place:
+        over whatever is at rel if `replace`, else only if nothing is (FileExistsError otherwise; the check and the
+        placing are one step). On an exception the temporary file is deleted and rel is left as it was."""
+        parts = self._parts(rel)
+        folder, name = parts[:-1], parts[-1]
+        temp = f".oc-{secrets.token_hex(8)}.part"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0)
+        if self.POSIX:
+            dfd = self._open_dir(folder, create=True)
+            where = dict(dir_fd=dfd)
+            path = lambda n: n  # noqa: E731
+            flags |= os.O_NOFOLLOW
+        else:
+            dfd, where = None, {}
+            dirpath = self._windows_dir(folder, create=True)
+            path = lambda n: os.path.join(dirpath, n)  # noqa: E731
+        placed = False
+        try:
+            fd = os.open(path(temp), flags, 0o644, **where)
+            with os.fdopen(fd, "wb") as f:
+                yield f
+                f.flush()
+                os.fsync(f.fileno())
+                if not self.POSIX:
+                    self._check_location(f.fileno(), dirpath)
+            renames = dict(src_dir_fd=dfd, dst_dir_fd=dfd) if self.POSIX else {}
+            if replace:
+                os.replace(path(temp), path(name), **renames)
+            elif self.POSIX:  # reserve the name exclusively, then move the file onto that reservation
+                os.close(os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dfd))
+                os.replace(temp, name, **renames)
+            else:
+                os.rename(path(temp), path(name))  # Windows: fails if the name exists
+            placed = True
+        finally:
+            if not placed:
+                try:
+                    os.unlink(path(temp), **where)
+                except FileNotFoundError:
+                    pass
+            if dfd is not None:
+                os.close(dfd)
+
+    @staticmethod
+    def _check_location(fd, dirpath):
+        """Windows: refuse a file whose real folder, read through its own handle, is not dirpath (a folder on the
+        way was swapped for a junction or link after it was checked)."""
+        buf = ctypes.create_unicode_buffer(32768)
+        n = _kernel32.GetFinalPathNameByHandleW(wintypes.HANDLE(msvcrt.get_osfhandle(fd)), buf, len(buf), 0)
+        if not n:
+            raise ctypes.WinError(ctypes.get_last_error())
+        real = buf.value[4:] if buf.value.startswith("\\\\?\\") else buf.value
+        if real.startswith("UNC\\"):
+            real = "\\" + real[3:]
+        # dirpath is root (resolved once, at the start) plus plain folder names: any link on the way shows here
+        if os.path.normcase(os.path.dirname(real)) != os.path.normcase(dirpath):
+            raise UnsafePath(f"a new file landed in {os.path.dirname(real)}, not {dirpath}: a folder was swapped; refused")
+
+    def remove(self, rel):
+        """Delete the file (or link) at rel if it is there, and say whether it was; a link is deleted itself, never
+        followed, and a folder is left alone."""
+        parts = self._parts(rel)
+        try:
+            if self.POSIX:
+                dfd = self._open_dir(parts[:-1], create=False)
+                try:
+                    os.unlink(parts[-1], dir_fd=dfd)
+                finally:
+                    os.close(dfd)
+            else:
+                os.unlink(os.path.join(self._windows_dir(parts[:-1], create=False), parts[-1]))
+            return True
+        except (FileNotFoundError, IsADirectoryError, PermissionError):
+            return False
+
+    def prune(self, rel):
+        """Remove the folders of rel that are now empty, deepest first (never root itself)."""
+        parts = self._parts(rel)[:-1]
         while parts:
             try:
-                os.rmdir(os.path.join(repo_path, *parts))
+                if self.POSIX:
+                    dfd = self._open_dir(parts[:-1], create=False)
+                    try:
+                        os.rmdir(parts[-1], dir_fd=dfd)
+                    finally:
+                        os.close(dfd)
+                else:
+                    os.rmdir(self._windows_dir(parts, create=False))
             except OSError:
-                break  # not empty, or already gone
+                return  # not empty, gone, or not a plain folder
             parts.pop()
+
+
+class HashingWriter:
+    """A file object that also counts and hashes what is written through it."""
+
+    def __init__(self, f):
+        self.f, self.size, self.hash = f, 0, hashlib.sha256()
+
+    def write(self, data):
+        self.f.write(data)
+        self.size += len(data)
+        self.hash.update(data)
 
 
 def space_problem(needs):
@@ -1994,38 +2290,48 @@ def space_problem(needs):
     return None
 
 
-def restore_entry(archive_root, repo, entry, dst):
-    """Write the original bytes of an archived file to dst. They go to a new temporary file in dst's folder first,
-    which replaces dst only once its size and SHA-256 are right, so on a problem dst is left as it was. Returns a
-    problem, or None."""
+class _Mismatch(Exception):
+    pass
+
+
+def restore_entry(archive_root, repo, entry, tree, rel, replace):
+    """Write the original bytes of an archived file to rel in tree (SafeTree.placing): into a new temporary file
+    that is put in place only once its size and SHA-256 are right, so on a problem rel is left as it was; over a
+    file already there only if `replace` (else the placing fails, in one step, if a file of that name has appeared).
+    Returns a problem, or None."""
     problem = chain_problem(archive_root, repo, entry)
     if problem:
         return problem
-    fd, tmp = tempfile.mkstemp(prefix=".oc-restore-", suffix=".part", dir=os.path.dirname(os.path.abspath(dst)))
-    h, size = hashlib.sha256(), 0
     try:
-        with os.fdopen(fd, "wb") as f:
+        with tree.placing(rel, replace) as f:
+            out = HashingWriter(f)
             for chunk in iter_entry_bytes(archive_root, repo, entry):
-                f.write(chunk)
-                h.update(chunk)
-                size += len(chunk)
-            f.flush()
-            os.fsync(f.fileno())
-        if size != entry["size"] or h.hexdigest() != entry["sha256"]:
-            return "restored bytes differ from original sha256"
-        os.replace(tmp, dst)
-        tmp = None
-        return None
+                out.write(chunk)
+            if out.size != entry["size"] or out.hash.hexdigest() != entry["sha256"]:
+                raise _Mismatch
+    except _Mismatch:
+        return "restored bytes differ from original sha256"
+    except FileExistsError:
+        return "a file of that name appeared in the destination while restoring: not overwritten (--overwrite replaces it)"
+    except UnsafePath as e:
+        return str(e)
     except Exception as e:
         return f"restore failed: {e}"
-    finally:
-        if tmp and os.path.exists(tmp):
-            os.remove(tmp)
+    return None
 
 
 def restore_target(dest_dir, parts):
-    """Where restore writes the file with these path parts: inside dest_dir even after following any symlinked or
-    junctioned folder on the way; ValueError otherwise."""
+    """Where restore writes the file with these path parts: inside dest_dir, with no link (symlink or junction) on
+    the way below dest_dir, since restore never writes through one (SafeTree); ValueError otherwise."""
+    path = dest_dir
+    for i, part in enumerate(parts[:-1]):
+        path = os.path.join(path, part)
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            break
+        if stat.S_ISLNK(st.st_mode) or getattr(st, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0):
+            raise ValueError(f"{'/'.join(parts[:i + 1])} in {dest_dir} is a link: restore does not write through links")
     dst = os.path.join(dest_dir, *parts)
     root = os.path.realpath(dest_dir)
     try:
@@ -2072,7 +2378,7 @@ def restore_plan(dest_dir, entries):
                 break
         taken.add(key)
         rel = "/".join(where)
-        plan[i] = (entries[i], dst, rel if rel != entries[i]["path"] else None)
+        plan[i] = (entries[i], dst, rel, rel != entries[i]["path"])
     return plan
 
 
@@ -2153,19 +2459,18 @@ def rebase_model(args, repo):
             if problem:
                 sys.exit(f"  not enough room to rebase {rec['path']}: {problem} (OC_TMP picks the temporary folder)")
             t0 = time.perf_counter()
-            src = os.path.join(tmp, local_parts(rec["path"])[-1])  # keeps the extension file_regions looks at
+            name = local_parts(rec["path"])[-1]  # keeps the extension file_regions looks at
+            src = os.path.join(tmp, name)
             try:
-                problem = restore_entry(args.archive_root, repo, old, src)
+                problem = restore_entry(args.archive_root, repo, old, SafeTree(tmp), name, replace=False)
                 if problem:
                     sys.exit(f"  cannot restore {rec['path']}: {problem}")
                 stored = names.fresh(rec["path"])
                 names.add(stored)
-                pending.append(os.path.join(repo_path, *stored.split("/")))
+                pending.append(stored)
                 entry, problem = pack_verified(args, src, rec, repo_path, repo, base, base_files, chunk_size, {}, stored)
             finally:
-                for path in (src, src + ".part"):
-                    if os.path.exists(path):
-                        os.remove(path)
+                SafeTree(tmp).remove(name)
             if problem:
                 sys.exit(f"  VERIFY FAILED {rec['path']}: {problem}")
             print_entry(rec, entry, t0)
@@ -2173,8 +2478,8 @@ def rebase_model(args, repo):
                 entries[-1] = entry
                 print(f"    replaces {stored_description(old)}")
             else:
-                os.remove(pending.pop())
-                prune_empty_folders(repo_path, [entry["stored"]])
+                SafeTree(repo_path).remove(pending.pop())
+                SafeTree(repo_path).prune(entry["stored"])
                 print(f"    not smaller than {stored_description(old)}: kept that")
         if any(e is not o for e, o in zip(entries, old_entries)):
             write_manifest(repo_path, {**manifest, "tool": TOOL_VERSION, "base_choice": base_choice(args),
@@ -2238,8 +2543,8 @@ def all_manifests(archive_root, problems=None):
         if not os.path.exists(path):
             continue
         try:
-            with open(path, encoding="utf-8") as f:
-                manifest = json.load(f)
+            with open(path, "rb") as f:
+                manifest = strict_json(f.read())
             problem = manifest_problem(manifest)
             if not problem and os.path.normcase(repo_dir_name(manifest["repo"])) != os.path.normcase(d):
                 problem = f"it holds the model {manifest['repo']!r}, whose folder is {repo_dir_name(manifest['repo'])}"
@@ -2302,12 +2607,12 @@ def cmd_restore(args):
         except ValueError:  # another drive
             return False
 
-    if in_archive(args.dest_dir) or any(in_archive(os.path.dirname(dst)) for _, dst, _ in plan):
+    if in_archive(args.dest_dir) or any(in_archive(os.path.dirname(dst)) for _, dst, _, _ in plan):
         sys.exit(f"refusing to restore into the archive itself ({args.archive_root}): choose a folder outside it "
                  "(--overwrite does not change this)")
     targets, conflicts = [], []
-    for entry, dst, renamed in plan:
-        shown = entry["path"] + (f"  (as {renamed})" if renamed else "")
+    for entry, dst, rel, renamed in plan:
+        shown = entry["path"] + (f"  (as {rel})" if renamed else "")
         if os.path.isdir(dst) and not os.path.islink(dst):
             sys.exit(f"cannot restore {shown}: a folder of that name is in the way in {args.dest_dir}")
         present = False
@@ -2316,23 +2621,21 @@ def cmd_restore(args):
                        and sha256_file(dst) == entry["sha256"])
             if not present:
                 conflicts.append(shown)
-        targets.append((entry, dst, shown, present))
+        targets.append((entry, rel, shown, present))
     if conflicts and not args.overwrite:
         sys.exit(f"{len(conflicts)} file(s) already exist in {args.dest_dir} with other contents, e.g. {conflicts[0]}: "
                  "restore into an empty folder, or add --overwrite to replace them")
-    for entry, dst, shown, present in targets:
+    os.makedirs(args.dest_dir, exist_ok=True)
+    tree = SafeTree(args.dest_dir)
+    for entry, rel, shown, present in targets:
         if present:
             print(f"  ok    {shown}  (already there)")
             continue
-        try:
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-        except OSError as e:
-            sys.exit(f"  cannot restore {shown}: {e}")
-        problem = restore_entry(args.archive_root, args.repo, entry, dst)
+        problem = restore_entry(args.archive_root, args.repo, entry, tree, rel, replace=args.overwrite)
         if problem:
             sys.exit(f"  cannot restore {shown}: {problem}")
         print(f"  ok    {shown}")
-    renamed = sum(1 for _, _, r in plan if r)
+    renamed = sum(1 for *_, r in plan if r)
     if renamed:
         print(f"  {renamed} file(s) restored under another name: a character this system does not allow in names "
               "became \"_\", or a \" (n)\" keeps two files apart")

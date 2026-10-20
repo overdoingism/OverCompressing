@@ -79,6 +79,25 @@ for where in (len(payload) - 5, len(payload) // 2, la.ANS16_HEAD.size + 3):
         caught, how = True, f"raised {type(e).__name__}"
     failures += not caught
     print(f"  {'ok  ' if caught else 'FAIL'} flipped byte {where:>9,}: {how}")
+head = la.ANS16_HEAD.unpack_from(payload, 0)
+malformed = {
+    "bytes after the payload": bytes(payload) + b"junk",
+    "a word count that does not add up": la.ANS16_HEAD.pack(*head[:7], head[7] + 1) + bytes(payload[la.ANS16_HEAD.size:]),
+    "precision 0": la.ANS16_HEAD.pack(0, *head[1:]) + bytes(payload[la.ANS16_HEAD.size:]),
+    "300 contexts": la.ANS16_HEAD.pack(*head[:4], 300, *head[5:]) + bytes(payload[la.ANS16_HEAD.size:]),
+    "a table length past the end": la.ANS16_HEAD.pack(*head[:5], 1 << 30, *head[6:]) + bytes(payload[la.ANS16_HEAD.size:]),
+    "a 10-byte payload": bytes(payload[:10]),
+}
+for what, bad in malformed.items():
+    try:
+        la.ans16_decode(base, bad, "BF16")
+        ok, how = False, "decoded"
+    except ValueError:
+        ok, how = True, "ValueError"
+    except Exception as e:
+        ok, how = False, type(e).__name__
+    failures += not ok
+    print(f"  {'ok  ' if ok else 'FAIL'} {what}: {how}")
 try:
     la.ans16_decode(base[:-1], bytes(payload), "BF16")
     failures += 1

@@ -199,17 +199,19 @@ Writes the original files, byte-identical, and checks each SHA-256. Deltas need 
 root; ans16 deltas first restore the base files they read into `OC_TMP`.
 
 Before writing anything, every path in the manifest is checked: it must be relative, without `..`, and land inside
-`<dest_dir>` even through a symlinked or junctioned folder. Names this system does not allow are adapted, as other
+`<dest_dir>`; restore never writes through a link, so if a folder on the way below `<dest_dir>` is a symlink or a
+junction, it stops. Names this system does not allow are adapted, as other
 archivers do: on Windows each of `<>:"\|?*` and control characters becomes `_`, as do trailing dots and spaces, and a
 device name gets `_` after its stem (`CON.txt` -> `CON_.txt`). If two files would then be one file (e.g. `a\b.txt` and
-`a_b.txt`, `a.txt` and `A.txt` on Windows, or `one/f.txt` and `two/f.txt` when `two` is a link to `one`), the later
+`a_b.txt`, or `a.txt` and `A.txt` on Windows), the later
 one gets ` (1)`, ` (2)`, ... before its extension; files whose names needed no change keep them. Every renamed file
 is listed (`ok  a\b.txt  (as a_b (1).txt)`), and the names depend only on the archive, so a second restore puts every
 file in the same place. A file already in `<dest_dir>` with the right bytes is kept (`already there`), so an
 interrupted restore can simply be run again; a file with other contents stops the restore unless you add
-`--overwrite`. Each file is written to a temporary file in its folder and moved into place only once its size and
-SHA-256 are right, so a failed file never replaces what was there. A destination inside the archive itself is
-refused, even with `--overwrite`.
+`--overwrite`. Each file is written to a new temporary file with a random name in its folder and moved into place
+only once its size and SHA-256 are right, so a failed file never replaces what was there; without `--overwrite`, a
+file that appears in the destination meanwhile (another program) is not replaced either, since checking and placing
+are one step. A destination inside the archive itself is refused, even with `--overwrite`.
 
 ## 6. Protection and repair
 
@@ -237,6 +239,12 @@ choice (PAR2, RAR recovery records, ZFS/Btrfs/ReFS, …): see [protection.md](pr
   volume read-only (a CD/DVD/BD, a write-protected drive, a read-only mount), since nothing can change it then;
   otherwise they stop. `--no-lock` makes them go on anyway: use it only when you know nothing changes the archive
   meanwhile (e.g. a share that is read-only for you but not for others).
+- Links are never followed below the archive's model folders or a restore destination: if another program swaps a
+  folder there for a symlink or junction while `pack`, `rebase` or `restore` runs, the write is refused instead of
+  landing elsewhere. On Linux and macOS this holds at every step (folders are opened one by one without following
+  links); on Windows it is a best effort (each folder is checked just before use, and every new file's real location
+  through its own handle before it is put in place). Do not let untrusted users write into the archive or the
+  destination while the tool runs.
 
 ## Offline kit
 
@@ -272,7 +280,9 @@ none is found) and print the exact `restore` / `verify` commands to use. Details
 | `re-packing X would change or drop files other models need` | pack the new version under another name, or make the listed models independent first (`rebase … --no-base --no-dedupe`) |
 | `already exist … with other contents` (restore) | restore into an empty folder, or add `--overwrite` |
 | `<folder>/manifest.json: …` when packing or rebasing | restore that manifest from another copy, or move the folder out of the archive |
-| leftover `.oc-restore-*.part` or `.manifest-*.part` after a killed run | delete it |
+| leftover `.oc-*.part` after a killed run | delete it (an unfinished temporary file; nothing refers to it) |
+| `… is a link or not a folder: not followed` | a folder in the archive or the destination is a symlink or junction: replace it with a real folder (or restore elsewhere) |
+| `a file of that name appeared in the destination while restoring` | another program wrote there: run restore again, or add `--overwrite` |
 | `the archive is in use …` or `… is being changed …` | another `pack`, `rebase`, `verify` or `restore` runs on the archive: run this when it has finished |
 | `… is a link to a folder`, `… is not a regular file`, `… cannot be read` (pack) | skip it with `--exclude`, or pack the link's target as a folder of its own |
 
@@ -457,15 +467,15 @@ python -I tools/llm_archive.py restore <archive_root> <名稱> <目的資料夾>
 寫回與原檔逐 byte 相同的檔案並核對 SHA-256。delta 需要 base 模型在同一個歸檔根目錄裡；ans16 delta 會先把用到的
 base 檔還原到 `OC_TMP`。
 
-寫入任何東西之前，會先檢查 manifest 裡的每個路徑：必須是相對路徑、不含 `..`，而且即使經過符號連結或 junction 的
-資料夾，也必須落在 `<目的資料夾>` 之內。這個系統不允許的檔名會像其他解壓縮工具一樣調整：在 Windows 上，
+寫入任何東西之前，會先檢查 manifest 裡的每個路徑：必須是相對路徑、不含 `..`，而且必須落在 `<目的資料夾>` 之內；
+還原絕不經過連結寫入，所以 `<目的資料夾>` 底下途經的資料夾若是符號連結或 junction，就會停止。這個系統不允許的檔名會像其他解壓縮工具一樣調整：在 Windows 上，
 `<>:"\|?*` 與控制字元都換成 `_`，結尾的句點與空白也換成 `_`，裝置名稱則在主檔名後加 `_`（`CON.txt` -> `CON_.txt`）。
-若因此有兩個檔案變成同一個檔案（例如 `a\b.txt` 與 `a_b.txt`、Windows 上的 `a.txt` 與 `A.txt`，或 `two` 是指向
-`one` 的連結時的 `one/f.txt` 與 `two/f.txt`），後者會在副檔名前加上 ` (1)`、` (2)`……；檔名不需調整的檔案優先保留原名。
+若因此有兩個檔案變成同一個檔案（例如 `a\b.txt` 與 `a_b.txt`，或 Windows 上的 `a.txt` 與 `A.txt`），後者會在副檔名前加上 ` (1)`、` (2)`……；檔名不需調整的檔案優先保留原名。
 每個改名的檔案都會列出（`ok  a\b.txt  (as a_b (1).txt)`），而且名稱只取決於歸檔內容，所以重跑還原時每個檔案都會
 落在同一個位置。目的資料夾裡已有內容正確的檔案會保留（顯示 `already there`），所以中斷的還原可以直接重跑；已有但內容不同
-的檔案會讓還原停止，除非加上 `--overwrite`。每個檔案都先寫到同資料夾的暫存檔，確認大小與 SHA-256 正確後才移到定位，
-所以失敗的檔案不會蓋掉原本的檔案。目的資料夾若在歸檔之內，即使加上 `--overwrite` 也會拒絕。
+的檔案會讓還原停止，除非加上 `--overwrite`。每個檔案都先寫到同資料夾裡以隨機名稱新建的暫存檔，確認大小與 SHA-256
+正確後才移到定位，所以失敗的檔案不會蓋掉原本的檔案；沒有 `--overwrite` 時，就算還原期間有其他程式在目的地建立了同名
+檔案，也不會被覆蓋，因為「確認不存在」與「放上檔案」是同一個步驟。目的資料夾若在歸檔之內，即使加上 `--overwrite` 也會拒絕。
 
 ## 6. 防護與修復
 
@@ -490,6 +500,10 @@ ZFS/Btrfs/ReFS 等），詳見 [protection.md](protection.md)。
   若完全無法加鎖，只有在作業系統回報歸檔所在的磁碟是唯讀時（光碟、防寫磁碟、唯讀掛載）才照常執行，因為這時不可能有人
   寫入；其他情況會停止。加上 `--no-lock` 可強制執行：請只在確定這段期間沒有人會改動歸檔時使用（例如對你唯讀、但別人
   可寫的共用資料夾）。
+- 在歸檔的模型資料夾與還原目的資料夾底下，絕不跟隨連結：若 `pack`、`rebase` 或 `restore` 執行期間有其他程式把某個資料夾
+  換成符號連結或 junction，寫入會被拒絕，而不會寫到別處。在 Linux 與 macOS 上每一步都有保障（逐層開啟資料夾、不跟隨連結）；
+  在 Windows 上則是盡力而為（每層資料夾使用前檢查，每個新檔案放上前再透過它自己的 handle 確認實際位置）。工具執行期間，
+  請不要讓不受信任的使用者能寫入歸檔或目的資料夾。
 
 ## 離線工具包
 
@@ -525,6 +539,8 @@ sh _kit/install_linux.sh
 | `re-packing X would change or drop files other models need` | 把新版本用另一個名稱打包，或先讓列出的模型不再依賴它（`rebase … --no-base --no-dedupe`） |
 | 還原時出現 `already exist … with other contents` | 還原到空資料夾，或加上 `--overwrite` |
 | 打包或 rebase 時出現 `<資料夾>/manifest.json: …` | 從其他副本換回該 manifest，或把該資料夾移出歸檔 |
-| 程式被強制中斷後留下 `.oc-restore-*.part` 或 `.manifest-*.part` | 直接刪除 |
+| 程式被強制中斷後留下 `.oc-*.part` | 直接刪除（未完成的暫存檔，沒有任何東西引用它） |
+| `… is a link or not a folder: not followed` | 歸檔或目的資料夾中有資料夾是符號連結或 junction：改成實際的資料夾（或還原到別處） |
+| `a file of that name appeared in the destination while restoring` | 有其他程式寫入了目的地：重跑還原，或加上 `--overwrite` |
 | `the archive is in use …` 或 `… is being changed …` | 另一個 `pack`、`rebase`、`verify` 或 `restore` 正在使用這個歸檔：等它結束後再執行 |
 | 打包時出現 `… is a link to a folder`、`… is not a regular file`、`… cannot be read` | 用 `--exclude` 略過，或把連結指向的資料夾另外打包 |

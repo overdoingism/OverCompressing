@@ -11,10 +11,13 @@ import struct
 import subprocess
 import sys
 import time
+import tracemalloc
 import zipfile
+import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np  # noqa: E402
+import zstandard  # noqa: E402
 
 import llm_archive as la  # noqa: E402
 
@@ -37,7 +40,7 @@ def check(name, path):
     size = os.path.getsize(path)
     fmt, _, regions = la.file_regions(path, size, 1 << 20)
     out = path + ".ocz"
-    codecs = la.write_container(path, out, regions, (19, 9))
+    codecs, _, _ = la.write_container(path, out, regions, (19, 9))
     restored = b"".join(la.iter_original_chunks(scratch, out))
     ok = restored == open(path, "rb").read()
     failures += not ok
@@ -528,12 +531,9 @@ def check_safety():
     if not link_dir(os.path.join(dest, "two"), os.path.join(dest, "one")):
         print("  skip linked folder inside the destination (no symlinks or junctions here)")
     else:
-        code, out = tool("restore", alias, "t/L", dest)
-        code2, out2 = tool("restore", alias, "t/L", dest)
-        one = lambda name: open(os.path.join(dest, "one", name), "rb").read()  # noqa: E731
-        expect("two paths that a link inside the destination joins: the second becomes f (1).txt, nothing is lost",
-               code == 0 and clean(out) and one("f.txt") == b"ONE" and one("f (1).txt") == b"TWO")
-        expect("  and a second restore finds both files already there", code2 == 0 and out2.count("already there") == 2)
+        code, out = tool("restore", alias, "t/L", dest)  # restore never writes through a link in the destination
+        expect("a link inside the destination (two -> one) is refused before anything is written",
+               code != 0 and clean(out) and "link" in out and os.listdir(os.path.join(dest, "one")) == [])
     if os.name == "nt":
         edit_manifest(archive, "t__R", lambda m: m["files"][1].update(path="NOTE.txt"))
         code, out = tool("restore", archive, "t/R", os.path.join(root, "r3c"))
@@ -846,6 +846,180 @@ la.read_only_volume = lambda path: {read_only}"""
            and clean(out) and code_v == 0 and not leftovers, f"left: {leftovers}" if leftovers else "")
 
 
+def check_hardening():
+    """Cases of the security review (2026-10-21): names planted and folders swapped for links while pack or restore
+    runs, malformed containers (refused before decoding, without large allocations), and ambiguous input files."""
+    root = os.path.join(scratch, "hardening")
+    shutil.rmtree(root, ignore_errors=True)
+    os.makedirs(root)
+    clean = lambda out: "Traceback" not in out  # noqa: E731
+
+    print("hardening: something appears where pack is about to write")
+    outside = os.path.join(root, "outside.txt")
+    open(outside, "wb").write(b"OUTSIDE")
+    plant = f"""_inner = la.SafeTree.placing
+def _planted(self, rel, replace=True):
+    target = la.os.path.join(self.root, *rel.split("/"))
+    if rel != "manifest.json" and not la.os.path.lexists(target):
+        try:
+            la.os.symlink({outside!r}, target)
+        except OSError:
+            open(target, "wb").write(b"PLANTED")
+    return _inner(self, rel, replace)
+la.SafeTree.placing = _planted"""
+    code, out = patched_pack(plant, make_folder(os.path.join(root, "src1"), {"a.txt": b"new data"}), os.path.join(root, "h1"),
+                             "--name", "t/P")
+    expect("a file or link planted at a new stored name is neither followed nor written over",
+           code != 0 and clean(out) and open(outside, "rb").read() == b"OUTSIDE", out[-200:] if code == 0 else "")
+
+    print("hardening: a folder is swapped for a link while pack or restore runs")
+    outside_dir = os.path.join(root, "outside-dir")
+    os.makedirs(outside_dir)
+    swap = f"""import os as _os, subprocess as _sp
+_inner, _done = la.SafeTree.placing, set()
+def _swapped(self, rel, replace=True):
+    parts = rel.split("/")
+    if len(parts) > 1 and self.root not in _done:
+        _done.add(self.root)
+        folder = _os.path.join(self.root, parts[0])
+        if _os.path.isdir(folder):
+            _os.rename(folder, folder + "-was")
+        try:
+            _os.symlink({outside_dir!r}, folder, target_is_directory=True)
+        except OSError:
+            _sp.run(["cmd", "/c", "mklink", "/J", _os.path.normpath(folder), _os.path.normpath({outside_dir!r})], capture_output=True)
+    return _inner(self, rel, replace)
+la.SafeTree.placing = _swapped"""
+    if not link_dir(os.path.join(root, "probe-link"), outside_dir):
+        print("  skip swapped folders (no symlinks or junctions here)")
+    else:
+        files = {"sub/x.txt": b"X"}
+        code, out = patched_pack(swap, make_folder(os.path.join(root, "src2"), files), os.path.join(root, "h2"), "--name", "t/S")
+        ok = code != 0 and clean(out) and "not followed" in out and os.listdir(outside_dir) == []
+        expect("pack: a stored folder swapped for a link is refused, nothing written outside", ok, "" if ok else out[-200:])
+        archive = os.path.join(root, "h3")
+        pack(os.path.join(root, "src2"), archive, "t/S")
+        run = patched_process(swap, "restore", archive, "t/S", os.path.join(root, "r3"))
+        out = run.communicate(timeout=300)[0]
+        ok = run.returncode != 0 and clean(out) and os.listdir(outside_dir) == []
+        expect("restore: a destination folder swapped for a link after the checks is refused, nothing written outside",
+               ok, "" if ok else out[-200:])
+        if os.name == "nt":  # the check through the new file's own handle, for a swap after the folder was checked
+            tree_root = os.path.join(root, "h-check")
+            os.makedirs(tree_root)
+            link_dir(os.path.join(tree_root, "sub"), outside_dir)
+            tree = la.SafeTree(tree_root)
+            probe = os.path.join(tree_root, "sub", "probe.bin")
+            fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_BINARY)
+            try:
+                tree._check_location(fd, os.path.join(tree.root, "sub"))
+                caught = False
+            except la.UnsafePath:
+                caught = True
+            finally:
+                os.close(fd)
+                os.remove(probe)
+            expect("Windows: a new file whose folder is a junction is caught through the file's own handle", caught)
+
+    print("hardening: a file appears after restore checked the destination")
+    appear = """_inner = la.SafeTree.placing
+def _appear(self, rel, replace=True):
+    target = la.os.path.join(self.root, *rel.split("/"))
+    if not la.os.path.lexists(target):
+        la.os.makedirs(la.os.path.dirname(target), exist_ok=True)
+        open(target, "wb").write(b"KEEP")
+    return _inner(self, rel, replace)
+la.SafeTree.placing = _appear"""
+    archive = os.path.join(root, "h4")
+    pack(make_folder(os.path.join(root, "src4"), {"x.txt": b"archived"}), archive, "t/A")
+    dest = os.path.join(root, "r4")
+    run = patched_process(appear, "restore", archive, "t/A", dest)
+    out = run.communicate(timeout=300)[0]
+    ok = run.returncode != 0 and clean(out) and "appeared" in out and open(os.path.join(dest, "x.txt"), "rb").read() == b"KEEP"
+    expect("without --overwrite it is not overwritten (checked and placed in one step)", ok, "" if ok else out[-200:])
+
+    print("hardening: malformed containers are refused before anything is decoded")
+    cdir = os.path.join(root, "containers")
+    os.makedirs(cdir)
+    data = b"hello world"
+
+    def container(header, frames, extra=b""):
+        hb = header if isinstance(header, bytes) else json.dumps(header).encode()
+        body = la.MAGIC + struct.pack("<I", len(hb)) + hb
+        for codec, raw_len, payload, crc, *declared in frames:
+            body += la.FRAME_HEAD.pack(codec, raw_len, declared[0] if declared else len(payload), crc) + payload
+        return body + extra
+
+    def decode(name, blob):
+        path = os.path.join(cdir, name.replace(" ", "_") + ".ocz")
+        open(path, "wb").write(blob)
+        return b"".join(la.iter_original_chunks(cdir, path))
+
+    one = lambda length, kind="zstd": {"original_size": length, "regions": [{"offset": 0, "length": length, "kind": kind}], "delta": None}  # noqa: E731
+    good = (la.CODEC_RAW, len(data), data, zlib.crc32(data))
+    expect("(setup) a well-formed container decodes", decode("good", container(one(len(data)), [good])) == data)
+    bomb = zstandard.ZstdCompressor().compress(bytes(32 << 20))
+    bomb_nosize = zstandard.ZstdCompressor(write_content_size=False).compress(bytes(32 << 20))
+    cases = {
+        "a zstd frame declaring 32 MiB in a 1-byte region": container(one(1), [(la.CODEC_ZSTD, 1, bomb, 0)]),
+        "a zstd frame of 32 MiB without a declared size in a 1-byte region": container(one(1), [(la.CODEC_ZSTD, 1, bomb_nosize, 0)]),
+        "a zstd frame followed by other bytes": container(one(len(data)), [(la.CODEC_ZSTD, len(data), zstandard.ZstdCompressor().compress(data) + b"junk", zlib.crc32(data))]),
+        "bytes after the last frame": container(one(len(data)), [good], extra=b"junk"),
+        "a gap between regions": container({"original_size": 11, "regions": [{"offset": 0, "length": 5, "kind": "zstd"}, {"offset": 6, "length": 5, "kind": "zstd"}], "delta": None}, [good]),
+        "an original_size the regions do not add up to": container({**one(len(data)), "original_size": 12}, [good]),
+        "a frame that restores more than its region": container(one(5), [good]),
+        "a payload running past the end of the file": container(one(len(data)), [(la.CODEC_RAW, len(data), b"", 0, 1 << 40)]),
+        "a region longer than the limit": container(one(1 << 31), [good]),
+        "an ans16 frame in a region that is not a delta": container(one(len(data)), [(la.CODEC_ANS16, len(data), data, 0)]),
+        "a duplicate key in the header": container(b'{"original_size": 11, "original_size": 11, "regions": [{"offset": 0, "length": 11, "kind": "zstd"}], "delta": null}', [good]),
+        "a header longer than the file": la.MAGIC + struct.pack("<I", 10 ** 9) + b"{}",
+    }
+    for name, blob in cases.items():
+        tracemalloc.start()
+        try:
+            decode(name, blob)
+            ok, detail = False, "decoded"
+        except ValueError:
+            ok, detail = True, ""
+        except Exception as e:
+            ok, detail = False, f"{type(e).__name__}: {e}"
+        peak = tracemalloc.get_traced_memory()[1]
+        tracemalloc.stop()
+        expect(f"container with {name}: refused", ok and peak < (8 << 20), detail or (f"peak {peak >> 20} MiB" if peak >= 8 << 20 else ""))
+
+    print("hardening: ambiguous input files are stored as plain bytes")
+
+    def gguf(infos):  # [(name bytes, ggml_type, dims, offset)]
+        out = b"GGUF" + struct.pack("<IQQ", 3, len(infos), 0)
+        for name, ggml_type, dims, offset in infos:
+            out += struct.pack("<Q", len(name)) + name + struct.pack("<I", len(dims)) + b"".join(struct.pack("<Q", d) for d in dims)
+            out += struct.pack("<IQ", ggml_type, offset)
+        return out + bytes(-len(out) % 32) + bytes(64)
+
+    entry = lambda name, offsets: json.dumps({"dtype": "F32", "shape": [4], "data_offsets": offsets})  # noqa: E731
+    header = ('{"w": ' + entry("w", [0, 16]) + ', "w": ' + entry("w", [16, 32]) + "}").encode()
+    header += b" " * (-len(header) % 8)
+    odd = {
+        "dims-wrap.gguf": gguf([(b"w", 0, [1 << 62, 4], 0)]),  # 4 * 2^64 bytes: wraps to 0 in int64
+        "bad-utf8.gguf": gguf([(b"\xff\xfe", 0, [4], 0)]),
+        "same-name.gguf": gguf([(b"w", 0, [4], 0), (b"w", 0, [4], 16)]),
+        "duplicate-key.safetensors": struct.pack("<Q", len(header)) + header + bytes(32),
+    }
+    src = make_folder(os.path.join(root, "src5"), odd)
+    kinds = {name: la.file_tensors(os.path.join(src, name), len(blob))[0] for name, blob in odd.items()}
+    archive = os.path.join(root, "h5")
+    code, out = pack(src, archive, "t/O")
+    code_v, _ = tool("verify", archive)
+    ok = all(k is None for k in kinds.values()) and code == code_v == 0 and clean(out)
+    expect("GGUF sizes past int64, invalid UTF-8 or repeated tensor names, and duplicate JSON keys: plain bytes, lossless",
+           ok, "" if ok else str(kinds))
+    path = os.path.join(archive, "t__O", "manifest.json")
+    text = open(path, encoding="utf-8").read()
+    open(path, "w", encoding="utf-8").write(text.replace('"repo": ', '"repo": "t/O", "repo": ', 1))
+    code, out = tool("verify", archive)
+    expect("a manifest with a duplicate key is a FAIL line", code != 0 and "FAIL" in out and "duplicate" in out and clean(out))
+
+
 def bf16_reference(value):
     """BF16 bits of a float32 value by round-to-nearest-even, worked out from the two neighbouring BF16 values with
     exact float arithmetic instead of bit tricks: an independent check of convert_bits."""
@@ -980,10 +1154,10 @@ def main():
         _, base_tensors = la.file_tensors(base_path, os.path.getsize(base_path))
         _, tensors = la.file_tensors(target_path, size)
         regions = la.tensor_regions(tensors, size, 1 << 20, la.match_against_base(tensors, [{"tensors": base_tensors}], "ans16"))
-        delta = {"repo": "test/base", "files": [{"path": "base.safetensors", "sha256": "x"}], "op": "ans16"}
+        delta = {"repo": "test/base", "files": [{"path": "base.safetensors", "sha256": "0" * 64}], "op": "ans16"}
         out = target_path + ".ocz"
         la.write_container(target_path, out, regions, (19, 9), delta, [base_path], workers=2)
-        la._BASE_CACHE[("test/base", "base.safetensors", "x")] = base_path  # stands in for a restored base file
+        la._BASE_CACHE[("test/base", "base.safetensors", "0" * 64)] = base_path  # stands in for a restored base file
         try:
             restored = b"".join(la.iter_original_chunks(scratch, out))
         finally:
@@ -1009,6 +1183,7 @@ def main():
     check_rebase()
     check_safety()
     check_accidents()
+    check_hardening()
 
     print("ALL PASSED" if not failures else f"{failures} FAILURE(S)")
     sys.exit(1 if failures else 0)

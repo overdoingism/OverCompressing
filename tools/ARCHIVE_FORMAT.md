@@ -176,7 +176,7 @@ Encoding is the exact inverse (symbols in reverse order; emit the low 32 bits an
   `same` references) before decoding, and refuse cyclic references.
 - `rebase`, and `pack` when it re-packs a repo, write each new stored file under a name the current manifest does
   not use (`<path>.ocz` and `<path>.1.ocz` alternate; a file stored byte-for-byte keeps `<path>` if its bytes are
-  unchanged, else alternates with `<path>.1`), decode it back, write the new manifest to a temporary `.manifest-*.part` file and
+  unchanged, else alternates with `<path>.1`), decode it back, write the new manifest to a temporary `.oc-*.part` file and
   rename it over `manifest.json`, and only then delete the old stored files, so the archive is complete at every
   moment. Other repos refer to a file by repo, path and SHA-256, which neither command changes.
 - Names and paths in a manifest are checked before they are used. A model name is one or more parts separated by
@@ -186,7 +186,7 @@ Encoding is the exact inverse (symbols in reverse order; emit the low 32 bits an
   name and may hold any other character; `stored` also has no `\` (on Windows no `:` and no part ending in a dot or
   space either), and new stored names are valid on Windows and POSIX and never differ from one another only in case,
   so a model folder can be copied between systems. `restore` refuses paths that would land outside its destination
-  (also through a symlink or junction), writes a name its system does not allow with `_` for each character it does
+  and never writes through a link (a symlink or junction below the destination stops it), writes a name its system does not allow with `_` for each character it does
   not allow (on Windows: `<>:"\|?*`, control characters, trailing dots and spaces; device names get `_` after the
   stem), and keeps two paths that would be one file apart with ` (1)`, ` (2)`, ... before the extension of the later
   one (paths that needed no change keep their names).
@@ -197,5 +197,18 @@ Encoding is the exact inverse (symbols in reverse order; emit the low 32 bits an
   `+ans16` / `+xor`); for `same`, `same_as` with a valid repo and path; otherwise `stored`, `stored_size` and
   `stored_sha256`; for a delta, `delta_base` and a non-empty `delta_files` of paths and SHA-256s. No path may be
   listed twice. A manifest that fails is reported by `verify` and blocks `pack` and `rebase` until it is fixed.
+- Every container is checked before anything in it is decoded: magic; a header of at most 64 MiB that is valid
+  UTF-8 JSON without duplicate keys; at most 4,194,304 regions, each 1 byte to 1 GiB long, covering `original_size`
+  in order without gaps, of a known kind, with base references only on delta regions and only into `delta.files`;
+  one frame per region whose `raw_len` is the region's length and whose codec fits the region; every payload inside
+  the file; nothing after the last frame; and `original_size` equal to the manifest's `size`. A zstd payload must be
+  exactly one frame, its declared content size no larger than its region, and it is decoded with output capped at
+  that size. An ans16 payload's lengths must add up exactly, its header fields stay in range (precision 1–30, 1–65,536
+  lanes, 1–257 contexts) and its tables (at most 65,536 symbols per context, frequencies summing to `2^prec`) fit.
+  Manifests and safetensors headers with duplicate JSON keys are refused too; a GGUF file whose sizes overflow,
+  whose tensor names are not valid UTF-8 or repeat, is stored as plain bytes.
+- Every file a tool writes goes first to a new, randomly named temporary file (`.oc-*.part`) created exclusively, and
+  is put in place only after it is synced to disk; links below the archive's model folders and the restore
+  destination are never followed (on Windows: checked as a best effort).
 - Repair data is not part of the format; add your own (copies, PAR2, a self-healing file system, …) and rebuild
   it after re-packing or rebasing a repo. See `docs/protection.md`.
