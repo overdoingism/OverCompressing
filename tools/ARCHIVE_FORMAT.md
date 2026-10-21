@@ -26,6 +26,16 @@ the rANS decoder described below.
                             readers skip it only on a read-only volume or with --no-lock)
 ```
 
+### Single-file archive (`.oczip`)
+
+The `bundle` command puts a whole `<archive_root>` into one file: a ZIP archive (ZIP64 where needed) whose member
+names are the paths relative to `<archive_root>`, with `/` separators and UTF-8 names. Every container (`*.ocz`, and
+every `stored` name of a container in a manifest) is stored with method 0 (no compression, no encryption), so it can
+be read in place at its offset: the member's local header offset plus 30 plus the lengths of its name and extra field.
+Other members are stored or Deflate-compressed (method 8). The lock file and `.oc-*.part` files are not put in; no name
+appears twice and none has an empty, `.` or `..` part. A model's manifest is `<folder>/manifest.json`, exactly as in
+the folder. Extracting the ZIP with any tool gives back the archive folder, byte for byte.
+
 ## manifest.json
 
 | field | meaning |

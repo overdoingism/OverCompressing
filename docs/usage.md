@@ -2,8 +2,8 @@
 
 **English** · [中文](#使用方式)
 
-Everything goes through one script, `tools/llm_archive.py`, with four commands: `pack`, `rebase`, `verify`,
-`restore` (or, for pack, verify and restore, a small window: see below). It never downloads anything: get the model files however you like (Hugging Face, ModelScope, git, a
+Everything goes through one script, `tools/llm_archive.py`, with five commands: `pack`, `rebase`, `verify`,
+`restore` and `bundle` (or, for all but rebase, a small window: see below). It never downloads anything: get the model files however you like (Hugging Face, ModelScope, git, a
 mirror, a USB drive), then pack the folder. Run it with the Python environment from the offline kit or from a
 development setup ([Windows](build-windows.md) / [Linux](build-linux.md)). Below, `python` means that environment's
 interpreter; `-I` (isolated mode) keeps it from importing stray files from the current folder.
@@ -27,16 +27,18 @@ derived from them. If a base arrives later, `rebase` re-chooses the bases afterw
 python -I tools/llm_archive_gui.py [<archive_root>]
 ```
 
-(On Windows, `pythonw` instead of `python` opens it without a console window.) **Open…** an archive folder (an empty
-one starts a new archive), then: **+ Folder…** or **+ Files…** to pack (files picked from one folder make up the
-model on their own; one file is named after itself by default), **⇩ Extract…** the models or files selected in the
+(On Windows, `pythonw` instead of `python` opens it without a console window.) **Open** an archive folder (an empty
+one starts a new archive) or a single `.oczip` file, then: **+ Folder…** or **+ Files…** to pack (files picked from
+one folder make up the model on their own; one file is named after itself by default), **▣ Bundle…** the folder into
+one `.oczip` (section 6), **⇩ Extract…** the models or files selected in the
 list (each model goes into a folder named after it, e.g. `<dest>/Qwen/Qwen2.5-7B`; files with other contents already
 there are replaced only after you agree), and **✔ Verify** the selection or the whole archive. The list shows every
 model and file with its size, stored size, ratio and how it is stored (`Δ` a delta against that model, `=` the same
 as that file). Each action runs `llm_archive.py` exactly as below and shows its output; **✕ Cancel** stops it as
 Ctrl+C would, so nothing half-done stays in the archive. Delta bases are always chosen automatically; `--base`,
-`rebase` and the other options are on the command line only. The window's text is English and symbols, whatever the
-system language. Run from an offline kit, it opens the kit's archive.
+`rebase` and the other options are on the command line only; with an `.oczip` open, packing and bundling are off.
+The window's text is English and symbols, whatever the system language. Run from an offline kit, it opens the kit's
+archive.
 
 ## 1. `pack` — compress a folder into the archive
 
@@ -206,7 +208,7 @@ Checks the stored hashes of every file and of everything it depends on, decodes 
 original SHA-256. Prints `ALL VERIFIED (<n> files)` or each failure with its cause, and exits with a non-zero code
 on any failure, and also when it verified nothing (the folder does not exist, or holds no models). A missing or unreadable stored file, and a `manifest.json` that cannot be read or contains an unsafe path or
 name, are reported like any other failure; the rest is still checked. Run it after copying the archive and from time
-to time on cold storage.
+to time on cold storage. `<archive_root>` may also be an `.oczip` file (section 6).
 
 ## 5. `restore`
 
@@ -217,7 +219,7 @@ python -I tools/llm_archive.py restore <archive_root> <name> <dest_dir> [--overw
 Writes the original files, byte-identical, and checks each SHA-256. Deltas need their base models in the same archive
 root; ans16 deltas first restore the base files they read into `OC_TMP`. `--file PATH` (repeatable) restores only
 those files, named by their paths in the archive (as `verify` lists them after `<name>:`); each lands where a full
-restore would put it.
+restore would put it. `<archive_root>` may also be an `.oczip` file (section 6).
 
 Before writing anything, every path in the manifest is checked: it must be relative, without `..`, and land inside
 `<dest_dir>`; restore never writes through a link, so if a folder on the way below `<dest_dir>` is a symlink or a
@@ -237,7 +239,36 @@ file system that has neither (some FUSE or network mounts), restore without `--o
 into an empty folder with `--overwrite` there. A destination inside the archive itself is refused, even with
 `--overwrite`.
 
-## 6. Protection and repair
+## 6. `bundle` — the whole archive in one `.oczip` file
+
+```bash
+python -I tools/llm_archive.py bundle <archive_root> <file.oczip> [--verify | --no-verify] [--delete] [--overwrite]
+```
+
+Puts everything in `<archive_root>` (the models, `_kit/` and anything else you keep there) into one file: a ZIP
+(ZIP64), named `.oczip` on purpose so that it is not taken for an ordinary ZIP. Containers and files compressed
+already (wheels, installers, images, …) are stored as they are; the rest is Deflate-compressed when that makes it
+smaller. The lock file and leftover `.oc-*.part` files are left out, and a link anywhere in the folder stops it. The
+`.oczip` is written to a temporary file next to it and put in place only when complete, so a stopped bundle leaves
+nothing behind.
+
+`verify` and `restore` (and the window) take the `.oczip` in place of the folder and read it as it is, without
+extracting anything: the containers lie uncompressed in it and are read at their offsets. It is read-only: to `pack`
+into it or `rebase` it, extract it into a folder with any ZIP tool (rename a copy to `.zip` for tools that go by the
+extension), work on that folder, and bundle again.
+
+| option | meaning |
+|---|---|
+| `--verify` | then read it back: every file compared with what was put in (SHA-256), and every model verified from the `.oczip` as `verify` does. Off by default |
+| `--delete` | then delete the files put in from `<archive_root>` (and the folder, once empty). Verifies first unless `--no-verify`; if anything fails, nothing is deleted |
+| `--no-verify` | with `--delete`: delete without verifying first |
+| `--overwrite` | replace an existing file of that name |
+
+The `.oczip` must lie outside `<archive_root>`. `bundle` holds the archive's lock while it runs (alone with
+`--delete`), so nothing changes the folder meanwhile. Repair data for an `.oczip` (e.g. PAR2) is made for the whole
+file and kept beside it (section 7).
+
+## 7. Protection and repair
 
 OverCompressing detects damage but does not repair it. Keep several copies and/or add repair data with a tool of your
 choice (PAR2, RAR recovery records, ZFS/Btrfs/ReFS, …): see [protection.md](protection.md).
@@ -289,7 +320,9 @@ sh _kit/install_linux.sh
 ```
 
 The install scripts create a virtual environment from the bundled wheels (installing the bundled Python 3.13 first if
-none is found) and print the exact `restore` / `verify` commands to use. Details: `_kit/README.md`.
+none is found) and print the exact `restore` / `verify` commands to use. Details: `_kit/README.md`. With an
+`.oczip`, first extract its `_kit/` folder with any ZIP tool (7-Zip opens it as it is; for Windows Explorer, rename a
+copy to `.zip`), then give the `.oczip` to `verify`, `restore` or the window.
 
 ## Troubleshooting
 
@@ -309,6 +342,8 @@ none is found) and print the exact `restore` / `verify` commands to use. Details
 | `a file of that name appeared in the destination while restoring` | another program wrote there: run restore again, or add `--overwrite` |
 | `cannot put … in place … without the risk of replacing a file` | the file system has no hard links and no rename that refuses an existing name: restore into an empty folder with `--overwrite`; keep the archive itself on another file system |
 | `… and the archive … are in one another` (pack) | pack a folder outside the archive, into an archive outside that folder |
+| `… is a single-file archive (.oczip): it is read-only` | extract it into a folder (it is a ZIP), pack or rebase there, then `bundle` again |
+| `… is compressed or encrypted in the .oczip: containers must be stored as they are` | the `.oczip` was rewritten by another ZIP tool: make it again with `bundle` from the folder |
 | `the archive is in use …` or `… is being changed …` | another `pack`, `rebase`, `verify` or `restore` runs on the archive: run this when it has finished |
 | `… is a link to a folder`, `… is not a regular file`, `… cannot be read` (pack) | skip it with `--exclude`, or pack the link's target as a folder of its own |
 
@@ -318,8 +353,8 @@ none is found) and print the exact `restore` / `verify` commands to use. Details
 
 [English](#usage) · **中文**
 
-所有功能都在 `tools/llm_archive.py` 這支程式裡，共四個指令：`pack`、`rebase`、`verify`、`restore`（打包、驗證與還原也可以用
-圖形介面，見下文）。本工具不會下載任何東西：
+所有功能都在 `tools/llm_archive.py` 這支程式裡，共五個指令：`pack`、`rebase`、`verify`、`restore`、`bundle`（除了 rebase，
+其餘也可以用圖形介面，見下文）。本工具不會下載任何東西：
 請用你習慣的方式取得模型檔（Hugging Face、ModelScope、git、鏡像站、隨身碟皆可），再打包整個資料夾。請用離線工具包
 安裝出來的 Python 環境，或依建置頁面（[Windows](build-windows.md) / [Linux](build-linux.md)）建立的開發環境來執行。
 以下的 `python` 指的都是該環境的直譯器；`-I`（隔離模式）可避免它載入目前資料夾裡來路不明的檔案。
@@ -342,14 +377,15 @@ python -I tools/llm_archive.py restore archive Qwen/Qwen2.5-7B-Instruct restored
 python -I tools/llm_archive_gui.py [<archive_root>]
 ```
 
-（Windows 上把 `python` 換成 `pythonw` 就不會多開一個主控台視窗。）用 **Open…** 開啟歸檔資料夾（選空資料夾即建立新歸檔）
-後，可以：用 **+ Folder…** 或 **+ Files…** 壓縮（從同一資料夾選取的檔案會自成一個模型；只選一個檔案時，預設以檔名命名）、
+（Windows 上把 `python` 換成 `pythonw` 就不會多開一個主控台視窗。）用 **Open** 開啟歸檔資料夾（選空資料夾即建立新歸檔）
+或單一 `.oczip` 檔後，可以：用 **+ Folder…** 或 **+ Files…** 壓縮（從同一資料夾選取的檔案會自成一個模型；只選一個檔案時，
+預設以檔名命名）、用 **▣ Bundle…** 把資料夾打包成一個 `.oczip`（第 6 節）、
 用 **⇩ Extract…** 解壓縮清單中選取的模型或檔案（每個模型放在以其名稱命名的資料夾中，例如 `<目的地>/Qwen/Qwen2.5-7B`；
 目的地已有內容不同的同名檔案時，經你同意才會取代），以及用 **✔ Verify** 驗證選取的模型或整個歸檔。清單會列出每個模型與
 檔案的原始大小、壓縮後大小、比例與儲存方式（`Δ` 表示以該模型為基底的差異，`=` 表示與該檔案相同）。每個動作都是照下文的
 方式執行 `llm_archive.py`，並顯示它的輸出；**✕ Cancel** 的效果等同按 Ctrl+C，歸檔裡不會留下做一半的東西。差異基底一律
-自動選擇；`--base`、`rebase` 等其他選項只能用命令列。介面文字只有英文與符號，與系統語系無關。從離線工具包執行時，會直接
-開啟工具包所在的歸檔。
+自動選擇；`--base`、`rebase` 等其他選項只能用命令列；開啟 `.oczip` 時，壓縮與打包的按鈕會停用。介面文字只有英文與符號，
+與系統語系無關。從離線工具包執行時，會直接開啟工具包所在的歸檔。
 
 ## 1. `pack`：把資料夾打包進歸檔
 
@@ -499,7 +535,7 @@ python -I tools/llm_archive.py verify <archive_root> [<名稱> ...] [--no-lock]
 
 檢查每個檔案與其所有依賴的儲存雜湊，在記憶體中解碼並比對原始 SHA-256。結果為 `ALL VERIFIED (<n> files)`，或逐一列出失敗原因；
 有任何失敗時結束碼不為 0；什麼都沒驗證到時（資料夾不存在，或裡面沒有模型）結束碼也不為 0。缺少或無法讀取的儲存檔，以及無法讀取、或含有不安全路徑或名稱的 `manifest.json`，都會像
-其他失敗一樣列出，其餘項目照常檢查。建議在複製歸檔後、以及冷儲存定期執行。
+其他失敗一樣列出，其餘項目照常檢查。建議在複製歸檔後、以及冷儲存定期執行。`<archive_root>` 也可以是 `.oczip` 檔（第 6 節）。
 
 ## 5. `restore`：還原
 
@@ -509,7 +545,7 @@ python -I tools/llm_archive.py restore <archive_root> <名稱> <目的資料夾>
 
 寫回與原檔逐 byte 相同的檔案並核對 SHA-256。delta 需要 base 模型在同一個歸檔根目錄裡；ans16 delta 會先把用到的
 base 檔還原到 `OC_TMP`。`--file 路徑`（可重複指定）只還原這些檔案，路徑以歸檔中的為準（即 `verify` 列出的 `<名稱>:` 之後的部分）；
-每個檔案會放在完整還原時的同一個位置。
+每個檔案會放在完整還原時的同一個位置。`<archive_root>` 也可以是 `.oczip` 檔（第 6 節）。
 
 寫入任何東西之前，會先檢查 manifest 裡的每個路徑：必須是相對路徑、不含 `..`，而且必須落在 `<目的資料夾>` 之內；
 還原絕不經過連結寫入，所以 `<目的資料夾>` 底下途經的資料夾若是符號連結或 junction，就會停止。這個系統不允許的檔名會像其他解壓縮工具一樣調整：在 Windows 上，
@@ -523,7 +559,32 @@ base 檔還原到 `OC_TMP`。`--file 路徑`（可重複指定）只還原這些
 改名）。少數兩者都不支援的檔案系統（某些 FUSE 或網路掛載）上，沒加 `--overwrite` 的還原會停止並說明原因；這時請還原到
 空資料夾並加上 `--overwrite`。目的資料夾若在歸檔之內，即使加上 `--overwrite` 也會拒絕。
 
-## 6. 防護與修復
+## 6. `bundle`：把整個歸檔打包成一個 `.oczip` 檔
+
+```bash
+python -I tools/llm_archive.py bundle <archive_root> <檔名.oczip> [--verify | --no-verify] [--delete] [--overwrite]
+```
+
+把 `<archive_root>` 裡的所有東西（各模型、`_kit/`，以及你放在裡面的其他資料）放進一個檔案：格式是 ZIP（ZIP64），
+副檔名刻意取為 `.oczip`，以免被當成一般 ZIP。容器檔與本來就壓縮過的檔案（wheel、安裝檔、圖片等）原樣存放（store），
+其他檔案若用 Deflate 壓得更小就壓縮。鎖檔與殘留的 `.oc-*.part` 不會放進去；資料夾裡有任何連結時會停止。`.oczip` 先寫到
+旁邊的暫存檔，完整寫完才放到定位，所以中途停止不會留下任何東西。
+
+`verify` 與 `restore`（以及圖形介面）都可以用 `.oczip` 取代資料夾，直接讀取、不必先解開：容器檔在裡面是未壓縮的，
+直接依位移讀取。`.oczip` 是唯讀的：要再 `pack` 進去或 `rebase`，請用任何 ZIP 工具解開成資料夾（只認副檔名的工具，
+可把副本改名為 `.zip`），在該資料夾上作業後再重新打包。
+
+| 選項 | 說明 |
+|---|---|
+| `--verify` | 寫完後讀回驗證：每個檔案都與放進去的內容比對（SHA-256），並像 `verify` 一樣從 `.oczip` 驗證每個模型。預設不做 |
+| `--delete` | 之後刪除 `<archive_root>` 裡已放進去的檔案（資料夾清空後也一併刪除）。除非加上 `--no-verify`，否則會先驗證；任何一項失敗就什麼都不刪 |
+| `--no-verify` | 與 `--delete` 併用：不驗證就刪除 |
+| `--overwrite` | 取代同名的既有檔案 |
+
+`.oczip` 必須放在 `<archive_root>` 之外。`bundle` 執行期間會鎖住歸檔（加 `--delete` 時為獨占），所以這段期間沒有人能改動
+資料夾。`.oczip` 的修復資料（例如 PAR2）請針對整個檔案製作，放在它旁邊（第 7 節）。
+
+## 7. 防護與修復
 
 本工具負責偵測損毀，不負責修復。請保留多份副本，並／或用你選擇的工具加上修復資料（PAR2、RAR 修復記錄、
 ZFS/Btrfs/ReFS 等），詳見 [protection.md](protection.md)。
@@ -570,7 +631,8 @@ sh _kit/install_linux.sh
 ```
 
 安裝腳本會用內附的 wheel 建立虛擬環境（找不到 Python 3.13 時會先安裝內附的版本），並印出可直接使用的
-`restore` / `verify` 指令。詳見 `_kit/README.md`。
+`restore` / `verify` 指令。詳見 `_kit/README.md`。若是 `.oczip`，請先用任何 ZIP 工具解出其中的 `_kit/`
+（7-Zip 可直接開啟；Windows 檔案總管則需把副本改名為 `.zip`），再把 `.oczip` 交給 `verify`、`restore` 或圖形介面。
 
 ## 疑難排解
 
@@ -590,5 +652,7 @@ sh _kit/install_linux.sh
 | `a file of that name appeared in the destination while restoring` | 有其他程式寫入了目的地：重跑還原，或加上 `--overwrite` |
 | `cannot put … in place … without the risk of replacing a file` | 檔案系統既不支援 hard link，也不支援遇到同名就失敗的改名：還原到空資料夾並加上 `--overwrite`；歸檔本身請放在其他檔案系統上 |
 | 打包時出現 `… and the archive … are in one another` | 打包歸檔以外的資料夾，並存到該資料夾以外的歸檔 |
+| `… is a single-file archive (.oczip): it is read-only` | 把它解開成資料夾（它是 ZIP），在資料夾上 pack 或 rebase，再重新 `bundle` |
+| `… is compressed or encrypted in the .oczip: containers must be stored as they are` | 這個 `.oczip` 被其他 ZIP 工具重寫過：請從資料夾用 `bundle` 重新製作 |
 | `the archive is in use …` 或 `… is being changed …` | 另一個 `pack`、`rebase`、`verify` 或 `restore` 正在使用這個歸檔：等它結束後再執行 |
 | 打包時出現 `… is a link to a folder`、`… is not a regular file`、`… cannot be read` | 用 `--exclude` 略過，或把連結指向的資料夾另外打包 |

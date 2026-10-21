@@ -26,6 +26,10 @@ sh _kit/install_linux.sh
 ~/overcompressing-venv/bin/python -I _kit/tools/llm_archive.py restore <archive_root> Qwen/Qwen2.5-0.5B-Instruct <dest_dir>
 ```
 
+If the archive is a single `.oczip` file (made by `llm_archive.py bundle`), extract this `_kit/` folder from it with
+any ZIP tool first (7-Zip opens it as it is; for Windows Explorer, rename a copy to `.zip`), then give the `.oczip`
+in place of `<archive_root>`: `verify` and `restore` read it without extracting the rest.
+
 Or open a window to look through the archive and extract models or single files: `<venv>\Scripts\pythonw.exe -I
 _kit\tools\llm_archive_gui.py` on Windows, `~/overcompressing-venv/bin/python -I _kit/tools/llm_archive_gui.py` on
 Linux (the install scripts print both commands).
@@ -54,7 +58,7 @@ weight file if the system temp folder is small. `OC_WORKERS` limits the CPU core
 | `wheels/win_amd64/` | Windows wheels (numpy, zstandard) |
 | `wheels/linux_x86_64/` | Linux wheels (numpy, zstandard) |
 | `tools/llm_archive.py` | the archiver: pack / verify / restore |
-| `tools/llm_archive_gui.py` | a small window for it (Tkinter, part of the bundled Python): pack, verify, extract |
+| `tools/llm_archive_gui.py` | a small window for it (Tkinter, part of the bundled Python): pack, bundle, verify, extract; opens a folder or an `.oczip` |
 | `tools/ARCHIVE_FORMAT.md` | on-disk format; enough to restore by hand if the tool itself is unusable |
 | `tools/test_ans16.py` | self-test of the ans16 delta decoder: `python -I tools/test_ans16.py` (prints ALL PASSED) |
 | `tools/test_formats.py` | self-test of the safetensors/GGUF/other-file containers: `python -I tools/test_formats.py <scratch_dir>` |

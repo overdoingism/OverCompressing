@@ -1,8 +1,9 @@
-"""A small window for llm_archive.py: pack a folder, or some files of one, into an archive; see what the archive
-holds; verify it; extract models or single files. Each action runs llm_archive.py in a process of its own, just as
-on the command line (delta bases are chosen automatically); rebase, --base and the other options are there.
+"""A small window for llm_archive.py: pack a folder, or some files of one, into an archive; bundle the archive into
+one .oczip file; see what an archive folder or .oczip holds; verify it; extract models or single files. Each action
+runs llm_archive.py in a process of its own, just as on the command line (delta bases are chosen automatically);
+rebase, --base and the other options are there.
 
-    python -I llm_archive_gui.py [<archive_root>]
+    python -I llm_archive_gui.py [<archive_root> | <file.oczip>]
 
 Run from an offline kit (<archive_root>/_kit/tools), it opens that archive. Its text is Unicode symbols where they
 say it, else English: nothing depends on the system's language.
@@ -41,10 +42,30 @@ except KeyboardInterrupt:
 
 TEXT = {  # all of the window's text: symbols (Unicode BMP, which every Tk renders) where they say it, else English
     "archive": "Archive",
-    "choose_archive": "Open…",
+    "choose_archive": "Open",
+    "open_folder": "Archive folder…",
+    "open_oczip": "Single file (.oczip)…",
+    "pick_oczip": "Single-file archive (.oczip)",
+    "read_only": "read-only .oczip",
     "no_archive": "—",
     "pack_folder": "+ Folder…",
     "pack_files": "+ Files…",
+    "bundle": "▣ Bundle…",
+    "bundle_title": "Bundle into one .oczip",
+    "bundle_what": "All of {archive} (models, _kit and anything else in it) into one file:",
+    "browse": "Browse…",
+    "bundle_verify": "✔ Verify it: read every file back, verify every model",
+    "bundle_delete": "Then delete the bundled files from the folder (✔ Verify comes on with it)",
+    "bundle_hint": "✔ Verify and ⇩ Extract read the .oczip as it is. It is read-only: to pack into it again, extract it "
+                   "into a folder (it is a ZIP).",
+    "bundle_name": "The file name must end with .oczip.",
+    "bundle_replace_q": "{path} exists already. Replace it?",
+    "bundle_delete_q": "Once {path} is written{checked}, the files of {archive} it holds are deleted. Go on?",
+    "checked": " and verified",
+    "unchecked": " (without verifying it)",
+    "bundling": "▶ Bundling into {name}",
+    "done_bundle": "✔ Bundled into {path}.",
+    "done_bundle_deleted": "✔ Bundled into {path}, and the folder's files deleted: the .oczip is open now.",
     "extract": "⇩ Extract…",
     "verify": "✔ Verify",
     "refresh": "↻ Refresh",
@@ -176,18 +197,26 @@ class App:
         ttk.Label(top, text=t("archive")).pack(side="left")
         self.path = tk.StringVar()
         ttk.Entry(top, textvariable=self.path, state="readonly").pack(side="left", fill="x", expand=True, padx=self.px(6))
-        self.buttons = [ttk.Button(top, text=t("choose_archive"), command=self.choose_archive)]
-        self.buttons[-1].pack(side="left")
+        opener = ttk.Menubutton(top, text=t("choose_archive"))
+        menu = tk.Menu(opener, tearoff=False)
+        menu.add_command(label=t("open_folder"), command=self.choose_archive)
+        menu.add_command(label=t("open_oczip"), command=self.choose_oczip)
+        opener["menu"] = menu
+        opener.pack(side="left")
+        self.controls = [(opener, "idle")]  # (widget, when it can be used: "idle", "folder" archive, "models" in one)
 
         bar = ttk.Frame(self.root, padding=(self.px(10), 0, self.px(10), self.px(6)))
         bar.pack(fill="x")
-        for key, command in (("pack_folder", self.pack_folder), ("pack_files", self.pack_files), (None, None),
-                             ("extract", self.extract), ("verify", self.verify), (None, None), ("refresh", self.load)):
+        for key, command, when in (("pack_folder", self.pack_folder, "folder"), ("pack_files", self.pack_files, "folder"),
+                                   ("bundle", self.bundle, "models"), (None, None, None),
+                                   ("extract", self.extract, "idle"), ("verify", self.verify, "idle"), (None, None, None),
+                                   ("refresh", self.load, "idle")):
             if key is None:
                 ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=self.px(6))
                 continue
-            self.buttons.append(ttk.Button(bar, text=t(key), command=command))
-            self.buttons[-1].pack(side="left", padx=(0, self.px(4)))
+            button = ttk.Button(bar, text=t(key), command=command)
+            button.pack(side="left", padx=(0, self.px(4)))
+            self.controls.append((button, when))
 
         panes = ttk.PanedWindow(self.root, orient="vertical")
         panes.pack(fill="both", expand=True, padx=self.px(10))
@@ -263,8 +292,10 @@ class App:
         problems = []
         try:
             self.manifests = la.all_manifests(self.archive, problems)
-        except OSError as e:
-            self.manifests, problems = {}, [(self.archive, e.strerror or str(e))]
+        except (OSError, ValueError) as e:
+            self.manifests, problems = {}, [(self.archive, getattr(e, "strerror", None) or str(e))]
+        finally:
+            la.close_single_files()  # an .oczip held open here could not be replaced by a bundle
         needs = la.repo_needs(self.manifests)
         size = stored = files = 0
         for repo, manifest in self.manifests.items():
@@ -284,10 +315,19 @@ class App:
         for folder, problem in problems:
             self.tree.insert("", "end", text=folder, values=("", "", "", t("unreadable", problem=problem)), tags=("problem",))
         if self.manifests:
-            self.status.configure(text=t("summary", models=count(len(self.manifests), "model"), files=count(files, "file"), size=size_text(size),
-                                         stored=size_text(stored), ratio=ratio(stored, size)))
+            self.status.configure(text=t("summary", models=count(len(self.manifests), "model"), files=count(files, "file"),
+                                         size=size_text(size), stored=size_text(stored), ratio=ratio(stored, size))
+                                  + (f" · {t('read_only')}" if la.is_oczip(self.archive) else ""))
         else:
             self.status.configure(text=t("empty"))
+        self.update_buttons()
+
+    def update_buttons(self):
+        single = bool(self.archive) and la.is_oczip(self.archive)
+        for widget, when in self.controls:
+            usable = not self.proc and (when == "idle" or (when == "folder" and not single)
+                                        or (when == "models" and not single and bool(self.manifests)))
+            widget.configure(state="normal" if usable else "disabled")
 
     def choose_archive(self):
         folder = filedialog.askdirectory(parent=self.root, title=t("pick_archive"), mustexist=False,
@@ -306,6 +346,13 @@ class App:
             return
         self.archive = folder
         self.load()
+
+    def choose_oczip(self):
+        path = filedialog.askopenfilename(parent=self.root, title=t("pick_oczip"),
+                                          filetypes=[(t("pick_oczip"), "*.oczip"), ("*", "*")])
+        if path:
+            self.archive = os.path.normpath(path)
+            self.load()
 
     def need_archive(self):
         if not self.archive:
@@ -399,6 +446,84 @@ class App:
         dialog.bind("<Escape>", lambda _: dialog.destroy())
         entry.select_range(0, "end")
         entry.focus_set()
+        self.show_dialog(dialog)
+        return result[0] if result else None
+
+    def bundle(self):
+        """Ask where to write the .oczip and what to do after, then run llm_archive.py bundle."""
+        folder = self.archive
+        dialog = tk.Toplevel(self.root)
+        dialog.title(t("bundle_title"))
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        frame = ttk.Frame(dialog, padding=self.px(16))
+        frame.pack(fill="both", expand=True)
+        wrap = self.px(520)
+        ttk.Label(frame, text=t("bundle_what", archive=folder), wraplength=wrap).pack(anchor="w")
+        row = ttk.Frame(frame)
+        row.pack(fill="x", pady=(self.px(8), self.px(4)))
+        path = tk.StringVar(value=os.path.normpath(folder) + ".oczip")
+        entry = ttk.Entry(row, textvariable=path, width=56)
+        entry.pack(side="left", fill="x", expand=True)
+
+        def browse():
+            chosen = filedialog.asksaveasfilename(
+                parent=dialog, title=t("bundle_title"), defaultextension=".oczip", filetypes=[(t("pick_oczip"), "*.oczip")],
+                initialdir=os.path.dirname(path.get()), initialfile=os.path.basename(path.get()), confirmoverwrite=False)
+            if chosen:
+                path.set(os.path.normpath(chosen))
+
+        ttk.Button(row, text=t("browse"), command=browse).pack(side="left", padx=(self.px(6), 0))
+        verify, delete = tk.BooleanVar(value=False), tk.BooleanVar(value=False)
+        ttk.Checkbutton(frame, text=t("bundle_verify"), variable=verify).pack(anchor="w", pady=(self.px(6), 0))
+        ttk.Checkbutton(frame, text=t("bundle_delete"), variable=delete,
+                        command=lambda: delete.get() and verify.set(True)).pack(anchor="w")
+        error = ttk.Label(frame, foreground="#b3261e", wraplength=wrap)
+        error.pack(anchor="w", pady=(self.px(4), 0))
+        ttk.Label(frame, text=t("bundle_hint"), foreground="#5f6368", wraplength=wrap).pack(anchor="w")
+        buttons = ttk.Frame(frame)
+        buttons.pack(anchor="e", pady=(self.px(14), 0))
+        result = []
+
+        def accept(_=None):
+            target = os.path.normpath(path.get().strip())
+            if not target.lower().endswith(".oczip"):
+                error.configure(text=t("bundle_name"))
+                return
+            result.append(target)
+            dialog.destroy()
+
+        ttk.Button(buttons, text=t("ok"), command=accept, default="active").pack(side="left", padx=(0, self.px(6)))
+        ttk.Button(buttons, text=t("cancel"), command=dialog.destroy).pack(side="left")
+        dialog.bind("<Return>", accept)
+        dialog.bind("<Escape>", lambda _: dialog.destroy())
+        entry.icursor("end")
+        entry.focus_set()  # keys (Return, Escape) reach a dialog only through the focus
+        self.show_dialog(dialog)
+        if not result:
+            return
+        target, overwrite = result[0], False
+        if os.path.exists(target):
+            if not messagebox.askyesno(t("bundle_title"), t("bundle_replace_q", path=target), parent=self.root):
+                return
+            overwrite = True
+        if delete.get() and not messagebox.askyesno(t("bundle_title"), t("bundle_delete_q", path=target, archive=folder,
+                                                    checked=t("checked" if verify.get() else "unchecked")), parent=self.root):
+            return
+        argv = ["bundle", folder, target, "--verify" if verify.get() else "--no-verify"]
+        argv += ["--delete"] * delete.get() + ["--overwrite"] * overwrite
+
+        def done():
+            if delete.get():
+                self.archive = target
+                self.load()
+            messagebox.showinfo(t("bundle_title"), t("done_bundle_deleted" if delete.get() else "done_bundle", path=target),
+                                parent=self.root)
+
+        self.start([{"argv": argv, "title": t("bundling", name=os.path.basename(target))}], done)
+
+    def show_dialog(self, dialog):
+        """Center a dialog over the window and wait, modal, until it is closed."""
         dialog.update_idletasks()
         x = self.root.winfo_rootx() + (self.root.winfo_width() - dialog.winfo_reqwidth()) // 2
         y = self.root.winfo_rooty() + (self.root.winfo_height() - dialog.winfo_reqheight()) // 3
@@ -406,7 +531,6 @@ class App:
         dialog.wait_visibility()  # a grab needs a window that is shown (X11)
         dialog.grab_set()
         self.root.wait_window(dialog)
-        return result[0] if result else None
 
     def extract(self):
         if not self.need_archive():
@@ -448,7 +572,7 @@ class App:
         """Run llm_archive.py once per job, one after another, showing what it prints; stop at the first failure.
         `done` is called once all have succeeded."""
         self.jobs, self.done = list(jobs), done
-        for widget in self.buttons:
+        for widget, _ in self.controls:
             widget.configure(state="disabled")
         self.cancel_button.configure(state="normal", text=t("cancel"))
         self.progress.configure(mode="indeterminate")
@@ -517,8 +641,6 @@ class App:
         self.progress.stop()
         self.progress.configure(mode="determinate", value=0)  # an idle indeterminate bar still shows its block
         self.cancel_button.configure(state="disabled", text=t("cancel"))
-        for widget in self.buttons:
-            widget.configure(state="normal")
         if self.quit_after:
             self.root.destroy()
             return

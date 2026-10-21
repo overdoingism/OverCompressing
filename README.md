@@ -71,7 +71,9 @@ python -I tools/llm_archive.py restore archive Qwen/Qwen2.5-0.5B-Instruct restor
 
 Get the model folders with any tool you like (OverCompressing never downloads) → pack the base → pack the fine-tune
 (it finds its base in the archive by itself and is stored as a delta) → verify → restore. Prefer a window?
-`python -I tools/llm_archive_gui.py archive` does pack, verify and extract with a few clicks.
+`python -I tools/llm_archive_gui.py archive` does pack, verify and extract with a few clicks. Want one file?
+`python -I tools/llm_archive.py bundle archive models.oczip --delete` puts the whole archive into one `.oczip` (a ZIP),
+verifies it and removes the folder's files; `verify` and `restore` read the `.oczip` as it is.
 
 → **[Usage / 使用方式（中英對照）](docs/usage.md)**
 
@@ -99,8 +101,8 @@ without this tool: **[tools/ARCHIVE_FORMAT.md](tools/ARCHIVE_FORMAT.md)**.
 ## Repository layout / 目錄結構
 
 ```
-tools/llm_archive.py       the archiver (pack / rebase / verify / restore)
-tools/llm_archive_gui.py   a small window (Tkinter) for pack, verify and restore
+tools/llm_archive.py       the archiver (pack / rebase / verify / restore / bundle)
+tools/llm_archive_gui.py   a small window (Tkinter) for pack, bundle, verify and restore
 tools/ARCHIVE_FORMAT.md    format specification
 tools/compare_tensors.py   how well a fine-tune lines up with a base
 tools/test_*.py            self-tests (ans16 coder, formats, conversions)

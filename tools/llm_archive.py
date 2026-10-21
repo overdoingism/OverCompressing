@@ -10,8 +10,10 @@ larger than 1 MiB that are identical to one already in the archive are stored as
     python -I llm_archive.py rebase  <archive_root> (<name> ... | --all) [--base NAME | --no-base] [--dry-run]
     python -I llm_archive.py verify  <archive_root> [<name> ...]
     python -I llm_archive.py restore <archive_root> <name> <dest_dir> [--overwrite] [--file PATH ...]
+    python -I llm_archive.py bundle  <archive_root> <file.oczip> [--verify | --no-verify] [--delete] [--overwrite]
 
-llm_archive_gui.py is a small window for pack, verify and restore.
+bundle puts the whole archive folder into one .oczip file (a ZIP); verify and restore read it like the folder.
+llm_archive_gui.py is a small window for pack, bundle, verify and restore.
 
 The tool never downloads anything: get the model files however you like, then pack the folder. rebase re-chooses the
 bases of models already in the archive (e.g. after a closer ancestor was packed), restoring each file it re-packs.
@@ -39,6 +41,7 @@ import struct
 import sys
 import tempfile
 import time
+import zipfile
 import zlib
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -203,10 +206,14 @@ def _manifest_problem(manifest):
 
 
 def sha256_file(path):
-    h = hashlib.sha256()
     with open(path, "rb") as f:
-        while block := f.read(16 << 20):
-            h.update(block)
+        return sha256_stream(f)
+
+
+def sha256_stream(f):
+    h = hashlib.sha256()
+    while block := f.read(16 << 20):
+        h.update(block)
     return h.hexdigest()
 
 
@@ -1019,11 +1026,13 @@ def container_header_problem(header):
     return None if pos == header["original_size"] else "regions do not add up to original_size"
 
 
-def read_container(f):
-    """(header, [(codec, raw_len, payload offset, payload_len, crc)]) of an open container, checked before anything
+def read_container(f, start=0, size=None):
+    """(header, [(codec, raw_len, payload offset, payload_len, crc)]) of an open container (the file f, or `size`
+    bytes of it from `start`, where a container lies in an .oczip; offsets count from there), checked before anything
     is decoded: the header (container_header_problem), one frame per region restoring to exactly its length with a
     codec that fits the region, every payload inside the file, and nothing after the last one. ValueError if not."""
-    size = os.fstat(f.fileno()).st_size
+    size = os.fstat(f.fileno()).st_size - start if size is None else size
+    f.seek(start)
     if f.read(4) != MAGIC:
         raise ValueError(f"not an {MAGIC.decode()} container")
     (n,) = struct.unpack("<I", f.read(4).ljust(4, b"\0"))
@@ -1037,7 +1046,7 @@ def read_container(f):
     for region in header["regions"]:
         if pos + FRAME_HEAD.size > size:
             raise ValueError("container cut short")
-        f.seek(pos)
+        f.seek(start + pos)
         codec, raw_len, payload_len, crc = FRAME_HEAD.unpack(f.read(FRAME_HEAD.size))
         pos += FRAME_HEAD.size
         kind = codec & ~STANDALONE
@@ -1050,6 +1059,110 @@ def read_container(f):
     if pos != size:
         raise ValueError("bytes after the last frame of the container")
     return header, frames
+
+
+# ----------------------------------------------------------------------------------------------- reading an archive
+#
+# An archive is a folder, or that folder in one .oczip file (a ZIP; see bundle). verify and restore read either.
+# Containers in an .oczip are stored uncompressed, so they are read where they lie in it; the other files
+# (manifests, files stored as-is) may be Deflate-compressed there and are read through zipfile.
+
+OCZIP = ".oczip"
+_ZIPS = {}  # .oczip path -> its ZipFile, opened once for the program's run
+MAX_MANIFEST = 256 << 20
+
+
+def is_oczip(archive_root):
+    return archive_root.lower().endswith(OCZIP)
+
+
+def oczip(archive_root):
+    """The ZipFile of a single-file archive; ValueError if it is not a ZIP, or names a file twice or unsafely."""
+    z = _ZIPS.get(archive_root)
+    if z is None:
+        try:
+            z = zipfile.ZipFile(archive_root)
+        except zipfile.BadZipFile as e:
+            raise ValueError(f"not a readable {OCZIP} ({e})") from None
+        names = z.namelist()
+        bad = next((n for n in names if path_problem(n.rstrip("/"))), None)
+        if bad is not None or len(set(names)) != len(names):
+            z.close()
+            raise ValueError(f"unsafe file name {bad!r} in it" if bad is not None else "a file name appears twice in it")
+        _ZIPS[archive_root] = z
+    return z
+
+
+def archive_file(archive_root, rel):
+    """rel ("/"-separated, inside the archive) opened for reading: from the folder, or from the .oczip."""
+    if not is_oczip(archive_root):
+        return open(os.path.join(archive_root, *rel.split("/")), "rb")
+    try:
+        return oczip(archive_root).open(rel)
+    except KeyError:
+        raise FileNotFoundError(errno.ENOENT, "not in the archive", rel) from None
+    except (RuntimeError, NotImplementedError) as e:  # encrypted, or compressed in a way zipfile cannot read
+        raise ValueError(f"{rel}: {e}") from None
+
+
+def container_span(archive_root, rel):
+    """(path, start, size): where the container rel lies on disk. In a folder, a file of its own; in an .oczip, its
+    bytes inside it, which must be stored uncompressed (ValueError otherwise)."""
+    if not is_oczip(archive_root):
+        path = os.path.join(archive_root, *rel.split("/"))
+        return path, 0, os.path.getsize(path)
+    try:
+        info = oczip(archive_root).getinfo(rel)
+    except KeyError:
+        raise FileNotFoundError(errno.ENOENT, "not in the archive", rel) from None
+    if info.compress_type != zipfile.ZIP_STORED or info.flag_bits & 1 or info.compress_size != info.file_size:
+        raise ValueError(f"{rel} is compressed or encrypted in the {OCZIP}: containers must be stored as they are")
+    with open(archive_root, "rb") as f:
+        f.seek(info.header_offset)
+        head = f.read(30)  # the ZIP local file header, then its name and extra field
+        end = os.fstat(f.fileno()).st_size
+    if len(head) != 30 or head[:4] != b"PK\x03\x04":
+        raise ValueError(f"{rel}: no ZIP local header where the {OCZIP} says it is")
+    start = info.header_offset + 30 + sum(struct.unpack("<HH", head[26:30]))
+    if start + info.file_size > end:
+        raise ValueError(f"{rel} runs past the end of the {OCZIP}")
+    return archive_root, start, info.file_size
+
+
+def model_folders(archive_root):
+    """The archive's top-level folders that hold a manifest.json, sorted."""
+    if is_oczip(archive_root):
+        return sorted({n[:-len("/manifest.json")] for n in oczip(archive_root).namelist()
+                       if n.endswith("/manifest.json") and n.count("/") == 1})
+    if not os.path.isdir(archive_root):
+        return []
+    return [d for d in sorted(os.listdir(archive_root)) if os.path.exists(os.path.join(archive_root, d, "manifest.json"))]
+
+
+def read_manifest(archive_root, folder):
+    """The JSON of folder/manifest.json in the archive, unchecked; ValueError if it cannot be read as JSON."""
+    try:
+        with archive_file(archive_root, f"{folder}/manifest.json") as f:
+            data = f.read(MAX_MANIFEST + 1)
+    except zipfile.BadZipFile as e:  # a CRC mismatch inside the .oczip
+        raise ValueError(str(e)) from None
+    if len(data) > MAX_MANIFEST:
+        raise ValueError(f"larger than {human(MAX_MANIFEST)}")
+    return strict_json(data)
+
+
+def close_single_files():
+    """Close the .oczip files opened for reading, so that another program may replace them."""
+    while _ZIPS:
+        _ZIPS.popitem()[1].close()
+
+
+def open_single_file(archive_root):
+    """Open an .oczip for reading, or stop saying why it cannot be."""
+    try:
+        oczip(archive_root)
+    except (OSError, ValueError) as e:
+        sys.exit(f"cannot open {archive_root}: {e.strerror if isinstance(e, OSError) and e.strerror else e}")
 
 
 def find_entry(archive_root, repo, path):
@@ -1070,13 +1183,13 @@ def iter_entry_bytes(archive_root, repo, entry, depth=0):
         ref = entry["same_as"]
         yield from iter_entry_bytes(archive_root, ref["repo"], find_entry(archive_root, ref["repo"], ref["path"]), depth + 1)
         return
-    stored = os.path.join(archive_root, repo_dir_name(repo), entry["stored"])
+    stored = f"{repo_dir_name(repo)}/{entry['stored']}"
     if entry["method"] == "raw":
-        with open(stored, "rb") as f:
+        with archive_file(archive_root, stored) as f:
             while block := f.read(16 << 20):
                 yield block
     else:
-        yield from iter_original_chunks(archive_root, stored, depth, entry["size"])
+        yield from iter_original_chunks(archive_root, container_span(archive_root, stored), depth, entry["size"])
 
 
 def materialize_file(archive_root, repo, path, sha256, depth=0):
@@ -1129,18 +1242,20 @@ def base_paths_for(archive_root, delta, depth=0):
 STANDALONE = 0x80  # frame codec flag: this region of a delta was stored without using the base
 
 
-def iter_original_chunks(archive_root, container_path, depth=0, expected_size=None):
+def iter_original_chunks(archive_root, container, depth=0, expected_size=None):
     """Yield the original file's bytes region by region, resolving deltas against base archives recursively.
-    ans16 regions are decoded in parallel worker processes."""
+    container: its path, or (path, start, size) of one inside an .oczip (container_span). ans16 regions are decoded
+    in parallel worker processes."""
+    container_path, start, size = container if isinstance(container, tuple) else (container, 0, None)
     with open(container_path, "rb") as f:
-        header, frames = read_container(f)
+        header, frames = read_container(f, start, size)
         if expected_size is not None and header["original_size"] != expected_size:
             raise ValueError(f"{container_path}: the container restores {header['original_size']} bytes, not {expected_size}")
         regions = header["regions"]
         delta = header.get("delta")
         base_paths, owned = base_paths_for(archive_root, delta, depth) if delta else ([], [])
         jobs = [
-            (container_path, off, plen, base_paths[r["base"][0]], r["base"][1], r.get("base_dtype"), r["length"], r["dtype"])
+            (container_path, start + off, plen, base_paths[r["base"][0]], r["base"][1], r.get("base_dtype"), r["length"], r["dtype"])
             for r, (codec, _, off, plen, _) in zip(regions, frames) if codec == CODEC_ANS16
         ]
         pool = ProcessPoolExecutor(ans16_workers()) if jobs else None
@@ -1152,7 +1267,7 @@ def iter_original_chunks(archive_root, container_path, depth=0, expected_size=No
             def to_decode():  # read here, in order; decoded on the threads
                 for region, (codec, raw_len, off, plen, _) in zip(regions, frames):
                     if codec != CODEC_ANS16:
-                        f.seek(off)
+                        f.seek(start + off)
                         payload = f.read(plen)
                         base = base_bytes(base_paths, bases, region) if "base" in region and not codec & STANDALONE else None
                         yield codec, payload, raw_len, region, base
@@ -1537,8 +1652,7 @@ def load_manifest(archive_root, repo_id):
     if problem:
         raise ValueError(problem)
     path = os.path.join(archive_root, repo_dir_name(repo_id), "manifest.json")
-    with open(path, "rb") as f:
-        manifest = strict_json(f.read())
+    manifest = read_manifest(archive_root, repo_dir_name(repo_id))
     problem = manifest_problem(manifest)
     if not problem and manifest["repo"] != repo_id:
         problem = f"this folder holds the model {manifest['repo']!r}, not {repo_id!r}"
@@ -1564,9 +1678,12 @@ def chain_problem(archive_root, repo, entry, trail=()):
     trail += (here,)
     if entry.get("stored"):
         try:
-            digest = sha256_file(os.path.join(archive_root, repo_dir_name(repo), *entry["stored"].split("/")))
+            with archive_file(archive_root, f"{repo_dir_name(repo)}/{entry['stored']}") as f:
+                digest = sha256_stream(f)
         except OSError as e:
             return f"stored file {entry['stored']} missing or unreadable ({e.strerror or e})"
+        except (ValueError, zipfile.BadZipFile) as e:  # in an .oczip: unreadable, or its CRC does not match
+            return f"stored file {entry['stored']} unreadable or corrupted ({e})"
         if digest != entry["stored_sha256"]:
             return "stored file corrupted (stored_sha256 mismatch)"
     for ref_repo, ref_path, ref_sha in references(entry):
@@ -1911,7 +2028,14 @@ def holds(folder, path):
         return False
 
 
+def refuse_single_file(archive_root):
+    if is_oczip(archive_root):
+        sys.exit(f"{archive_root} is a single-file archive ({OCZIP}): it is read-only. To pack into it or rebase it, "
+                 "extract it into a folder (it is a ZIP) and use that folder")
+
+
 def cmd_pack(args):
+    refuse_single_file(args.archive_root)
     source = os.path.abspath(args.source_dir)
     if not os.path.isdir(source):
         sys.exit(f"{source} is not a folder")
@@ -2620,6 +2744,7 @@ def rebase_model(args, repo):
 
 
 def cmd_rebase(args):
+    refuse_single_file(args.archive_root)
     if bool(args.repos) == args.all:
         sys.exit("name the models to rebase, or use --all")
     if args.all and args.base:
@@ -2653,16 +2778,15 @@ def all_manifests(archive_root, problems=None):
     manifest_problem; its folder must also be named after its model) is added to `problems` as (folder, problem) if
     given; otherwise the program stops, since a model it cannot see may depend on the others."""
     manifests = {}
-    for d in sorted(os.listdir(archive_root)) if os.path.isdir(archive_root) else ():
+    for d in model_folders(archive_root):
         path = os.path.join(archive_root, d, "manifest.json")
-        if not os.path.exists(path):
-            continue
         try:
-            with open(path, "rb") as f:
-                manifest = strict_json(f.read())
+            manifest = read_manifest(archive_root, d)
             problem = manifest_problem(manifest)
             if not problem and os.path.normcase(repo_dir_name(manifest["repo"])) != os.path.normcase(d):
                 problem = f"it holds the model {manifest['repo']!r}, whose folder is {repo_dir_name(manifest['repo'])}"
+            if not problem and manifest["repo"] in manifests:  # e.g. in an .oczip, folders differing only in case
+                problem = f"another folder holds the model {manifest['repo']!r} already"
         except (OSError, ValueError) as e:
             problem = f"cannot read it ({e})"
         if problem:
@@ -2674,29 +2798,39 @@ def all_manifests(archive_root, problems=None):
     return manifests
 
 
-def cmd_verify(args):
-    if not os.path.isdir(args.archive_root):
-        sys.exit(f"{args.archive_root} is not a folder: nothing verified")
-    lock_archive(args.archive_root, exclusive=False, skip=args.no_lock)
+def verify_models(archive_root, repos):
+    """Decode every file of these models (none: of every model) and check it, printing a line for each; returns
+    (failures, files checked)."""
     failures, problems, checked = 0, [], 0
-    repos = args.repos or list(all_manifests(args.archive_root, problems))
+    repos = repos or list(all_manifests(archive_root, problems))
     if not repos and not problems:
-        sys.exit(f"no models found in {args.archive_root}: nothing verified")
+        sys.exit(f"no models found in {archive_root}: nothing verified")
     for folder, problem in problems:
         failures += 1
         print(f"  FAIL  {folder}/manifest.json  -- {problem}")
     for repo in repos:
         try:
-            entries = load_manifest(args.archive_root, repo)["files"]
+            entries = load_manifest(archive_root, repo)["files"]
         except (OSError, ValueError) as e:
             failures += 1
             print(f"  FAIL  {repo}  -- cannot read its manifest: {e}")
             continue
         for entry in entries:
-            problem = verify_entry(args.archive_root, repo, entry)
+            problem = verify_entry(archive_root, repo, entry)
             failures += bool(problem)
             checked += 1
             print(f"  {'FAIL' if problem else 'ok  '}  {repo}:{entry['path']}" + (f"  -- {problem}" if problem else ""))
+    return failures, checked
+
+
+def cmd_verify(args):
+    if is_oczip(args.archive_root):
+        open_single_file(args.archive_root)  # one file, only ever written whole: nothing to lock
+    elif not os.path.isdir(args.archive_root):
+        sys.exit(f"{args.archive_root} is not a folder: nothing verified")
+    else:
+        lock_archive(args.archive_root, exclusive=False, skip=args.no_lock)
+    failures, checked = verify_models(args.archive_root, args.repos)
     if failures:
         sys.exit(f"{failures} FAILURE(S): replace the damaged files from another copy or repair them (see docs/protection.md)")
     if not checked:
@@ -2707,7 +2841,9 @@ def cmd_verify(args):
 def cmd_restore(args):
     """Every path is placed (restore_plan) and checked before anything is written. A destination file that already
     holds the right bytes is kept; one with other contents is replaced only with --overwrite."""
-    if os.path.isdir(args.archive_root):
+    if is_oczip(args.archive_root):
+        open_single_file(args.archive_root)
+    elif os.path.isdir(args.archive_root):
         lock_archive(args.archive_root, exclusive=False, skip=args.no_lock)
     try:
         manifest = load_manifest(args.archive_root, args.repo)
@@ -2761,6 +2897,151 @@ def cmd_restore(args):
               "became \"_\", or a \" (n)\" keeps two files apart")
     what = f"{len(plan)} of {len(manifest['files'])} files of {args.repo}" if args.files else args.repo
     print(f"restored {what}" + (f" @ {manifest['revision']}" if manifest.get("revision") else "") + f" into {args.dest_dir}")
+
+
+STORED_SUFFIXES = (".ocz", OCZIP, ".zip", ".whl", ".gz", ".tgz", ".xz", ".zst", ".bz2", ".7z", ".rar", ".exe", ".msi",
+                   ".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp3", ".mp4", ".mkv", ".par2")  # compressed already
+
+
+def bundle_files(archive_root):
+    """(files, problems) of an archive folder for bundle: every file in it (relative "/" paths, sorted) but the lock
+    file and unfinished temporary files (.oc-*.part); problems: links (never followed) and anything that is not a
+    regular file."""
+    found, problems = [], []
+    is_junction = getattr(os.path, "isjunction", lambda p: False)
+    for dirpath, dirnames, names in os.walk(archive_root):
+        rel = lambda n: os.path.relpath(os.path.join(dirpath, n), archive_root).replace(os.sep, "/")  # noqa: E731
+        keep = []
+        for d in sorted(dirnames):
+            full = os.path.join(dirpath, d)
+            if os.path.islink(full) or is_junction(full):
+                problems.append(f"{rel(d)}/ is a link to a folder")
+            else:
+                keep.append(d)
+        dirnames[:] = keep
+        for n in sorted(names):
+            if (dirpath == archive_root and n == LOCK_NAME) or (n.startswith(".oc-") and n.endswith(".part")):
+                continue
+            mode = os.lstat(os.path.join(dirpath, n)).st_mode
+            if stat.S_ISREG(mode):
+                found.append(rel(n))
+            else:
+                problems.append(f"{rel(n)} is {'a link' if stat.S_ISLNK(mode) else 'not a regular file'}")
+    return sorted(found), problems
+
+
+def zip_method(path, rel, size):
+    """ZIP_STORED for a file compressed already (by its name) or one Deflate barely shrinks (judged on its first
+    MiB), else ZIP_DEFLATED."""
+    if not size or rel.lower().endswith(STORED_SUFFIXES):
+        return zipfile.ZIP_STORED
+    with open(path, "rb") as f:
+        sample = f.read(1 << 20)
+    return zipfile.ZIP_DEFLATED if len(zlib.compress(sample, 6)) < 0.9 * len(sample) else zipfile.ZIP_STORED
+
+
+def bundle_problems(path, digests):
+    """What differs between the .oczip at path, read back from disk, and the files put in it ({name: sha256})."""
+    _ZIPS.pop(path, None)
+    z, problems = oczip(path), []
+    names = set(z.namelist())
+    problems += [f"{n}: in the {OCZIP} but not put in" for n in sorted(names - set(digests))]
+    problems += [f"{n}: missing from the {OCZIP}" for n in sorted(set(digests) - names)]
+    for name, digest in digests.items():
+        if name in names:
+            try:
+                with z.open(name) as f:
+                    same = sha256_stream(f) == digest
+            except (OSError, ValueError, zipfile.BadZipFile) as e:
+                problems.append(f"{name}: cannot be read back ({e})")
+                continue
+            if not same:
+                problems.append(f"{name}: differs from the file put in")
+    return problems
+
+
+def unlock_archive(archive_root):
+    """Release the archive's lock and delete its file (bundle --delete: the folder is going)."""
+    while _HELD_LOCK:
+        os.close(_HELD_LOCK.pop())
+    with contextlib.suppress(OSError):
+        os.remove(os.path.join(archive_root, LOCK_NAME))
+
+
+def cmd_bundle(args):
+    """Put the whole archive folder (models, _kit, anything else in it) into one .oczip file, a ZIP: containers and
+    files compressed already stored as they are (so containers can be read in place), the others Deflate-compressed
+    when that makes them smaller. --verify reads it back (every file compared with what was put in, every model
+    verified from it); --delete then deletes the files put in from the folder, and verifies first unless --no-verify."""
+    root, out = args.archive_root, os.path.abspath(args.oczip)
+    verify = args.delete if args.verify is None else args.verify
+    if is_oczip(root) or not os.path.isdir(root):
+        sys.exit(f"{root} is not an archive folder")
+    if not out.lower().endswith(OCZIP):
+        sys.exit(f"{args.oczip}: the name of the single file must end with {OCZIP}")
+    if holds(root, out):
+        sys.exit(f"{args.oczip} would be inside the archive folder: write it somewhere else")
+    if os.path.lexists(out) and not args.overwrite:
+        sys.exit(f"{args.oczip} exists already: choose another name, or add --overwrite to replace it")
+    lock_archive(root, exclusive=args.delete)  # a reader's lock is enough unless the files are then deleted
+    manifests = all_manifests(root)
+    if not manifests:
+        sys.exit(f"no models found in {root}: nothing to bundle")
+    files, problems = bundle_files(root)
+    if problems:
+        sys.exit(f"cannot bundle {root} as it is:\n  " + "\n  ".join(problems) + "\nmove or delete these first")
+    containers = {f"{repo_dir_name(r)}/{e['stored']}" for r, m in manifests.items() for e in m["files"]
+                  if e["method"] not in ("raw", "same")}
+    sizes = {rel: os.path.getsize(os.path.join(root, *rel.split("/"))) for rel in files}
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    problem = space_problem({os.path.dirname(out): sum(sizes.values()) + (len(files) << 10) + (16 << 20)})
+    if problem:
+        sys.exit(f"not enough room for {args.oczip}: {problem}")
+    print(f"bundling {len(files)} files ({human(sum(sizes.values()))}) of {root} into {out}")
+    digests, t0 = {}, time.perf_counter()
+    with SafeTree(os.path.dirname(out)).placing(os.path.basename(out), replace=args.overwrite) as f, \
+            zipfile.ZipFile(f, "w", allowZip64=True) as z:
+        for rel in files:
+            full = os.path.join(root, *rel.split("/"))
+            info = zipfile.ZipInfo.from_file(full, rel, strict_timestamps=False)
+            info.file_size = sizes[rel]
+            info.compress_type = zipfile.ZIP_STORED if rel in containers else zip_method(full, rel, sizes[rel])
+            h, n = hashlib.sha256(), 0
+            with open(full, "rb") as src, z.open(info, "w") as dst:
+                while block := src.read(16 << 20):
+                    h.update(block)
+                    dst.write(block)
+                    n += len(block)
+            if n != sizes[rel]:
+                sys.exit(f"{rel} changed while it was bundled: nothing written")
+            digests[rel] = h.hexdigest()
+            how = "stored" if info.compress_type == zipfile.ZIP_STORED else f"deflated to {info.compress_size / max(n, 1):.0%}"
+            print(f"  {rel:<60} {human(n):>12}  {how}")
+    print(f"wrote {out}: {human(os.path.getsize(out))}  ({time.perf_counter() - t0:.0f}s)")
+    if verify:
+        print(f"verifying {out}")
+        problems = bundle_problems(out, digests)
+        for p in problems:
+            print(f"  FAIL  {p}")
+        failures, checked = verify_models(out, [])
+        if problems or failures:
+            sys.exit(f"{len(problems) + failures} FAILURE(S) in {out}" + (": nothing deleted" if args.delete else ""))
+        print(f"VERIFIED: all {len(files)} files read back identical; {checked} model files restored exactly")
+    if args.delete:
+        tree = SafeTree(root)
+        left = [rel for rel in files if not tree.remove(rel)]
+        for rel in files:
+            tree.prune(rel)
+        unlock_archive(root)
+        with contextlib.suppress(OSError):
+            os.rmdir(root)  # only if nothing else is left in it
+        print(f"deleted the {len(files) - len(left)} bundled files from {root}")
+        others = [os.path.join(d, n) for d, _, names in os.walk(root) for n in names if os.path.join(d, n) not in
+                  {os.path.join(root, *rel.split("/")) for rel in left}]
+        if others:
+            print(f"  left in {root}, not bundled: {len(others)} file(s), e.g. {others[0]}")
+        if left:
+            sys.exit(f"could not delete {len(left)} file(s), e.g. {left[0]}: they are in {out}; delete them yourself")
 
 
 def whole_number(lo, hi):
@@ -2839,6 +3120,20 @@ def main():
                    help="restore only this file of the model, its path as the archive lists it (repeatable)")
     s.add_argument("--no-lock", action="store_true", help=no_lock)
     s.set_defaults(func=cmd_restore)
+    s = sub.add_parser("bundle", help=f"put the whole archive folder into one {OCZIP} file, which verify and "
+                                      "restore read as they read the folder")
+    s.add_argument("archive_root")
+    s.add_argument("oczip", help=f"the file to write, its name ending in {OCZIP} (outside the archive folder)")
+    check = s.add_mutually_exclusive_group()
+    check.add_argument("--verify", action="store_true", default=None,
+                       help="then read it back: every file compared with what was put in, every model verified "
+                            "(default: only with --delete)")
+    check.add_argument("--no-verify", dest="verify", action="store_false", default=None,
+                       help="with --delete: delete without verifying first")
+    s.add_argument("--delete", action="store_true",
+                   help="then delete the files put in from the archive folder (verified first unless --no-verify)")
+    s.add_argument("--overwrite", action="store_true", help="replace a file of that name")
+    s.set_defaults(func=cmd_bundle)
     args = p.parse_args()
     workers = ans16_workers()  # checks OC_WORKERS before any command starts
     if getattr(args, "workers", 0) is None:

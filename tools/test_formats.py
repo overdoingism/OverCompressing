@@ -1158,6 +1158,143 @@ def check_selected_files():
         expect(f"pack of a folder {what}: refused", ok, "" if ok else out[-200:])
 
 
+def check_bundle():
+    """bundle: the archive folder (here the one check_rebase made: ans16 deltas, same-as references) into one .oczip
+    that verify and restore read in place; --verify, --delete; and what is refused."""
+    print("bundle (.oczip)")
+    root = os.path.join(scratch, "bundle")
+    shutil.rmtree(root, ignore_errors=True)
+    os.makedirs(root)
+    archive, models = os.path.join(scratch, "rebase_archive"), os.path.join(scratch, "rebase_models")
+    clean = lambda out: "Traceback" not in out  # noqa: E731
+    single = os.path.join(root, "all.oczip")
+    code, out = tool("bundle", archive, single)
+    ok = code == 0 and os.path.isfile(single) and "verifying" not in out and os.path.isfile(os.path.join(archive, "t__F", "manifest.json"))
+    expect("bundle writes the .oczip; by default it neither verifies nor deletes", ok, "" if ok else out[-300:])
+    with zipfile.ZipFile(single) as z:
+        methods = {i.filename: i.compress_type for i in z.infolist()}
+    ok = all(m == zipfile.ZIP_STORED for n, m in methods.items() if n.endswith(".ocz")) and la.LOCK_NAME not in methods \
+        and all(m == zipfile.ZIP_DEFLATED for n, m in methods.items() if n.endswith("manifest.json"))
+    expect("containers stored, manifests deflated, the lock file left out", ok, "" if ok else str(methods))
+    code, out = tool("verify", single)
+    code2, out2 = tool("verify", archive)
+    ok = code == 0 and "ALL VERIFIED" in out and out.count("  ok  ") == out2.count("  ok  ")
+    expect("verify reads the .oczip in place (ans16 deltas and same-as references too)", ok, "" if ok else out[-300:])
+    for name in ("t/F", "t/P", "t/G"):
+        src = os.path.join(models, name.replace("/", "_"))
+        dest = os.path.join(root, "restored", name.replace("/", "_"))
+        code, out = tool("restore", single, name, dest)
+        ok = code == 0 and same_tree(dest, {rel: open(os.path.join(src, rel), "rb").read() for rel in os.listdir(src)})
+        expect(f"restore {name} from the .oczip: byte-identical", ok, "" if ok else out[-300:])
+    dest = os.path.join(root, "one")
+    code, out = tool("restore", single, "t/G", dest, "--file", "config.json")
+    ok = code == 0 and os.listdir(dest) == ["config.json"]
+    expect("restore --file from the .oczip", ok, "" if ok else out[-200:])
+    for argv, words in ((("bundle", archive, single), "exists already"),
+                        (("bundle", archive, os.path.join(root, "all.zip")), "must end with"),
+                        (("bundle", archive, os.path.join(archive, "inside.oczip")), "inside the archive folder"),
+                        (("pack", os.path.join(models, "t_F"), single, "--name", "t/X"), "read-only"),
+                        (("rebase", single, "--all"), "read-only")):
+        code, out = tool(*argv)
+        ok = code != 0 and words in out and clean(out)
+        expect(f"{argv[0]} {'into' if argv[0] == 'pack' else 'with'} {os.path.basename(argv[2])}: refused", ok, "" if ok else out[-200:])
+    code, out = tool("bundle", archive, single, "--overwrite")
+    expect("--overwrite replaces it", code == 0, "" if code == 0 else out[-200:])
+
+    print("bundle: damaged or unusable .oczip files")
+    span = la.container_span(single, "t__G/model.safetensors.ocz")
+    la.close_single_files()
+    bad = os.path.join(root, "flipped.oczip")
+    shutil.copyfile(single, bad)
+    with open(bad, "r+b") as f:
+        f.seek(span[1] + span[2] // 2)
+        byte = f.read(1)
+        f.seek(-1, 1)
+        f.write(bytes([byte[0] ^ 0x20]))
+    deflated = os.path.join(root, "deflated.oczip")
+    with zipfile.ZipFile(single) as z, zipfile.ZipFile(deflated, "w", zipfile.ZIP_DEFLATED) as w:
+        for i in z.infolist():
+            w.writestr(i.filename, z.read(i.filename))
+    junk = os.path.join(root, "junk.oczip")
+    open(junk, "wb").write(b"not a zip at all")
+    twice = os.path.join(root, "twice.oczip")
+    with zipfile.ZipFile(single) as z, zipfile.ZipFile(twice, "w") as w:
+        for i in z.infolist():
+            w.writestr(i, z.read(i.filename))
+        w.writestr("T__G/manifest.json", z.read("t__G/manifest.json"))  # the same model under a folder name in other case
+    expected = "another folder holds" if os.name == "nt" else "whose folder is"
+    for path, words in ((bad, "FAIL"), (deflated, "must be stored"), (junk, "cannot open"), (twice, expected)):
+        code, out = tool("verify", path)
+        ok = code != 0 and words in out and clean(out)
+        expect(f"verify of {os.path.basename(path)}: a clean failure", ok, "" if ok else out[-300:])
+
+    print("bundle: --verify, --delete")
+    work = os.path.join(root, "work")
+    files_in = lambda folder: sorted(os.path.relpath(os.path.join(d, n), folder) for d, _, ns in os.walk(folder)  # noqa: E731
+                                     for n in ns if n != la.LOCK_NAME)
+
+    def fresh_copy():
+        shutil.rmtree(work, ignore_errors=True)
+        shutil.copytree(archive, work, ignore=shutil.ignore_patterns(la.LOCK_NAME))
+        make_folder(os.path.join(work, "notes"), {"readme.txt": b"notes about these models\n" * 200})
+        make_folder(os.path.join(work, "_kit"), {"fake.whl": os.urandom(5000)})
+        open(os.path.join(work, ".oc-0123456789abcdef.part"), "wb").write(b"leftover")
+        return files_in(work)
+
+    listing = fresh_copy()
+    if link_dir(os.path.join(work, "linked"), os.path.join(root, "restored")):
+        code, out = tool("bundle", work, os.path.join(root, "linked.oczip"))
+        ok = code != 0 and "is a link" in out and not os.path.exists(os.path.join(root, "linked.oczip"))
+        expect("a link in the archive folder stops bundle", ok, "" if ok else out[-200:])
+        (os.rmdir if os.name == "nt" else os.remove)(os.path.join(work, "linked"))  # the link itself
+    code, out = tool("bundle", work, os.path.join(root, "checked.oczip"), "--verify")
+    left = files_in(work)
+    ok = code == 0 and "VERIFIED" in out and left == listing
+    expect("--verify alone: verified, the folder kept", ok, "" if ok else out[-300:])
+    patch = 'la.bundle_problems = lambda path, digests: ["notes/readme.txt: differs from the file put in"]'
+    run = patched_process(patch, "bundle", work, os.path.join(root, "failing.oczip"), "--delete")
+    out = run.communicate(timeout=600)[0]
+    left = files_in(work)
+    ok = run.returncode != 0 and "nothing deleted" in out and left == listing
+    expect("--delete after a failed verification: nothing deleted", ok, "" if ok else out[-300:])
+    stop = """_inner, _calls = la.zip_method, []
+def _stopping(*a):
+    _calls.append(1)
+    if len(_calls) == 3:
+        raise KeyboardInterrupt
+    return _inner(*a)
+la.zip_method = _stopping"""
+    run = patched_process(stop, "bundle", work, os.path.join(root, "stopped.oczip"), "--delete")
+    run.communicate(timeout=600)
+    leftovers = [n for n in os.listdir(root) if n.startswith(".oc-") or n == "stopped.oczip"]
+    left = files_in(work)
+    ok = not leftovers and left == listing
+    expect("bundle stopped midway: no .oczip, no temporary file, the folder kept", ok, "" if ok else str(leftovers))
+    single2 = os.path.join(root, "work.oczip")
+    code, out = tool("bundle", work, single2, "--delete")
+    leftover = ".oc-0123456789abcdef.part"
+    ok = code == 0 and "VERIFIED" in out and "deleted" in out and os.listdir(work) == [leftover] and "not bundled" in out
+    expect("--delete: verified first, then the bundled files deleted (only the leftover not bundled stays)", ok,
+           "" if ok else out[-300:])
+    with zipfile.ZipFile(single2) as z:
+        methods = {i.filename: i.compress_type for i in z.infolist()}
+    ok = methods.get("notes/readme.txt") == zipfile.ZIP_DEFLATED and methods.get("_kit/fake.whl") == zipfile.ZIP_STORED \
+        and not any(n.startswith(".oc-") for n in methods)
+    expect("other files go in too (text deflated, a wheel stored); temporary leftovers do not", ok, "" if ok else str(methods))
+    code, out = tool("verify", single2)
+    ok = code == 0 and "ALL VERIFIED" in out
+    expect("the result verifies", ok, "" if ok else out[-200:])
+    fresh_copy()
+    code, out = tool("bundle", work, os.path.join(root, "unchecked.oczip"), "--delete", "--no-verify")
+    ok = code == 0 and "verifying" not in out and os.listdir(work) == [leftover]
+    expect("--delete --no-verify: deleted without verifying", ok, "" if ok else out[-300:])
+    shutil.rmtree(work)
+    shutil.copytree(archive, work, ignore=shutil.ignore_patterns(la.LOCK_NAME))
+    code, out = tool("bundle", work, os.path.join(root, "whole.oczip"), "--delete")
+    ok = code == 0 and not os.path.exists(work)
+    expect("--delete of an archive folder holding nothing else: the folder goes too", ok, "" if ok else out[-200:])
+
+
 def bf16_reference(value):
     """BF16 bits of a float32 value by round-to-nearest-even, worked out from the two neighbouring BF16 values with
     exact float arithmetic instead of bit tricks: an independent check of convert_bits."""
@@ -1323,6 +1460,7 @@ def main():
     check_accidents()
     check_hardening()
     check_selected_files()
+    check_bundle()
 
     print("ALL PASSED" if not failures else f"{failures} FAILURE(S)")
     sys.exit(1 if failures else 0)
