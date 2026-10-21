@@ -10,6 +10,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import threading
 import time
 import tracemalloc
 import zipfile
@@ -101,6 +102,11 @@ def wait_for(path, seconds=60):
             return True
         time.sleep(0.1)
     return False
+
+
+def model_dir(archive, name):
+    """The folder of model `name` in an archive folder (or, for an .oczip, the path naming it in the .oczip)."""
+    return os.path.join(archive, la.repo_dir_name(name))
 
 
 def pack(folder, archive, name, *options, **run):
@@ -277,7 +283,7 @@ def check_rebase():
     before = manifests()
     code, out = tool("rebase", archive, "--all")
     expect("rebase --all changes nothing yet (F cannot use P, which needs F)", code == 0 and manifests() == before, out[-400:] if code else "")
-    code, out = tool("rebase", archive, "t/P", "--no-base", "--no-dedupe")
+    code, out = tool("rebase", model_dir(archive, "t/P"), "--no-base", "--no-dedupe")
     expect("rebase t/P --no-base --no-dedupe makes P independent, even though it grows", code == 0 and base("t/P") is None
            and entry("t/P", "tokenizer.json")["method"] != "same" and la.repo_needs(la.all_manifests(archive))["t/P"] == set())
     f_before = stored("t/F")
@@ -293,14 +299,14 @@ def check_rebase():
            and base("t/G") == "t/F" and "skipped:" not in out, out if "skipped:" in out else "")
     expect("nothing left in OC_TMP", not os.listdir(tmp), os.listdir(tmp))
 
-    code, out = tool("rebase", archive, "t/P", "--base", "t/F")
+    code, out = tool("rebase", model_dir(archive, "t/P"), "--base", "t/F")
     expect("rebase t/P --base t/F is refused (F needs P now)", code != 0 and "cannot be its base" in out)
     before = manifests()
-    code, out = tool("rebase", archive, "t/F", "--no-base", "--no-dedupe", "--dry-run")
+    code, out = tool("rebase", model_dir(archive, "t/F"), "--no-base", "--no-dedupe", "--dry-run")
     expect("--dry-run changes nothing", code == 0 and "would be re-packed without a base" in out
            and "would be stored again" in out and manifests() == before)
-    tool("rebase", archive, "t/P")  # nothing to change, but now recorded as chosen automatically
-    code, out = tool("rebase", archive, "t/P", "--no-base")
+    tool("rebase", model_dir(archive, "t/P"))  # nothing to change, but now recorded as chosen automatically
+    code, out = tool("rebase", model_dir(archive, "t/P"), "--no-base")
     choice = la.load_manifest(archive, "t/P").get("base_choice")
     expect("--no-base is recorded even when no file changes", code == 0 and choice == "none"
            and "skipping t/P" in tool("rebase", archive, "--all", "--dry-run")[1], choice)
@@ -311,7 +317,7 @@ def check_rebase():
     for name, files in originals.items():
         dest = os.path.join(scratch, "rebase_restored", name.replace("/", "_"))
         shutil.rmtree(dest, ignore_errors=True)
-        code, out = tool("restore", archive, name, dest)
+        code, out = tool("restore", model_dir(archive, name), dest)
         same = code == 0 and all(open(os.path.join(dest, rel), "rb").read() == data for rel, data in files.items())
         expect(f"restore {name} is byte-identical", same, out[-400:] if not same else "")
     del os.environ["OC_TMP"]
@@ -383,7 +389,7 @@ def check_safety():
     expect("... or drops a file t/B needs (--exclude)", code != 0 and "data.txt" in out and clean(out))
     code, out = tool("verify", archive)
     expect("the archive is still intact after the refusals", code == 0, out[-300:] if code else "")
-    tool("rebase", archive, "t/B", "--no-base", "--no-dedupe")
+    tool("rebase", model_dir(archive, "t/B"), "--no-base", "--no-dedupe")
     write({**a_files, "data.txt": text + b"changed\n"})
     code, out = pack(a, archive, "t/A")
     code_v, out_v = tool("verify", archive)
@@ -399,7 +405,7 @@ def check_safety():
         code, out = pack(src, archive, "t/N")
         code_v, out_v = tool("verify", archive)
         dest = os.path.join(root, f"r2-{attempt}")
-        code_r, out_r = tool("restore", archive, "t/N", dest)
+        code_r, out_r = tool("restore", model_dir(archive, "t/N"), dest)
         stored = sorted(e["stored"] for e in la.load_manifest(archive, "t/N")["files"])
         expect(f"{attempt}: manifest.json, *.part and x/x.ocz all survive", code == code_v == code_r == 0 and same_tree(dest, files),
                f"stored as {stored}")
@@ -427,7 +433,7 @@ def check_safety():
         want = {"a\\b.txt": b"B", "a_b.txt": b"U", "ok.txt": b"ok"}
     stored = [e["stored"] for e in la.load_manifest(names, "t/U")["files"]] if code == 0 else []
     code_v, _ = tool("verify", names)
-    code_r, out_r = tool("restore", names, "t/U", os.path.join(root, "r4u"))
+    code_r, out_r = tool("restore", model_dir(names, "t/U"), os.path.join(root, "r4u"))
     expect('a file named a\\b.txt packs under a portable name and restores (on Windows as "a_b (1).txt")',
            code == code_v == code_r == 0 and clean(out + out_r) and stored and all("\\" not in s for s in stored)
            and same_tree(os.path.join(root, "r4u"), want), f"stored as {stored}" if code == 0 else out[-200:])
@@ -461,7 +467,7 @@ def check_safety():
         code, out = pack(make_folder(os.path.join(root, "src", "turn"), files), turn, "t/T")
         code_v, _ = tool("verify", turn)
         shutil.rmtree(os.path.join(root, "r4t"), ignore_errors=True)
-        code_r, _ = tool("restore", turn, "t/T", os.path.join(root, "r4t"))
+        code_r, _ = tool("restore", model_dir(turn, "t/T"), os.path.join(root, "r4t"))
         stored = [e["stored"] for e in la.load_manifest(turn, "t/T")["files"]] if code == 0 else []
         left = sorted(os.listdir(os.path.join(turn, "t__T")))
         expect(f"sub as a {version}: packs, verifies, restores; nothing left over", code == code_v == code_r == 0
@@ -471,16 +477,14 @@ def check_safety():
         files = {"a_": b"FILE", "a?/x.txt": b"X"}
         code, out = pack(make_folder(os.path.join(root, "src", "prefix"), files), os.path.join(root, "a4p"), "t/P")
         code_v, _ = tool("verify", os.path.join(root, "a4p"))
-        code_r, _ = tool("restore", os.path.join(root, "a4p"), "t/P", os.path.join(root, "r4p"))
+        code_r, _ = tool("restore", model_dir(os.path.join(root, "a4p"), "t/P"), os.path.join(root, "r4p"))
         expect("a file a_ next to a folder a?/ packs, verifies and restores", code == code_v == code_r == 0
                and clean(out) and same_tree(os.path.join(root, "r4p"), files), out[-200:] if code else "")
     code, out = pack(src, archive, "A/B")
     expect("(setup) A/B packs", code == 0, out[-200:] if code else "")
     code, out = pack(make_folder(os.path.join(root, "src", "other"), {"two.txt": b"second model"}), archive, "A__B")
-    code_r, out_r = tool("restore", archive, "A/B", os.path.join(root, "r4"))
+    code_r, out_r = tool("restore", model_dir(archive, "A/B"), os.path.join(root, "r4"))
     expect("A__B cannot take over the folder of A/B", code != 0 and code_r == 0 and same_tree(os.path.join(root, "r4"), {"one.txt": b"first model"}))
-    code, out = tool("restore", archive, "A__B", os.path.join(root, "r4b"))
-    expect("restore A__B does not restore A/B instead", code != 0 and clean(out) and not os.path.exists(os.path.join(root, "r4b")))
     os.makedirs(os.path.join(archive, "stray"), exist_ok=True)
     open(os.path.join(archive, "stray", "notes.txt"), "w").write("mine")
     code, out = pack(src, archive, "stray")
@@ -497,7 +501,7 @@ def check_safety():
         edit_manifest(archive, "t__R", lambda m: m["files"][0].update(path=odd))
         shutil.rmtree(os.path.join(root, "r3m"), ignore_errors=True)
         dest = os.path.join(root, "r3m", "dest")
-        code, out = tool("restore", archive, "t/R", dest)
+        code, out = tool("restore", model_dir(archive, "t/R"), dest)
         where = os.path.join(dest, *la.local_parts(odd))
         expect(f"path {odd!r} restores inside the destination as {'/'.join(la.local_parts(odd))!r}",
                code == 0 and clean(out) and os.path.isfile(where) and open(where, "rb").read() == b"hello"
@@ -506,7 +510,7 @@ def check_safety():
         open(os.path.join(archive, "t__R", "manifest.json"), "w", encoding="utf-8").write(original)
         edit_manifest(archive, "t__R", lambda m: m["files"][0].update(path=bad))
         dest = os.path.join(root, "r3", "dest")
-        code, out = tool("restore", archive, "t/R", dest)
+        code, out = tool("restore", model_dir(archive, "t/R"), dest)
         code_v, out_v = tool("verify", archive)
         expect(f"path {bad!r}: restore refused, verify reports it", code != 0 and clean(out) and not os.path.exists(os.path.join(root, "r3"))
                and code_v != 0 and "FAIL" in out_v and clean(out_v))
@@ -521,7 +525,7 @@ def check_safety():
     if not link_dir(os.path.join(dest, "sub"), outside):
         print("  skip symlinked folder in the destination (no symlinks or junctions here)")
     else:
-        code, out = tool("restore", archive, "t/R", dest)
+        code, out = tool("restore", model_dir(archive, "t/R"), dest)
         expect("restore does not follow a symlinked folder out of the destination", code != 0 and os.listdir(outside) == [] and clean(out))
     # two paths of the manifest that a link inside the destination makes one file (review of 2026-10-20, 2nd round)
     alias = os.path.join(root, "a3l")
@@ -531,12 +535,12 @@ def check_safety():
     if not link_dir(os.path.join(dest, "two"), os.path.join(dest, "one")):
         print("  skip linked folder inside the destination (no symlinks or junctions here)")
     else:
-        code, out = tool("restore", alias, "t/L", dest)  # restore never writes through a link in the destination
+        code, out = tool("restore", model_dir(alias, "t/L"), dest)  # restore never writes through a link in the destination
         expect("a link inside the destination (two -> one) is refused before anything is written",
                code != 0 and clean(out) and "link" in out and os.listdir(os.path.join(dest, "one")) == [])
     if os.name == "nt":
         edit_manifest(archive, "t__R", lambda m: m["files"][1].update(path="NOTE.txt"))
-        code, out = tool("restore", archive, "t/R", os.path.join(root, "r3c"))
+        code, out = tool("restore", model_dir(archive, "t/R"), os.path.join(root, "r3c"))
         expect("note.txt and NOTE.txt, one file on Windows: the second becomes NOTE (1).txt",
                code == 0 and same_tree(os.path.join(root, "r3c"), {"note.txt": b"hello", "NOTE (1).txt": b"in a subfolder"}))
         open(os.path.join(archive, "t__R", "manifest.json"), "w", encoding="utf-8").write(original)
@@ -545,17 +549,17 @@ def check_safety():
     dest = os.path.join(root, "r5")
     os.makedirs(dest)
     open(os.path.join(dest, "note.txt"), "wb").write(b"KEEP")
-    code, out = tool("restore", archive, "t/R", dest)
+    code, out = tool("restore", model_dir(archive, "t/R"), dest)
     expect("a different existing file stops restore before anything is written",
            code != 0 and open(os.path.join(dest, "note.txt"), "rb").read() == b"KEEP" and not os.path.exists(os.path.join(dest, "sub")))
     edit_manifest(archive, "t__R", lambda m: m["files"][0].update(sha256="0" * 64))
-    code, out = tool("restore", archive, "t/R", dest, "--overwrite")
+    code, out = tool("restore", model_dir(archive, "t/R"), dest, "--overwrite")
     leftovers = [n for n in os.listdir(dest) if n.endswith(".part")]
     expect("a failed restore keeps the existing file and leaves no temporary file",
            code != 0 and open(os.path.join(dest, "note.txt"), "rb").read() == b"KEEP" and not leftovers and clean(out))
     open(os.path.join(archive, "t__R", "manifest.json"), "w", encoding="utf-8").write(original)
-    code, out = tool("restore", archive, "t/R", dest, "--overwrite")
-    code2, out2 = tool("restore", archive, "t/R", dest)
+    code, out = tool("restore", model_dir(archive, "t/R"), dest, "--overwrite")
+    code2, out2 = tool("restore", model_dir(archive, "t/R"), dest)
     expect("--overwrite replaces it; a second restore keeps the files already right",
            code == code2 == 0 and same_tree(dest, files) and "already there" in out2)
 
@@ -586,7 +590,7 @@ def check_safety():
     src = make_folder(os.path.join(root, "src", "empty"), {"empty.txt": b"", "sub/also-empty": b""})
     code, out = pack(src, archive, "t/E")
     code_v, _ = tool("verify", archive)
-    code_r, _ = tool("restore", archive, "t/E", os.path.join(root, "r7"))
+    code_r, _ = tool("restore", model_dir(archive, "t/E"), os.path.join(root, "r7"))
     expect("a folder of empty files packs, verifies and restores", code == code_v == code_r == 0 and clean(out)
            and same_tree(os.path.join(root, "r7"), {"empty.txt": b"", "sub/also-empty": b""}))
     for option in (["--chunk-mib", "0"], ["--chunk-mib", "-1"], ["--workers", "0"], ["--zstd-level", "23"], ["--zstd-tensor-level", "x"]):
@@ -637,7 +641,7 @@ def _after_hashing(*a, **k):
 la.all_manifests = _after_hashing"""
     make_folder(src, {"x.txt": b"OLD", "y.txt": b"Y0"})
     code, out = patched_pack(change_x, src, archive, "--name", "t/C")
-    code_r, _ = tool("restore", archive, "t/C", os.path.join(root, "r1"))
+    code_r, _ = tool("restore", model_dir(archive, "t/C"), os.path.join(root, "r1"))
     expect("an unchanged small file keeps its stored copy: the hashed version is archived, nothing is overwritten",
            code == 0 and code_r == 0 and same_tree(os.path.join(root, "r1"), {"x.txt": b"OLD", "y.txt": b"Y0"}), out[-200:] if code else "")
     make_folder(src, {"x.txt": b"OLD", "y.txt": b"Y1"})
@@ -648,7 +652,7 @@ def _changed(args, source_file, *a, **k):
 la.pack_verified = _changed"""
     code, out = patched_pack(change_y, src, archive, "--name", "t/C")
     code_v, _ = tool("verify", archive)
-    code_r, _ = tool("restore", archive, "t/C", os.path.join(root, "r1b"))
+    code_r, _ = tool("restore", model_dir(archive, "t/C"), os.path.join(root, "r1b"))
     expect("a changed file that changes again while packed: VERIFY FAILED, the old version is intact",
            code != 0 and "VERIFY FAILED" in out and code_v == code_r == 0
            and same_tree(os.path.join(root, "r1b"), {"x.txt": b"OLD", "y.txt": b"Y0"}))
@@ -669,7 +673,7 @@ la.pack_verified = _changed"""
         open(go, "w").close()
         out_a = first.communicate(timeout=120)[0]
         code_v2, _ = tool("verify", archive)
-        code_r, _ = tool("restore", archive, "t/L", os.path.join(root, "r2"))
+        code_r, _ = tool("restore", model_dir(archive, "t/L"), os.path.join(root, "r2"))
         expect("while a pack runs, a second pack (same or other model) and a verify stop at once",
                code_b != 0 and code_o != 0 and code_v != 0 and "in use" in out_b and "being changed" in out_v and clean(out_b + out_v))
         expect("  and the first pack finishes; the archive verifies and holds its version",
@@ -698,7 +702,7 @@ la.pack_verified = _changed"""
     files = {"a.txt": b"A", "notes.txt": b"NEW SOURCE", "extra/readme.txt": b"NEW TOO"}
     code, out = pack(make_folder(src, files), archive, "t/U")
     code_v, _ = tool("verify", archive)
-    code_r, _ = tool("restore", archive, "t/U", os.path.join(root, "r3"))
+    code_r, _ = tool("restore", model_dir(archive, "t/U"), os.path.join(root, "r3"))
     kept = all(open(os.path.join(archive, "t__U", *rel.split("/")), "rb").read() == data for rel, data in own.items())
     expect("your own files in a model folder are never written over by a pack", code == code_v == code_r == 0 and kept
            and same_tree(os.path.join(root, "r3"), files))
@@ -707,10 +711,10 @@ la.pack_verified = _changed"""
     archive = os.path.join(root, "c4")
     pack(make_folder(os.path.join(root, "src4"), {"manifest.json": b'{"own": 1}', "w.txt": b"w"}), archive, "t/M")
     for where in (os.path.join(archive, "t__M"), archive, os.path.join(archive, "t__M", "sub")):
-        code, out = tool("restore", archive, "t/M", where, "--overwrite")
+        code, out = tool("restore", model_dir(archive, "t/M"), where, "--overwrite")
         code_v, _ = tool("verify", archive)
-        expect(f"restore into {os.path.relpath(where, root)} is refused even with --overwrite", code != 0 and code_v == 0
-               and "archive itself" in out and clean(out))
+        ok = code != 0 and code_v == 0 and "refusing to restore there" in out and clean(out)
+        expect(f"restore into {os.path.relpath(where, root)} is refused even with --overwrite", ok, "" if ok else out[-200:])
 
     print("accidents: an identical file in the archive is damaged")
     archive = os.path.join(root, "c5")
@@ -722,7 +726,7 @@ la.pack_verified = _changed"""
     open(stored, "wb").write(damaged)
     code, out = pack(make_folder(os.path.join(root, "src5b"), {"big.bin": big}), archive, "t/B")
     entry = la.load_manifest(archive, "t/B")["files"][0] if code == 0 else {}
-    code_v, _ = tool("verify", archive, "t/B")
+    code_v, _ = tool("verify", model_dir(archive, "t/B"))
     expect("the new file is stored itself, with a warning, and verifies", code == 0 and "damaged" in out
            and entry.get("method") != "same" and code_v == 0)
 
@@ -804,7 +808,7 @@ la.pack_verified = _changed"""
     if wait_for(ready):
         os.chmod(lock, 0o444)  # a lock file readers cannot open for writing (on Windows: read-only)
         code_v, out_v = tool("verify", archive)
-        code_r, out_r = tool("restore", archive, "t/R", os.path.join(root, "r10"))
+        code_r, out_r = tool("restore", model_dir(archive, "t/R"), os.path.join(root, "r10"))
         os.chmod(lock, 0o644)
         open(go, "w").close()
         writer.communicate(timeout=120)
@@ -825,7 +829,7 @@ la.read_only_volume = lambda path: {read_only}"""
                                         (False, ["--no-lock"], True, "  --no-lock lets it go on, and says so"),
                                         (True, [], True, "on a read-only volume it goes on without a lock")):
         out = ""
-        for argv in (["verify", archive], ["restore", archive, "t/R", os.path.join(root, f"r10-{read_only}-{len(options)}")]):
+        for argv in (["verify", archive], ["restore", model_dir(archive, "t/R"), os.path.join(root, f"r10-{read_only}-{len(options)}")]):
             run = patched_process(no_lock_file.format(read_only=read_only), *argv, *options)
             out_run = run.communicate(timeout=120)[0]
             out += out_run
@@ -899,7 +903,7 @@ la.SafeTree.placing = _swapped"""
         expect("pack: a stored folder swapped for a link is refused, nothing written outside", ok, "" if ok else out[-200:])
         archive = os.path.join(root, "h3")
         pack(os.path.join(root, "src2"), archive, "t/S")
-        run = patched_process(swap, "restore", archive, "t/S", os.path.join(root, "r3"))
+        run = patched_process(swap, "restore", model_dir(archive, "t/S"), os.path.join(root, "r3"))
         out = run.communicate(timeout=300)[0]
         ok = run.returncode != 0 and clean(out) and os.listdir(outside_dir) == []
         expect("restore: a destination folder swapped for a link after the checks is refused, nothing written outside",
@@ -933,7 +937,7 @@ la.SafeTree.placing = _appear"""
     archive = os.path.join(root, "h4")
     pack(make_folder(os.path.join(root, "src4"), {"x.txt": b"archived"}), archive, "t/A")
     dest = os.path.join(root, "r4")
-    run = patched_process(appear, "restore", archive, "t/A", dest)
+    run = patched_process(appear, "restore", model_dir(archive, "t/A"), dest)
     out = run.communicate(timeout=300)[0]
     ok = run.returncode != 0 and clean(out) and "appeared" in out and open(os.path.join(dest, "x.txt"), "rb").read() == b"KEEP"
     expect("without --overwrite it is not overwritten (checked and placed in one step)", ok, "" if ok else out[-200:])
@@ -951,7 +955,7 @@ def _rival(src, dst, *a, **k):
     return _real(src, dst, *a, **k)
 la.os.{commit} = _rival"""
     dest = os.path.join(root, "r5")
-    run = patched_process(rival, "restore", archive, "t/A", dest)
+    run = patched_process(rival, "restore", model_dir(archive, "t/A"), dest)
     out = run.communicate(timeout=300)[0]
     ok = run.returncode != 0 and clean(out) and "appeared" in out and restored(dest) == b"RIVAL" and tidy(dest)
     expect("a file another program writes at the very moment of placing is kept", ok, "" if ok else out[-200:])
@@ -960,10 +964,10 @@ la.os.{commit} = _rival"""
 la.os.{commit} = _fail
 la.rename_no_replace = _fail"""
     dest = os.path.join(root, "r6")
-    run = patched_process(fail, "restore", archive, "t/A", dest)
+    run = patched_process(fail, "restore", model_dir(archive, "t/A"), dest)
     out = run.communicate(timeout=300)[0]
     left = os.listdir(dest)
-    code, out2 = tool("restore", archive, "t/A", dest)
+    code, out2 = tool("restore", model_dir(archive, "t/A"), dest)
     ok = run.returncode != 0 and clean(out) and left == [] and code == 0 and restored(dest) == b"archived" and tidy(dest)
     expect("placing that fails leaves nothing (no empty file in the way); restoring again works", ok,
            "" if ok else f"{left} {out[-150:]} {out2[-150:]}")
@@ -976,7 +980,7 @@ la.rename_no_replace = _fail"""
     raise PermissionError(1, "Operation not permitted")
 la.os.link = _no_link"""
         dest = os.path.join(root, "r7")
-        run = patched_process(no_links, "restore", archive, "t/A", dest)
+        run = patched_process(no_links, "restore", model_dir(archive, "t/A"), dest)
         out = run.communicate(timeout=300)[0]
         ok = run.returncode == 0 and restored(dest) == b"archived" and tidy(dest)
         expect("without hard links, a rename that refuses an existing name places the file", ok, "" if ok else out[-200:])
@@ -989,16 +993,16 @@ def _rival(src, dst, dir_fd):
     return _real(src, dst, dir_fd)
 la.rename_no_replace = _rival"""
         dest = os.path.join(root, "r8")
-        run = patched_process(rival_rename, "restore", archive, "t/A", dest)
+        run = patched_process(rival_rename, "restore", model_dir(archive, "t/A"), dest)
         out = run.communicate(timeout=300)[0]
         ok = run.returncode != 0 and clean(out) and "appeared" in out and restored(dest) == b"RIVAL" and tidy(dest)
         expect("... and keeps a file another program writes at that moment", ok, "" if ok else out[-200:])
         neither = no_links + "\nla.rename_no_replace = lambda *a: False"
         dest = os.path.join(root, "r9")
-        run = patched_process(neither, "restore", archive, "t/A", dest)
+        run = patched_process(neither, "restore", model_dir(archive, "t/A"), dest)
         out = run.communicate(timeout=300)[0]
         left = os.listdir(dest)
-        run2 = patched_process(neither, "restore", archive, "t/A", dest, "--overwrite")
+        run2 = patched_process(neither, "restore", model_dir(archive, "t/A"), dest, "--overwrite")
         out2 = run2.communicate(timeout=300)[0]
         ok = run.returncode != 0 and clean(out) and "hard links" in out and "--overwrite" in out and left == [] \
             and run2.returncode == 0 and restored(dest) == b"archived" and tidy(dest)
@@ -1115,9 +1119,9 @@ la.rename_no_replace = _rival"""
     edit_manifest(archive, "t__B", to_same)
     os.remove(os.path.join(archive, "t__B", "small.txt"))
     before = sorted(os.listdir(os.path.join(archive, "t__B")))
-    code, out = interrupted("before", "rebase", archive, "t/B", "--no-dedupe")
+    code, out = interrupted("before", "rebase", model_dir(archive, "t/B"), "--no-dedupe")
     after = sorted(os.listdir(os.path.join(archive, "t__B")))
-    code2, out2 = tool("rebase", archive, "t/B", "--no-dedupe")
+    code2, out2 = tool("rebase", model_dir(archive, "t/B"), "--no-dedupe")
     code3, out3 = tool("verify", archive)
     ok = code != 0 and after == before and code2 == 0 and la.load_manifest(archive, "t/B")["files"][0]["method"] == "raw" and code3 == 0
     expect("a small same-as file stored again (as-is) by rebase is removed when it stops; run again it works", ok,
@@ -1146,16 +1150,74 @@ def check_selected_files():
         ok = code != 0 and words in out and "Traceback" not in out
         expect(f"pack {' '.join(argv)}: refused", ok, "" if ok else out[-200:])
     dest = os.path.join(root, "dest")
-    code, out = tool("restore", archive, "t/S", dest, "--file", "sub/b.txt")
+    code, out = tool("restore", model_dir(archive, "t/S"), dest, "--file", "sub/b.txt")
     ok = code == 0 and same_tree(dest, {"sub/b.txt": b"B"})
     expect("restore --file writes just that file", ok, "" if ok else out[-200:])
-    code, out = tool("restore", archive, "t/S", dest, "--file", "c.bin")
+    code, out = tool("restore", model_dir(archive, "t/S"), dest, "--file", "c.bin")
     ok = code != 0 and "has no file" in out
     expect("restore --file of a file the model does not have: refused", ok, "" if ok else out[-200:])
-    for what, folder in (("holding the archive", root), ("inside the archive", os.path.join(archive, "t__S"))):
+    pack(make_folder(os.path.join(root, "twice"), {"x.txt": b"top", "sub/x.txt": b"in sub", "sub/y.txt": b"y"}), archive, "t/F")
+    flat = os.path.join(root, "flat")
+    code, out = tool("restore", model_dir(archive, "t/F"), flat, "--flat")
+    ok = code == 0 and same_tree(flat, {"x.txt": b"top", "x (1).txt": b"in sub", "y.txt": b"y"})
+    expect("restore --flat: no folders; the file further down gets \" (1)\"", ok, "" if ok else out[-200:])
+    flat = os.path.join(root, "flat-one")
+    code, out = tool("restore", model_dir(archive, "t/F"), flat, "--flat", "--file", "sub/x.txt")
+    ok = code == 0 and same_tree(flat, {"x.txt": b"in sub"})
+    expect("restore --flat --file: named among the files chosen only", ok, "" if ok else out[-200:])
+    junk = make_folder(os.path.join(root, "junk"), {"a.txt": b"A", "Thumbs.db": b"x", "Desktop.ini": b"x",
+                                                    ".DS_Store": b"x", "__MACOSX/._a.txt": b"x"})
+    code, out = pack(junk, archive, "t/J")
+    stored = sorted(e["path"] for e in la.load_manifest(archive, "t/J")["files"]) if code == 0 else []
+    ok = code == 0 and stored == ["a.txt"]
+    expect("Thumbs.db, desktop.ini, .DS_Store (any case) and __MACOSX/ are left out", ok, "" if ok else out[-200:] + str(stored))
+    code, out = pack(junk, archive, "t/J2", "--file", "Thumbs.db")
+    stored = sorted(e["path"] for e in la.load_manifest(archive, "t/J2")["files"]) if code == 0 else []
+    ok = code == 0 and stored == ["Thumbs.db"]
+    expect("... unless named with --file", ok, "" if ok else out[-200:] + str(stored))
+
+    print("models given by their folders; where restore may write and pack may read")
+    clean = lambda out: "Traceback" not in out  # noqa: E731
+    make_folder(os.path.join(archive, "_kit"), {"README.md": b"kit"})
+    outside = os.path.join(root, "outside")
+    for what, folder, words in (("holding the archive", root, "holds the pack folder"),
+                                ("that is the archive folder", archive, "holds the pack folder"),
+                                ("inside a model folder", model_dir(archive, "t/S"), "inside the model folder"),
+                                ("inside the archive's _kit", os.path.join(archive, "_kit"), "_kit")):
         code, out = pack(folder, archive, "t/X")
-        ok = code != 0 and "in one another" in out
+        ok = code != 0 and words in out and clean(out)
         expect(f"pack of a folder {what}: refused", ok, "" if ok else out[-200:])
+    for what, dest, words in (("the archive folder itself", archive, "holds model folders"),
+                              ("inside a model folder", os.path.join(model_dir(archive, "t/S"), "x"), "inside the model folder"),
+                              ("inside the archive's _kit", os.path.join(archive, "_kit", "x"), "_kit")):
+        code, out = tool("restore", model_dir(archive, "t/S"), dest)
+        ok = code != 0 and words in out and clean(out) and not os.path.exists(os.path.join(dest, "a.txt"))
+        expect(f"restore into {what}: refused", ok, "" if ok else out[-200:])
+    beside = os.path.join(archive, "un_arch", "t", "S")
+    code, out = tool("restore", model_dir(archive, "t/S"), beside)
+    ok = code == 0 and same_tree(beside, {"a.txt": b"A", "sub/b.txt": b"B"})
+    expect("restore into a folder of its own beside the model folders", ok, "" if ok else out[-200:])
+    code, out = pack(beside, archive, "t/again")
+    ok = code == 0 and sorted(e["path"] for e in la.load_manifest(archive, "t/again")["files"]) == ["a.txt", "sub/b.txt"]
+    expect("pack from such a folder", ok, "" if ok else out[-200:])
+    code, out = tool("verify", archive)
+    ok = code == 0 and "ALL VERIFIED" in out and "un_arch" not in out
+    expect("verify of the archive folder: the models only", ok, "" if ok else out[-200:])
+    code, out = tool("verify", model_dir(archive, "t/S"), model_dir(archive, "t/J"))
+    ok = code == 0 and "t/S:a.txt" in out and "t/J:a.txt" in out and "t/again" not in out
+    expect("verify of two model folders: those two", ok, "" if ok else out[-200:])
+    for what, argv, words in (("restore of a folder that is not a model's", ("restore", outside, os.path.join(root, "r-x")),
+                               "not a model folder"),
+                              ("verify of a path that does not exist", ("verify", os.path.join(root, "nowhere")), "nothing verified"),
+                              ("rebase of a folder that is not a model's", ("rebase", outside), "not a model folder"),
+                              ("rebase --all of a model folder", ("rebase", model_dir(archive, "t/S"), "--all"), "is a model folder")):
+        os.makedirs(outside, exist_ok=True)
+        code, out = tool(*argv)
+        ok = code != 0 and words in out and clean(out)
+        expect(f"{what}: refused, saying why", ok, "" if ok else out[-200:])
+    code, out = tool("rebase", model_dir(archive, "t/S"), "--base", model_dir(archive, "t/J"), "--dry-run")
+    ok = code == 0 and "rebasing t/S" in out and "delta base: t/J" in out
+    expect("rebase <model folder> --base <model folder>", ok, "" if ok else out[-300:])
 
 
 def check_bundle():
@@ -1183,21 +1245,58 @@ def check_bundle():
     for name in ("t/F", "t/P", "t/G"):
         src = os.path.join(models, name.replace("/", "_"))
         dest = os.path.join(root, "restored", name.replace("/", "_"))
-        code, out = tool("restore", single, name, dest)
+        code, out = tool("restore", model_dir(single, name), dest)
         ok = code == 0 and same_tree(dest, {rel: open(os.path.join(src, rel), "rb").read() for rel in os.listdir(src)})
         expect(f"restore {name} from the .oczip: byte-identical", ok, "" if ok else out[-300:])
+    try:
+        import llm_archive_gui as gui  # needs tkinter
+    except ImportError:
+        print("  skip the window's way of running the tool (no tkinter here)")
+    else:  # its child keeps stdin open (closing it cancels): the ans16 workers must still start
+        dest = os.path.join(root, "runner")
+        run = subprocess.Popen([gui.python_exe(), "-I", "-X", "utf8", "-u", "-c", gui.RUNNER, gui.HERE, "restore", model_dir(single,
+                                "t/G"), dest], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        chunks = []
+        reader = threading.Thread(target=lambda: chunks.append(run.stdout.read()), daemon=True)
+        reader.start()
+        try:
+            code = run.wait(timeout=300)
+        except subprocess.TimeoutExpired:  # stop it with the workers it started
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(run.pid)], capture_output=True)
+            else:
+                run.kill()
+            code = "stalled"
+        reader.join(10)
+        src = os.path.join(models, "t_G")
+        ok = code == 0 and same_tree(dest, {rel: open(os.path.join(src, rel), "rb").read() for rel in os.listdir(src)})
+        expect("restore of an ans16 delta run as the window runs it (stdin left open): it does not stall", ok,
+               "" if ok else f"{code} {''.join(chunks)[-300:]}")
+        run.stdin.close()
     dest = os.path.join(root, "one")
-    code, out = tool("restore", single, "t/G", dest, "--file", "config.json")
+    code, out = tool("restore", model_dir(single, "t/G"), dest, "--file", "config.json")
     ok = code == 0 and os.listdir(dest) == ["config.json"]
     expect("restore --file from the .oczip", ok, "" if ok else out[-200:])
     for argv, words in ((("bundle", archive, single), "exists already"),
                         (("bundle", archive, os.path.join(root, "all.zip")), "must end with"),
-                        (("bundle", archive, os.path.join(archive, "inside.oczip")), "inside the archive folder"),
-                        (("pack", os.path.join(models, "t_F"), single, "--name", "t/X"), "read-only"),
+                        (("bundle", archive, os.path.join(archive, "inside.oczip")), "inside the pack folder"),
+                        (("pack", os.path.join(models, "t_F"), single, "--name", "t/X"), "exists already"),
                         (("rebase", single, "--all"), "read-only")):
         code, out = tool(*argv)
         ok = code != 0 and words in out and clean(out)
         expect(f"{argv[0]} {'into' if argv[0] == 'pack' else 'with'} {os.path.basename(argv[2])}: refused", ok, "" if ok else out[-200:])
+    new_file = os.path.join(root, "new", "G.oczip")
+    code, out = tool("pack", os.path.join(models, "t_G"), new_file, "--name", "t/G")
+    code_v, out_v = tool("verify", new_file)
+    ok = code == 0 and "VERIFIED" in out and code_v == 0 and os.listdir(os.path.dirname(new_file)) == ["G.oczip"]
+    expect("pack into a new .oczip: packed, bundled, verified; the folder in between gone", ok, "" if ok else out[-300:])
+    for what, argv, words in (("with --base", ("pack", os.path.join(models, "t_G"), os.path.join(root, "new", "H.oczip"),
+                                               "--name", "t/H", "--base", "t/F"), "no other model"),
+                              ("inside the folder packed", ("pack", os.path.join(models, "t_G"),
+                                                            os.path.join(models, "t_G", "x.oczip"), "--name", "t/H"), "inside")):
+        code, out = tool(*argv)
+        ok = code != 0 and words in out and clean(out) and not os.path.exists(argv[2])
+        expect(f"pack into a new .oczip {what}: refused", ok, "" if ok else out[-200:])
     code, out = tool("bundle", archive, single, "--overwrite")
     expect("--overwrite replaces it", code == 0, "" if code == 0 else out[-200:])
 

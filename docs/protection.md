@@ -15,7 +15,7 @@ page compares common options and lists what matters for this kind of archive.
    made earlier now describes old contents, and using it would "repair" files back to them. OverCompressing never
    deletes files it did not create, so remove or rebuild such data yourself.
 3. **Protect `_kit/` too**, and keep a copy of it with every copy of the archive.
-4. **Verify regularly and after every repair**: `python -I tools/llm_archive.py verify <archive_root>`.
+4. **Verify regularly and after every repair**: `python -I tools/llm_archive.py verify <pack_folder>`.
 
 ## Options
 
@@ -54,7 +54,7 @@ Later:
 ```bash
 par2 verify recovery.par2                                          # detect
 par2 repair recovery.par2                                          # repair
-python -I <path>/llm_archive.py verify <archive_root> <name>       # confirm with OverCompressing
+python -I <path>/llm_archive.py verify <pack_folder>/<model folder>  # confirm with OverCompressing
 ```
 
 During development, a single flipped byte in a 630 MB container was found and repaired this way with 5 % PAR2 data
@@ -79,7 +79,7 @@ OverCompressing 只負責**偵測**損毀：每個儲存檔都有 SHA-256、每�
 2. **每次重新打包後都要重建修復資料。** `pack` 與 `rebase` 會改寫該 repo 的儲存檔，舊的修復資料描述的是舊內容，
    拿它修復會把檔案改回舊版。本工具不會刪除不是它建立的檔案，請自行移除或重建。
 3. **`_kit/` 也要保護**，每一份歸檔副本都要附上它。
-4. **定期驗證，修復後也要驗證**：`python -I tools/llm_archive.py verify <archive_root>`。
+4. **定期驗證，修復後也要驗證**：`python -I tools/llm_archive.py verify <pack_folder>`。
 
 ## 方案比較
 
@@ -117,7 +117,7 @@ par2 create -r5 -n1 -B. recovery.par2 (Get-Content protect.txt)
 ```bash
 par2 verify recovery.par2                                          # 檢查
 par2 repair recovery.par2                                          # 修復
-python -I <路徑>/llm_archive.py verify <archive_root> <名稱>        # 用本工具確認
+python -I <路徑>/llm_archive.py verify <pack_folder>/<模型資料夾>  # 用本工具確認
 ```
 
 開發期間實測：630 MB 容器檔中翻轉 1 個 byte，用 5% 的 PAR2 資料（par2cmdline 1.4.0）成功找出並修復（1991 個區塊

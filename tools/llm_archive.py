@@ -1,22 +1,25 @@
 """Lossless archiver for model folders. safetensors and GGUF files are split per tensor (float tensors: byte planes,
 the exponents entropy-coded; quantized tensors, metadata, text: zstd; other binaries: whichever is smaller). A tensor that
-also exists in a base model already in the archive (same name, in any of its files) is stored as a delta against it
+also exists in a base model already in the pack (same name, in any of its files) is stored as a delta against it
 (ans16 for 16-bit floats), so different file names, headers, shardings and tensor orders still share data. Each file
-picks its base by sampling every model in the archive, unless --base names one or --no-base turns deltas off. Files
-larger than 1 MiB that are identical to one already in the archive are stored as a reference. See ARCHIVE_FORMAT.md.
+picks its base by sampling every model in the pack, unless --base names one or --no-base turns deltas off. Files
+larger than 1 MiB that are identical to one already in the pack are stored as a reference. See ARCHIVE_FORMAT.md.
 
-    python -I llm_archive.py pack    <source_dir> <archive_root> [--name NAME] [--base NAME | --no-base]
+    python -I llm_archive.py pack    <source_dir> <pack_folder | new.oczip> [--name NAME] [--base MODEL | --no-base]
                                      [--exclude GLOB ... | --file PATH ...]
-    python -I llm_archive.py rebase  <archive_root> (<name> ... | --all) [--base NAME | --no-base] [--dry-run]
-    python -I llm_archive.py verify  <archive_root> [<name> ...]
-    python -I llm_archive.py restore <archive_root> <name> <dest_dir> [--overwrite] [--file PATH ...]
-    python -I llm_archive.py bundle  <archive_root> <file.oczip> [--verify | --no-verify] [--delete] [--overwrite]
+    python -I llm_archive.py rebase  (<model_folder> ... | <pack_folder> --all) [--base MODEL | --no-base] [--dry-run]
+    python -I llm_archive.py verify  <model_folder | pack_folder | pack_file> ...
+    python -I llm_archive.py restore <model_folder> <dest_dir> [--overwrite] [--file PATH ...] [--flat]
+    python -I llm_archive.py bundle  <pack_folder> <pack_file.oczip> [--verify | --no-verify] [--delete] [--overwrite]
 
-bundle puts the whole archive folder into one .oczip file (a ZIP); verify and restore read it like the folder.
+A pack is a folder (the pack folder) holding one folder per model: a model folder, with the model's manifest.json and
+its stored files. Models refer to one another by name within their pack folder. bundle puts a whole pack folder into
+one pack file (.oczip, a ZIP), which verify and restore read like the folder: <file.oczip>/<model folder> names a
+model in it. pack into a new .oczip packs into a folder of its own, then bundles it.
 llm_archive_gui.py is a small window for pack, bundle, verify and restore.
 
 The tool never downloads anything: get the model files however you like, then pack the folder. rebase re-chooses the
-bases of models already in the archive (e.g. after a closer ancestor was packed), restoring each file it re-packs.
+bases of models already in the pack (e.g. after a closer ancestor was packed), restoring each file it re-packs.
 
 Damage is detected (SHA-256 / CRC) but not repaired here; see docs/protection.md for ways to add repair data.
 ans16 deltas restore their base into a temporary file, and rebase the file it re-packs: OC_TMP picks their folder
@@ -51,8 +54,9 @@ import zstandard
 
 TOOL_VERSION = "llm_archive 4"
 FORMAT_VERSION = 3
-SKIP_DIRS = {".git", ".cache"}  # bookkeeping of git / download tools, not model files
-SKIP_FILES = {".hf_files.json"}  # staging metadata written by earlier versions of this tool
+SKIP_DIRS = {".git", ".cache", "__MACOSX"}  # bookkeeping of git / download tools / macOS unzipping: not model files
+SKIP_FILES = {".hf_files.json", "thumbs.db", "desktop.ini", ".ds_store"}  # compared ignoring case: staging metadata of
+# earlier versions of this tool, and the folder-view caches Windows and macOS leave everywhere
 MAGIC = b"OCZ3"
 CODEC_RAW, CODEC_PLANES, CODEC_ZSTD, CODEC_ANS16 = 0, 1, 2, 3
 CODEC_NAMES = ["raw", "planes", "zstd", "ans16"]
@@ -1083,7 +1087,7 @@ def oczip(archive_root):
         try:
             z = zipfile.ZipFile(archive_root)
         except zipfile.BadZipFile as e:
-            raise ValueError(f"not a readable {OCZIP} ({e})") from None
+            raise ValueError(f"not a readable pack file ({e})") from None
         names = z.namelist()
         bad = next((n for n in names if path_problem(n.rstrip("/"))), None)
         if bad is not None or len(set(names)) != len(names):
@@ -1116,16 +1120,16 @@ def container_span(archive_root, rel):
     except KeyError:
         raise FileNotFoundError(errno.ENOENT, "not in the archive", rel) from None
     if info.compress_type != zipfile.ZIP_STORED or info.flag_bits & 1 or info.compress_size != info.file_size:
-        raise ValueError(f"{rel} is compressed or encrypted in the {OCZIP}: containers must be stored as they are")
+        raise ValueError(f"{rel} is compressed or encrypted in the pack file: containers must be stored as they are")
     with open(archive_root, "rb") as f:
         f.seek(info.header_offset)
         head = f.read(30)  # the ZIP local file header, then its name and extra field
         end = os.fstat(f.fileno()).st_size
     if len(head) != 30 or head[:4] != b"PK\x03\x04":
-        raise ValueError(f"{rel}: no ZIP local header where the {OCZIP} says it is")
+        raise ValueError(f"{rel}: no ZIP local header where the pack file says it is")
     start = info.header_offset + 30 + sum(struct.unpack("<HH", head[26:30]))
     if start + info.file_size > end:
-        raise ValueError(f"{rel} runs past the end of the {OCZIP}")
+        raise ValueError(f"{rel} runs past the end of the pack file")
     return archive_root, start, info.file_size
 
 
@@ -1151,6 +1155,112 @@ def read_manifest(archive_root, folder):
     return strict_json(data)
 
 
+def split_oczip(path):
+    """(the .oczip that `path` names or is inside, the "/"-separated rest of the path in it), or (None, None)."""
+    probe, rest = os.path.normpath(path), []
+    while True:
+        if is_oczip(probe) and os.path.isfile(probe):
+            return probe, "/".join(reversed(rest))
+        up = os.path.dirname(probe)
+        if not up or up == probe:
+            return None, None
+        rest.append(os.path.basename(probe))
+        probe = up
+
+
+def model_manifest(archive_root, folder):
+    """The manifest of model folder `folder` of an archive, checked (manifest_problem) and naming the model the folder
+    is named after; ValueError or OSError if the folder is not that."""
+    manifest = read_manifest(archive_root, folder)
+    problem = manifest_problem(manifest)
+    if not problem and os.path.normcase(repo_dir_name(manifest["repo"])) != os.path.normcase(folder):
+        problem = f"it holds the model {manifest['repo']!r}, whose folder is {repo_dir_name(manifest['repo'])}"
+    if problem:
+        raise ValueError(problem)
+    return manifest
+
+
+def model_at(path):
+    """(archive_root, model name) of the model whose folder `path` is: a folder holding its manifest.json, or
+    <file.oczip>/<folder> for one in an .oczip. Its archive is the folder (or .oczip) its folder is in, where the
+    models it refers to are found by name. ValueError if `path` is not a model folder."""
+    single, inner = split_oczip(path)
+    if single:
+        if not inner or "/" in inner:
+            raise ValueError(f"{path} is not a model folder of {single}")
+        root, folder = single, inner
+    else:
+        full = os.path.abspath(path)
+        if not os.path.isfile(os.path.join(full, "manifest.json")):
+            raise ValueError(f"{path} is not a model folder (no manifest.json in it)")
+        root, folder = os.path.dirname(full), os.path.basename(full)
+    try:
+        return root, model_manifest(root, folder)["repo"]
+    except OSError as e:
+        raise ValueError(f"{path}: {e.strerror or e}") from None
+
+
+def archive_target(path):
+    """What verify (or rebase) is given, as (archive_root, [model name], or None for all its models): a model folder
+    (also one in an .oczip), an .oczip, or an archive folder (the folder holding model folders). ValueError if the
+    path is none of these."""
+    single, inner = split_oczip(path)
+    if single and not inner:
+        return single, None
+    if single or os.path.isfile(os.path.join(path, "manifest.json")):
+        root, repo = model_at(path)
+        return root, [repo]
+    if os.path.isdir(path):
+        return path, None
+    raise ValueError(f"{path} is not a folder or a pack file ({OCZIP})")
+
+
+def model_folder_of(path):
+    """(archive_root, folder) of the model folder `path` is or is inside: the nearest folder on the way up that holds
+    the manifest.json of the model named after it (a file of that name that is no model's manifest, e.g. a file a
+    model stores, is passed over). None if there is none."""
+    folder = os.path.abspath(path)
+    while True:
+        if os.path.isfile(os.path.join(folder, "manifest.json")):
+            root, name = os.path.dirname(folder), os.path.basename(folder)
+            try:
+                model_manifest(root, name)
+                return root, name
+            except (OSError, ValueError):
+                pass
+        up = os.path.dirname(folder)
+        if up == folder:
+            return None
+        folder = up
+
+
+def place_problem(path, archive_root):
+    """Why restore must not write into `path`, nor pack read from it, or None: it holds model folders (files written
+    there would lie among them), is inside a model folder (of any archive), or inside this archive's _kit."""
+    real = os.path.realpath(path)
+    if os.path.isdir(real) and model_folders(real):
+        return f"{path} holds model folders"
+    inside = model_folder_of(real)
+    if inside:
+        return f"{path} is inside the model folder {os.path.join(*inside)}"
+    if not is_oczip(archive_root) and holds(os.path.join(archive_root, "_kit"), real):
+        return f"{path} is inside the pack folder's _kit"
+    return None
+
+
+def model_name(value, archive_root):
+    """A model given by name or by its folder (which must then be in archive_root), as its name."""
+    if not os.path.isfile(os.path.join(value, "manifest.json")):
+        return value
+    try:
+        root, repo = model_at(value)
+    except ValueError as e:
+        sys.exit(str(e))
+    if os.path.normcase(os.path.realpath(root)) != os.path.normcase(os.path.realpath(archive_root)):
+        sys.exit(f"{value} is a model of {root}, not of {archive_root}")
+    return repo
+
+
 def close_single_files():
     """Close the .oczip files opened for reading, so that another program may replace them."""
     while _ZIPS:
@@ -1168,7 +1278,7 @@ def open_single_file(archive_root):
 def find_entry(archive_root, repo, path):
     entry = next((e for e in load_manifest(archive_root, repo)["files"] if e["path"] == path), None)
     if entry is None:
-        raise ValueError(f"{repo}:{path} is not in the archive")
+        raise ValueError(f"{repo}:{path} is not in the pack")
     return entry
 
 
@@ -1387,7 +1497,7 @@ def cached_entry(archive_root, repo, path, sha256):
         _ENTRIES[key] = {e["path"]: e for e in load_manifest(archive_root, repo)["files"]}
     entry = _ENTRIES[key].get(path)
     if entry is None or entry["sha256"] != sha256:
-        raise ValueError(f"{repo}:{path} is missing from the archive or has a different sha256 than recorded")
+        raise ValueError(f"{repo}:{path} is missing from the pack or has a different sha256 than recorded")
     return entry
 
 
@@ -1690,7 +1800,7 @@ def chain_problem(archive_root, repo, entry, trail=()):
         try:
             ref_entry = find_entry(archive_root, ref_repo, ref_path)
         except (OSError, ValueError):
-            return f"{ref_repo}:{ref_path}, which it depends on, is missing from the archive"
+            return f"{ref_repo}:{ref_path}, which it depends on, is missing from the pack"
         if ref_entry["sha256"] != ref_sha:
             return f"{ref_repo}:{ref_path}, which it depends on, has a different sha256 than recorded"
         problem = chain_problem(archive_root, ref_repo, ref_entry, trail)
@@ -1848,7 +1958,7 @@ def source_files(source, patterns):
                 keep.append(d)
         dirnames[:] = keep
         for n in sorted(names):
-            if n in SKIP_FILES or excluded(rel(n), patterns):
+            if n.casefold() in SKIP_FILES or excluded(rel(n), patterns):
                 continue
             try:
                 regular = stat.S_ISREG(os.stat(os.path.join(dirpath, n)).st_mode)
@@ -1992,7 +2102,7 @@ def lock_archive(archive_root, exclusive, skip=False):
     lock at all goes on only if the system reports the archive's volume read-only (nothing can change it then), or
     with --no-lock (skip): its user's word that nothing changes the archive meanwhile."""
     if skip:
-        print("not locking the archive (--no-lock): nothing may change it while this runs")
+        print("not locking the pack folder (--no-lock): nothing may change it while this runs")
         return
     path = os.path.join(archive_root, LOCK_NAME)
     fd = None
@@ -2010,12 +2120,12 @@ def lock_archive(archive_root, exclusive, skip=False):
             os.close(fd)
         if not exclusive and read_only_volume(archive_root):
             return  # read-only media: nothing can change the archive
-        sys.exit(f"cannot lock the archive ({path}: {e.strerror or e})" + ("" if exclusive else
+        sys.exit(f"cannot lock the pack folder ({path}: {e.strerror or e})" + ("" if exclusive else
                  "; if you are sure nothing changes the archive while this runs, add --no-lock"))
     if not locked:
         os.close(fd)
-        sys.exit("the archive is in use by another pack, rebase, verify or restore: run this when it has finished"
-                 if exclusive else "the archive is being changed by another pack or rebase: run this when it has finished")
+        sys.exit("the pack folder is in use by another pack, rebase, verify or restore: run this when it has finished"
+                 if exclusive else "the pack folder is being changed by another pack or rebase: run this when it has finished")
     _HELD_LOCK.append(fd)
 
 
@@ -2030,18 +2140,47 @@ def holds(folder, path):
 
 def refuse_single_file(archive_root):
     if is_oczip(archive_root):
-        sys.exit(f"{archive_root} is a single-file archive ({OCZIP}): it is read-only. To pack into it or rebase it, "
-                 "extract it into a folder (it is a ZIP) and use that folder")
+        sys.exit(f"{archive_root} is a pack file ({OCZIP}): it is read-only. To rebase it, extract it into a pack "
+                 "folder (it is a ZIP), rebase there, then bundle it again")
+
+
+def pack_into_new_file(args):
+    """pack into a new pack file: into a folder of its own beside it first, then bundled into it (verified) and that
+    folder deleted. A pack file is written whole, so there is never one to add to."""
+    target = os.path.abspath(args.archive_root)
+    if os.path.lexists(target):
+        sys.exit(f"{args.archive_root} exists already: a pack file is written whole, never added to. To add a model to "
+                 "it, extract it into a pack folder (it is a ZIP), pack into that folder, then bundle it again")
+    if args.base:
+        sys.exit("--base: a new pack file holds no other model to be a base")
+    source = os.path.abspath(args.source_dir)
+    if holds(source, target) and not args.files:
+        sys.exit(f"{args.archive_root} would be inside {source}, the folder packed: write it somewhere else")
+    folder = os.path.join(os.path.dirname(target), f".oc-{secrets.token_hex(6)}.pack")
+    print(f"packing into a new pack file: first into {folder}, then bundled into {target}")
+    os.makedirs(folder)
+    try:
+        cmd_pack(argparse.Namespace(**{**vars(args), "archive_root": folder}))
+        unlock_archive(folder)  # bundle locks it again
+        cmd_bundle(argparse.Namespace(archive_root=folder, oczip=target, verify=None, delete=True, overwrite=False))
+    finally:
+        unlock_archive(folder)
+        shutil.rmtree(folder, ignore_errors=True)  # only what was packed into it, if it was not bundled
 
 
 def cmd_pack(args):
-    refuse_single_file(args.archive_root)
+    if is_oczip(args.archive_root):
+        return pack_into_new_file(args)
     source = os.path.abspath(args.source_dir)
     if not os.path.isdir(source):
         sys.exit(f"{source} is not a folder")
-    if holds(source, args.archive_root) or holds(args.archive_root, source):
-        sys.exit(f"{source} and the archive {args.archive_root} are in one another: pack a folder outside the archive, "
-                 "into an archive outside that folder")
+    if holds(source, args.archive_root) and not args.files:  # with --file, only the files named are read
+        sys.exit(f"{source} holds the pack folder {args.archive_root}: pack a folder that does not")
+    problem = place_problem(source, args.archive_root)
+    if problem:
+        sys.exit(f"cannot pack {problem}: pack the original files, from a folder of their own")
+    if args.base:
+        args.base = model_name(args.base, args.archive_root)
     name = args.name or os.path.basename(source)
     problem = name_problem(name)
     if problem:
@@ -2050,6 +2189,8 @@ def cmd_pack(args):
         sys.exit("use --file or --exclude, not both")
     if args.files:
         paths, problems = listed_files(source, args.files)
+        problems += [f"{rel} is inside the pack folder {args.archive_root}" for rel in paths
+                     if holds(args.archive_root, os.path.join(source, *rel.split("/")))]
         if problems:
             sys.exit(f"cannot pack these files of {source}:\n  " + "\n  ".join(problems))
     else:
@@ -2592,15 +2733,15 @@ def numbered(name, n):
     return f"{stem} ({n}){ext}"
 
 
-def restore_plan(dest_dir, entries):
+def restore_plan(dest_dir, entries, flat=False):
     """[(entry, destination file, its path in dest_dir if that differs from the original path)]. A name this system
-    cannot hold is changed (local_parts: "_" for each character it does not allow). A file that would land where
-    another file or a folder of the model already goes (the same name after that change, names that differ only in
-    case where case is ignored, or two paths that a link inside dest_dir joins) gets " (1)", " (2)", ... before its
-    extension. Files whose names needed no change are placed first, so they keep them. The plan depends only on the
-    manifest and the links in dest_dir, so a second restore places every file the same way. ValueError if a path
-    would leave dest_dir."""
-    parts = [local_parts(e["path"]) for e in entries]
+    cannot hold is changed (local_parts: "_" for each character it does not allow). With `flat`, every file goes
+    straight into dest_dir, without its folders. A file that would land where another file or a folder of the model
+    already goes (the same name after that change, names that differ only in case where case is ignored, or two paths
+    that a link inside dest_dir joins) gets " (1)", " (2)", ... before its extension. Files whose paths needed no
+    change are placed first, so they keep them. The plan depends only on the manifest and the links in dest_dir, so a
+    second restore places every file the same way. ValueError if a path would leave dest_dir."""
+    parts = [local_parts(e["path"])[-1:] if flat else local_parts(e["path"]) for e in entries]
     folders = {target_key(os.path.join(dest_dir, *p[:i])) for p in parts for i in range(1, len(p))}
     taken, plan = set(), [None] * len(entries)
     for i in sorted(range(len(entries)), key=lambda i: (parts[i] != entries[i]["path"].split("/"), i)):
@@ -2744,11 +2885,29 @@ def rebase_model(args, repo):
 
 
 def cmd_rebase(args):
+    if args.all:
+        if len(args.targets) != 1:
+            sys.exit("--all takes one pack folder (the folder holding the model folders)")
+        args.archive_root, args.repos = args.targets[0], []
+        if os.path.isfile(os.path.join(args.archive_root, "manifest.json")):
+            sys.exit(f"{args.archive_root} is a model folder: with --all, give the pack folder that holds it")
+    else:
+        if not args.targets:
+            sys.exit("give the folders of the models to rebase, or a pack folder with --all")
+        models = []
+        for path in args.targets:
+            try:
+                models.append(model_at(path))
+            except ValueError as e:
+                sys.exit(f"cannot rebase {path}: {e}")
+        if len({os.path.normcase(os.path.realpath(root)) for root, _ in models}) > 1:
+            sys.exit("the models to rebase must be in one pack folder")
+        args.archive_root, args.repos = models[0][0], [repo for _, repo in models]
     refuse_single_file(args.archive_root)
-    if bool(args.repos) == args.all:
-        sys.exit("name the models to rebase, or use --all")
     if args.all and args.base:
         sys.exit("--base needs the models named, not --all")
+    if args.base:
+        args.base = model_name(args.base, args.archive_root)
     if not os.path.isdir(args.archive_root):
         sys.exit(f"{args.archive_root} is not a folder")
     lock_archive(args.archive_root, exclusive=not args.dry_run)
@@ -2791,7 +2950,7 @@ def all_manifests(archive_root, problems=None):
             problem = f"cannot read it ({e})"
         if problem:
             if problems is None:
-                sys.exit(f"{path}: {problem}\nfix it, or move that folder out of the archive, before changing the archive")
+                sys.exit(f"{path}: {problem}\nfix it, or move that folder out of the pack folder, before changing the pack")
             problems.append((d, problem))
             continue
         manifests[manifest["repo"]] = manifest
@@ -2824,13 +2983,23 @@ def verify_models(archive_root, repos):
 
 
 def cmd_verify(args):
-    if is_oczip(args.archive_root):
-        open_single_file(args.archive_root)  # one file, only ever written whole: nothing to lock
-    elif not os.path.isdir(args.archive_root):
-        sys.exit(f"{args.archive_root} is not a folder: nothing verified")
-    else:
-        lock_archive(args.archive_root, exclusive=False, skip=args.no_lock)
-    failures, checked = verify_models(args.archive_root, args.repos)
+    targets = {}  # archive -> its models to verify, or None for all of them
+    for path in args.targets:
+        try:
+            root, repos = archive_target(path)
+        except ValueError as e:
+            sys.exit(f"{e}: nothing verified")
+        targets[root] = None if repos is None or targets.get(root, ()) is None else targets.get(root, []) + repos
+    failures = checked = 0
+    for root, repos in targets.items():
+        if len(targets) > 1:
+            print(f"verifying {root}")
+        if is_oczip(root):
+            open_single_file(root)  # one file, only ever written whole: nothing to lock
+        else:
+            lock_archive(root, exclusive=False, skip=args.no_lock)
+        found, done = verify_models(root, repos or [])
+        failures, checked = failures + found, checked + done
     if failures:
         sys.exit(f"{failures} FAILURE(S): replace the damaged files from another copy or repair them (see docs/protection.md)")
     if not checked:
@@ -2841,31 +3010,32 @@ def cmd_verify(args):
 def cmd_restore(args):
     """Every path is placed (restore_plan) and checked before anything is written. A destination file that already
     holds the right bytes is kept; one with other contents is replaced only with --overwrite."""
+    try:
+        args.archive_root, args.repo = model_at(args.model)
+    except ValueError as e:
+        sys.exit(f"cannot restore {args.model}: {e}")
     if is_oczip(args.archive_root):
         open_single_file(args.archive_root)
     elif os.path.isdir(args.archive_root):
         lock_archive(args.archive_root, exclusive=False, skip=args.no_lock)
     try:
         manifest = load_manifest(args.archive_root, args.repo)
-        plan = restore_plan(args.dest_dir, manifest["files"])  # for all files, so that each lands where it always does
     except (OSError, ValueError) as e:
         sys.exit(f"cannot restore {args.repo}: {e}")
-    if args.files:
-        unknown = sorted(set(args.files) - {e["path"] for e in manifest["files"]})
-        if unknown:
-            sys.exit(f"{args.repo} has no file {unknown[0]!r} (paths as the archive lists them, with \"/\")")
-        plan = [p for p in plan if p[0]["path"] in set(args.files)]
-    archive = os.path.realpath(args.archive_root)
-
-    def in_archive(folder):
-        try:
-            return os.path.commonpath([archive, os.path.realpath(folder)]) == archive
-        except ValueError:  # another drive
-            return False
-
-    if in_archive(args.dest_dir) or any(in_archive(os.path.dirname(dst)) for _, dst, _, _ in plan):
-        sys.exit(f"refusing to restore into the archive itself ({args.archive_root}): choose a folder outside it "
-                 "(--overwrite does not change this)")
+    unknown = sorted(set(args.files) - {e["path"] for e in manifest["files"]})
+    if unknown:
+        sys.exit(f"{args.repo} has no file {unknown[0]!r} (paths as the pack lists them, with \"/\")")
+    chosen = [e for e in manifest["files"] if not args.files or e["path"] in set(args.files)]
+    try:  # placed among all the model's files, so that each lands where it always does; with --flat, among those chosen
+        plan = restore_plan(args.dest_dir, chosen if args.flat else manifest["files"], flat=args.flat)
+    except ValueError as e:
+        sys.exit(f"cannot restore {args.repo}: {e}")
+    wanted = {e["path"] for e in chosen}
+    plan = [p for p in plan if p[0]["path"] in wanted]
+    for folder in dict.fromkeys([args.dest_dir, *(os.path.dirname(dst) for _, dst, _, _ in plan)]):
+        problem = place_problem(folder, args.archive_root)
+        if problem:
+            sys.exit(f"refusing to restore there: {problem}. Choose another folder (--overwrite does not change this)")
     targets, conflicts = [], []
     for entry, dst, rel, renamed in plan:
         shown = entry["path"] + (f"  (as {rel})" if renamed else "")
@@ -2891,7 +3061,7 @@ def cmd_restore(args):
         if problem:
             sys.exit(f"  cannot restore {shown}: {problem}")
         print(f"  ok    {shown}")
-    renamed = sum(1 for *_, r in plan if r)
+    renamed = sum(1 for e, _, rel, r in plan if r and (not args.flat or rel != e["path"].rsplit("/", 1)[-1]))
     if renamed:
         print(f"  {renamed} file(s) restored under another name: a character this system does not allow in names "
               "became \"_\", or a \" (n)\" keeps two files apart")
@@ -2945,8 +3115,8 @@ def bundle_problems(path, digests):
     _ZIPS.pop(path, None)
     z, problems = oczip(path), []
     names = set(z.namelist())
-    problems += [f"{n}: in the {OCZIP} but not put in" for n in sorted(names - set(digests))]
-    problems += [f"{n}: missing from the {OCZIP}" for n in sorted(set(digests) - names)]
+    problems += [f"{n}: in the pack file but not put in" for n in sorted(names - set(digests))]
+    problems += [f"{n}: missing from the pack file" for n in sorted(set(digests) - names)]
     for name, digest in digests.items():
         if name in names:
             try:
@@ -2976,11 +3146,11 @@ def cmd_bundle(args):
     root, out = args.archive_root, os.path.abspath(args.oczip)
     verify = args.delete if args.verify is None else args.verify
     if is_oczip(root) or not os.path.isdir(root):
-        sys.exit(f"{root} is not an archive folder")
+        sys.exit(f"{root} is not a pack folder")
     if not out.lower().endswith(OCZIP):
-        sys.exit(f"{args.oczip}: the name of the single file must end with {OCZIP}")
+        sys.exit(f"{args.oczip}: the name of a pack file must end with {OCZIP}")
     if holds(root, out):
-        sys.exit(f"{args.oczip} would be inside the archive folder: write it somewhere else")
+        sys.exit(f"{args.oczip} would be inside the pack folder: write it somewhere else")
     if os.path.lexists(out) and not args.overwrite:
         sys.exit(f"{args.oczip} exists already: choose another name, or add --overwrite to replace it")
     lock_archive(root, exclusive=args.delete)  # a reader's lock is enough unless the files are then deleted
@@ -3072,58 +3242,67 @@ def add_codec_options(s):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
-    s = sub.add_parser("pack", help="compress every file of a folder into the archive and verify it")
+    s = sub.add_parser("pack", help="compress every file of a folder into a pack folder, or a new pack file, and verify it")
     s.add_argument("source_dir")
-    s.add_argument("archive_root")
-    s.add_argument("--name", help="name of this model in the archive, e.g. Qwen/Qwen2.5-7B (default: the folder name)")
+    s.add_argument("archive_root", metavar="pack", help=f"the pack folder to pack into, or a new pack file (<name>{OCZIP}) "
+                                                        "to make")
+    s.add_argument("--name", help="name of this model in the pack, e.g. Qwen/Qwen2.5-7B (default: the folder name)")
     s.add_argument("--revision", help="free-text note stored in the manifest, e.g. the upstream commit")
     s.add_argument("--exclude", action="append", default=[], metavar="GLOB",
-                   help="skip files whose path or name matches (repeatable); .git/ and .cache/ are always skipped")
+                   help="skip files whose path or name matches (repeatable); .git/, .cache/, __MACOSX/, Thumbs.db, "
+                        "desktop.ini and .DS_Store are always skipped")
     s.add_argument("--file", action="append", default=[], metavar="PATH", dest="files",
                    help="pack only this file of the folder, a path relative to it (repeatable): the model then holds "
                         "just the files named")
     base = s.add_mutually_exclusive_group()
-    base.add_argument("--base", metavar="NAME",
-                      help="store tensors as deltas against this model in the archive (default: each file picks the "
-                           "model that compresses it best, by sampling)")
+    base.add_argument("--base", metavar="MODEL",
+                      help="store tensors as deltas against this model of the pack, by name or folder (default: "
+                           "each file picks the model that compresses it best, by sampling)")
     base.add_argument("--no-base", action="store_true", help="store every file without a delta base")
     s.add_argument("--no-dedupe", dest="dedupe", action="store_false",
-                   help="store files even if an identical file is already in the archive")
+                   help="store files even if an identical file is already in the pack")
     add_codec_options(s)
     s.set_defaults(func=cmd_pack)
-    s = sub.add_parser("rebase", help="re-choose the delta bases of archived models (restores only what it re-packs)")
-    s.add_argument("archive_root")
-    s.add_argument("repos", nargs="*", metavar="name")
+    s = sub.add_parser("rebase", help="re-choose the delta bases of packed models (restores only what it re-packs)")
+    s.add_argument("targets", nargs="*", metavar="model_folder",
+                   help="the folders of the models to rebase (in one pack folder); with --all, the pack folder")
     s.add_argument("--all", action="store_true",
-                   help="every model whose bases were chosen automatically, bases before the models that use them")
+                   help="every model of the pack folder whose bases were chosen automatically, bases before the "
+                        "models that use them")
     base = s.add_mutually_exclusive_group()
-    base.add_argument("--base", metavar="NAME", help="re-pack every file against this model, even if it gets larger")
+    base.add_argument("--base", metavar="MODEL", help="re-pack every file against this model (its name or folder), "
+                                                      "even if it gets larger")
     base.add_argument("--no-base", action="store_true", help="re-pack every file without a delta base, even if it gets larger")
     s.add_argument("--no-dedupe", dest="dedupe", action="store_false",
                    help="store files that are same-as references to another model as files again")
     s.add_argument("--dry-run", action="store_true", help="show what would change; change nothing")
     add_codec_options(s)
     s.set_defaults(func=cmd_rebase)
-    no_lock = "do not lock the archive (only when it cannot be locked and nothing can change it while this runs)"
+    no_lock = "do not lock the pack folder (only when it cannot be locked and nothing can change it while this runs)"
     s = sub.add_parser("verify", help="decompress everything in memory and check sha256")
-    s.add_argument("archive_root")
-    s.add_argument("repos", nargs="*")
+    s.add_argument("targets", nargs="+", metavar="path",
+                   help=f"a model folder; a pack folder or a pack file (all their models); or a model folder in a pack "
+                        f"file (<file{OCZIP}>/<folder>). Several may be given")
     s.add_argument("--no-lock", action="store_true", help=no_lock)
     s.set_defaults(func=cmd_verify)
-    s = sub.add_parser("restore", help="write a repo back out, byte-identical to the original")
-    s.add_argument("archive_root")
-    s.add_argument("repo")
+    s = sub.add_parser("restore", help="write a model back out, byte-identical to the original")
+    s.add_argument("model", help=f"the model's folder (the one holding its manifest.json), or <file{OCZIP}>/<folder> "
+                                 f"for one in a pack file")
     s.add_argument("dest_dir")
     s.add_argument("--overwrite", action="store_true",
                    help="replace files in dest_dir that have other contents (files already right are always kept)")
     s.add_argument("--file", action="append", default=[], metavar="PATH", dest="files",
-                   help="restore only this file of the model, its path as the archive lists it (repeatable)")
+                   help="restore only this file of the model, its path as the pack lists it (repeatable)")
+    s.add_argument("--flat", action="store_true",
+                   help="put every file straight into dest_dir, without the model's folders (two files of one name: "
+                        "the later one gets \" (1)\")")
     s.add_argument("--no-lock", action="store_true", help=no_lock)
     s.set_defaults(func=cmd_restore)
-    s = sub.add_parser("bundle", help=f"put the whole archive folder into one {OCZIP} file, which verify and "
+    s = sub.add_parser("bundle", help=f"put a whole pack folder into one pack file ({OCZIP}), which verify and "
                                       "restore read as they read the folder")
-    s.add_argument("archive_root")
-    s.add_argument("oczip", help=f"the file to write, its name ending in {OCZIP} (outside the archive folder)")
+    s.add_argument("archive_root", metavar="pack_folder")
+    s.add_argument("oczip", metavar="pack_file", help=f"the pack file to write, its name ending in {OCZIP} (outside the "
+                                                      "pack folder)")
     check = s.add_mutually_exclusive_group()
     check.add_argument("--verify", action="store_true", default=None,
                        help="then read it back: every file compared with what was put in, every model verified "
@@ -3131,7 +3310,7 @@ def main():
     check.add_argument("--no-verify", dest="verify", action="store_false", default=None,
                        help="with --delete: delete without verifying first")
     s.add_argument("--delete", action="store_true",
-                   help="then delete the files put in from the archive folder (verified first unless --no-verify)")
+                   help="then delete the files put in from the pack folder (verified first unless --no-verify)")
     s.add_argument("--overwrite", action="store_true", help="replace a file of that name")
     s.set_defaults(func=cmd_bundle)
     args = p.parse_args()

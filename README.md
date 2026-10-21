@@ -10,7 +10,7 @@
 
 Model weights hardly compress with zip or zstd, and quantizing them loses information. OverCompressing keeps the
 original files exactly, compresses each tensor with a codec suited to it, and stores fine-tunes as deltas against
-their base model. An offline kit (Python, wheels, tools, docs) is stored next to the archive so it can be restored
+their base model. An offline kit (Python, wheels, tools, docs) is stored in the pack folder so it can be restored
 without internet access.
 
 模型權重用 zip、zstd 幾乎壓不動，量化又會失真。OverCompressing 完整保留原檔，對每個 tensor 用最合適的方式壓縮，
@@ -43,7 +43,7 @@ hashes Hugging Face publishes).
   context-modelled rANS coder written for this project. No neural network is trained: the base model *is* the
   predictor.
 - **Matched by tensor name** across file names, shardings, orders, float dtypes (BF16/F16/F32) and vocabulary sizes.
-- **Base chosen automatically.** Each file is trial-coded against every matching model already in the archive and
+- **Base chosen automatically.** Each file is trial-coded against every matching model already in the pack and
   uses the one that compresses it best, or none; `--base` overrides.
 - **Verified at every step**; identical files are stored once. Damage is detected; for repair, pick a protection
   scheme ([docs/protection.md](docs/protection.md)).
@@ -63,17 +63,27 @@ hashes Hugging Face publishes).
 ## Quick start / 快速開始
 
 ```bash
-python -I tools/llm_archive.py pack    models/Qwen2.5-0.5B archive --name Qwen/Qwen2.5-0.5B
-python -I tools/llm_archive.py pack    models/Qwen2.5-0.5B-Instruct archive --name Qwen/Qwen2.5-0.5B-Instruct
-python -I tools/llm_archive.py verify  archive
-python -I tools/llm_archive.py restore archive Qwen/Qwen2.5-0.5B-Instruct restored
+python -I tools/llm_archive.py pack    models/Qwen2.5-0.5B packs --name Qwen/Qwen2.5-0.5B
+python -I tools/llm_archive.py pack    models/Qwen2.5-0.5B-Instruct packs --name Qwen/Qwen2.5-0.5B-Instruct
+python -I tools/llm_archive.py verify  packs
+python -I tools/llm_archive.py restore packs/Qwen__Qwen2.5-0.5B-Instruct restored
 ```
 
 Get the model folders with any tool you like (OverCompressing never downloads) → pack the base → pack the fine-tune
-(it finds its base in the archive by itself and is stored as a delta) → verify → restore. Prefer a window?
-`python -I tools/llm_archive_gui.py archive` does pack, verify and extract with a few clicks. Want one file?
-`python -I tools/llm_archive.py bundle archive models.oczip --delete` puts the whole archive into one `.oczip` (a ZIP),
-verifies it and removes the folder's files; `verify` and `restore` read the `.oczip` as it is.
+(it finds its base in the pack folder by itself and is stored as a delta) → verify → restore. Each model is a
+folder in the pack folder (`packs`); models refer to one another there. Prefer a window?
+`python -I tools/llm_archive_gui.py packs` does pack, verify and extract with a few clicks. Want one file?
+`python -I tools/llm_archive.py bundle packs models.oczip --delete` puts the whole pack into one pack file (`.oczip`,
+a ZIP), verifies it and removes the folder's files; `verify` and `restore` read the pack file as it is.
+
+Two forms of a pack / pack 的兩種形態:
+
+- **Pack folder (`.ocz` + `manifest.json`, one folder per model): for upkeep.** Add, re-pack or rebase one model at a
+  time; models share data within the folder.
+  **pack 資料夾：便於高效能維護。** 每個模型一個資料夾，可逐一新增、重新打包或 rebase；模型之間在資料夾內共用資料。
+- **Pack file (`.oczip`, one ZIP file): for cold storage.** Written once and verified; copy it, add repair data, shelve
+  it. `verify` and `restore` read it as it is.
+  **pack 檔：便於冷儲存管理。** 一次寫完並驗證；方便複製、加修復資料、離線保存；`verify` 與 `restore` 可直接讀取。
 
 → **[Usage / 使用方式（中英對照）](docs/usage.md)**
 

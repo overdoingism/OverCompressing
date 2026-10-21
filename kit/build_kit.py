@@ -1,4 +1,4 @@
-"""Assemble the offline restore kit (normally <archive_root>/_kit) from this repository plus pinned third-party
+"""Assemble the offline restore kit (normally <pack_folder>/_kit) from this repository plus pinned third-party
 downloads. Every downloaded file is checked against the SHA-256 recorded below or in kit/requirements-*.lock.
 
     python -I kit/build_kit.py <out_dir> [--cache DIR]

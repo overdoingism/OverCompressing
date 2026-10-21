@@ -1,6 +1,6 @@
 # Offline restore kit
 
-Everything needed to verify and restore the models in this archive **without network access**.
+Everything needed to verify and restore the models in this pack **without network access**.
 Each sibling directory of `_kit/` (e.g. `Qwen__Qwen2.5-0.5B/`) is one packed model; its `manifest.json` lists
 every original file with its SHA-256.
 
@@ -16,34 +16,35 @@ Windows:
 
 ```
 powershell -ExecutionPolicy Bypass -File _kit\install_windows.ps1
-<venv>\Scripts\python.exe -I _kit\tools\llm_archive.py restore <archive_root> Qwen/Qwen2.5-0.5B-Instruct <dest_dir>
+<venv>\Scripts\python.exe -I _kit\tools\llm_archive.py restore <pack_folder>\Qwen__Qwen2.5-0.5B-Instruct <dest_dir>
 ```
 
 Linux:
 
 ```
 sh _kit/install_linux.sh
-~/overcompressing-venv/bin/python -I _kit/tools/llm_archive.py restore <archive_root> Qwen/Qwen2.5-0.5B-Instruct <dest_dir>
+~/overcompressing-venv/bin/python -I _kit/tools/llm_archive.py restore <pack_folder>/Qwen__Qwen2.5-0.5B-Instruct <dest_dir>
 ```
 
-If the archive is a single `.oczip` file (made by `llm_archive.py bundle`), extract this `_kit/` folder from it with
-any ZIP tool first (7-Zip opens it as it is; for Windows Explorer, rename a copy to `.zip`), then give the `.oczip`
-in place of `<archive_root>`: `verify` and `restore` read it without extracting the rest.
+If the pack is a pack file (`.oczip`, made by `llm_archive.py bundle`), extract this `_kit/` folder from it with
+any ZIP tool first (7-Zip opens it as it is; for Windows Explorer, rename a copy to `.zip`), then give the pack file
+in place of `<pack_folder>` (a model in it is `<file.oczip>/<model folder>`): `verify` and `restore` read it
+without extracting the rest.
 
-Or open a window to look through the archive and extract models or single files: `<venv>\Scripts\pythonw.exe -I
+Or open a window to look through the pack and extract models or single files: `<venv>\Scripts\pythonw.exe -I
 _kit\tools\llm_archive_gui.py` on Windows, `~/overcompressing-venv/bin/python -I _kit/tools/llm_archive_gui.py` on
 Linux (the install scripts print both commands).
 
 `restore` writes byte-identical files and checks each against the manifest's SHA-256. Files can depend on other
-repos in the archive: a delta (`delta_base` / `delta_files` in the manifest) needs its base model's files, and a file
+repos in the pack: a delta (`delta_base` / `delta_files` in the manifest) needs its base model's files, and a file
 identical to one archived elsewhere (`"method": "same"`) is restored from that copy. **Do not delete a repo
-directory other repos depend on**; `verify` names any missing dependency. All of these need the directories present in the same archive
-root. ans16 deltas first restore the base into a temporary file: set `OC_TMP` to a folder with room for one
+directory other repos depend on**; `verify` names any missing dependency. All of these need the directories present in the same pack
+folder. ans16 deltas first restore the base into a temporary file: set `OC_TMP` to a folder with room for one
 weight file if the system temp folder is small. `OC_WORKERS` limits the CPU cores used.
 
 ## Check
 
-- `llm_archive.py verify <archive_root>` decodes everything in memory and checks every SHA-256.
+- `llm_archive.py verify <pack_folder>` decodes everything in memory and checks every SHA-256.
 - The kit itself: `SHA256SUMS` lists every kit file (`sha256sum -c SHA256SUMS` inside `_kit/`).
 - Damaged files are detected, not repaired: keep other copies, or add repair data with a tool of your choice
   (`docs/protection.md` compares the options).
@@ -58,7 +59,7 @@ weight file if the system temp folder is small. `OC_WORKERS` limits the CPU core
 | `wheels/win_amd64/` | Windows wheels (numpy, zstandard) |
 | `wheels/linux_x86_64/` | Linux wheels (numpy, zstandard) |
 | `tools/llm_archive.py` | the archiver: pack / verify / restore |
-| `tools/llm_archive_gui.py` | a small window for it (Tkinter, part of the bundled Python): pack, bundle, verify, extract; opens a folder or an `.oczip` |
+| `tools/llm_archive_gui.py` | a small window for it (Tkinter, part of the bundled Python): pack, bundle, verify, extract; opens a folder or a pack file (`.oczip`) |
 | `tools/ARCHIVE_FORMAT.md` | on-disk format; enough to restore by hand if the tool itself is unusable |
 | `tools/test_ans16.py` | self-test of the ans16 delta decoder: `python -I tools/test_ans16.py` (prints ALL PASSED) |
 | `tools/test_formats.py` | self-test of the safetensors/GGUF/other-file containers: `python -I tools/test_formats.py <scratch_dir>` |
