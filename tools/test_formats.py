@@ -689,6 +689,20 @@ def check_unused_base():
     code_v, out_v = tool("verify", new)
     expect("... in a new pack file too (written aside first), which verifies; nothing left aside", code == code_v == 0
            and not got["bases"] and not os.listdir(tmp), (out + out_v)[-300:])
+    failed = os.path.join(root, "bad-temp.oczip")  # found by GPT6: the ZIP was left to close itself, too late
+    code, out = tool("pack", src["a"], src["b"], failed, "--base", "a", "--json", env={"OC_TMP": os.path.join(root, "missing")})
+    expect("no folder to write a delta aside: refused cleanly (no traceback), no pack file",
+           code == 1 and error_code(out) == "other" and clean(out) and not os.path.exists(failed), out[-300:])
+    no_room = """_mkstemp = la.tempfile.mkstemp
+def _full(*a, **k):
+    if k.get("prefix") == "oc-blob-":
+        raise OSError(la.errno.ENOSPC, "No space left on device")
+    return _mkstemp(*a, **k)
+la.tempfile.mkstemp = _full"""
+    failed = os.path.join(root, "no-room.oczip")
+    code, out = patched(no_room, "pack", src["a"], src["b"], failed, "--base", "a", "--json")
+    expect("... no room for it: code no_room, no traceback, no pack file",
+           code == 1 and error_code(out) == "no_room" and clean(out) and not os.path.exists(failed), out[-300:])
     sft = os.path.join(root, "src", "sft")
     os.makedirs(sft)
     tune = a + (rng.standard_normal(a.size) * 2e-3).astype(np.float32)

@@ -2716,8 +2716,13 @@ def pack_into_new_file(args, target, plans):
     say(f"packing into a new pack file: {target}")
     with SafeTree(folder).placing(os.path.basename(target), replace=False) as f:
         p, manifests = NewFilePack(f, target), {}
-        for source, name, paths in plans:
-            pack_model(args, p, source, name, paths, manifests, args.base if args.base != name else None)
+        try:
+            for source, name, paths in plans:
+                pack_model(args, p, source, name, paths, manifests, args.base if args.base != name else None)
+        except BaseException:  # the file is deleted: closed here, while it is open, the ZIP does not try to finish it
+            with contextlib.suppress(Exception):  # later (a traceback); and what went wrong is what is reported
+                p.zip.close()
+            raise
         p.zip.close()
     PROGRESS.end()
     say(f"wrote {target}: {human(os.path.getsize(target))}", event="summary", path=target, size=os.path.getsize(target))

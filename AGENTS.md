@@ -250,6 +250,25 @@ python -I tools/test_formats.py <scratch_dir>
   python-build-standalone's Python, the Linux build guide) are verified by the downstream team.
 - Write patch scripts with the Write tool, not shell heredocs (backticks and quotes in docs break them).
 
+## Pinned versions and updates
+
+- Pinned, with SHA-256: python-build-standalone 20261001 (CPython 3.13.16) for Windows and Linux, in
+  `docs/build-windows.md` and `docs/build-linux.md` (both halves of each); numpy 2.5.4 and zstandard 0.25.0 in
+  `requirements-*.lock` (and unpinned in `requirements.txt`). Pinned on purpose: whoever follows a guide gets the same,
+  checkable bytes; never switch to "latest".
+- Bump soon when a security fix touches what the tool exposes to outside data (packs from others, downloaded models):
+  zlib deflate/inflate, libzstd, CPython's `zipfile`, `json` and `hashlib` (OpenSSL), numpy, Tk (the window shows
+  names from packs). Not for what it never reaches: e.g. zlib's `crc32_combine*` (CVE-2026-27171; Python's zlib
+  module does not expose it), `untgz` (CVE-2026-22184) or the gz* file API; checked 2026-10-23. The system's zlib1g
+  is not used by a portable copy either: its Python has zlib built in (20261001: zlib 1.3.2).
+- Otherwise bump when the guides change anyway, or every few months; skip releases younger than two weeks.
+- Steps: new file names and SHA-256 in both guides (four places); regenerate the lock files with hashes; follow the
+  Windows guide as written into a fresh folder; run both suites and the window checks with that Python; GPT6 follows
+  the Linux guide. `THIRD_PARTY_NOTICES.md` names the versions too.
+- Due: python-build-standalone 20261021 (CPython 3.13.17), released 2026-10-21; owner's choice: bump in early
+  November 2026, sooner if its notes show a fix in the areas above. The development venv here (python.org 3.13.15)
+  is older still: move it along then.
+
 ## Open questions
 
 - Base choice is per file against one model; the format already allows one file's regions to use blobs of several
