@@ -138,6 +138,13 @@ dev/                       experiments and measurement scripts used during devel
   Float (DFloat11)*, 2025 — [arXiv:2504.11651](https://arxiv.org/abs/2504.11651) (evaluated; needs a GPU to decode).
 - DEFLATE, [RFC 1951](https://www.rfc-editor.org/rfc/rfc1951) (zlib); Zstandard, [RFC 8878](https://www.rfc-editor.org/rfc/rfc8878).
 
+## Development / 開發與驗證
+
+This program was developed by Claude and verified by GPT6, which tested every change independently (functional,
+security and window tests, mainly on Linux) and reported back.
+
+本程式由 Claude 開發，由 GPT6 驗證：每次修改都由 GPT6 獨立測試（功能、安全與視窗測試，主要在 Linux 上）並回報結果。
+
 ## License / 授權
 
 MIT — see [LICENSE](LICENSE). Third-party components and their licenses (numpy BSD-3, zstd BSD-3/GPL-2, CPython

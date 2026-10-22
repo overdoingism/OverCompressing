@@ -223,8 +223,9 @@ data), only while the pack's stamp is as it was verified. No guided repair in th
 
 ## Working with the owner
 
-- Discuss approach questions before implementing; fix clear bugs directly. External test reports (often from a
-  downstream Linux team) are input to weigh, not orders: verify each issue first.
+- Discuss approach questions before implementing; fix clear bugs directly. External test reports (from the
+  downstream team, GPT6, mostly on Linux) are input to weigh, not orders: verify each issue first. The README says
+  so: developed by Claude, verified by GPT6.
 - When offering options, state a recommendation and why.
 - The repository is not public: no compatibility burden for formats or command lines unless asked.
 - Commit and push only when asked (the owner often says to hold commits while the window is being polished). Normal
