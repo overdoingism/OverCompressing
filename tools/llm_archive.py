@@ -716,7 +716,8 @@ def file_tensors(path, size):
     [name, dtype, start, end, shape] with absolute byte offsets and the shape outermost dimension first; GGUF
     quantized types are named "ggml_type_<n>" and run up to the next tensor (or the end of the file)."""
     with open(path, "rb") as f:
-        magic = f.read(4)
+        head = f.read(9)
+    magic = head[:4]
     if magic == b"GGUF":
         parsed = gguf_tensors(path)
         if parsed:
@@ -736,7 +737,7 @@ def file_tensors(path, size):
                 tensors.append([name, dtype, start, end, [int(d) for d in reversed(dims)]])
             else:
                 return "gguf", tensors
-    if path.endswith(".safetensors"):
+    if path.endswith(".safetensors") or head[8:9] == b"{":  # by its content too: ComfyUI's .sft, or any other name
         layout = safetensors_layout(path)
         if layout:
             data_start, items = layout
@@ -1960,6 +1961,11 @@ class NotSmaller(Exception):
     """rebase: the blob just written is not smaller than the one it would replace: it is not put in place."""
 
 
+class UnusedBase(Exception):
+    """A delta just coded reads its bases for less than MIN_BASE_USE of its file (storing its regions without them
+    came out smaller): it is not put in place, and the file is stored without a base instead (pack_blob)."""
+
+
 def method_of(fmt, regions):
     """How a file is stored, for people: its format (safetensors, gguf, zstd for text, auto for other bytes), with
     +ans16 or +xor for a delta."""
@@ -1973,10 +1979,11 @@ def write_container(src_path, out, header, base_paths=(), levels=(19, 9), worker
     region. Standalone regions are coded by kind. Regions with a "base" reference are coded against it (ans16 in
     parallel worker processes, or the original XOR base by byte planes/zstd) unless storing them standalone is
     smaller, in which case the frame's codec carries the STANDALONE flag. Other regions are coded on threads
-    (frame_workers), read and written here in order. Returns {frame codec: how many frames use it}."""
+    (frame_workers), read and written here in order. Returns {frame codec: how many frames use it}; UnusedBase if it
+    has bases but codes less than MIN_BASE_USE of the file against them."""
     regions = header["regions"]
     hb = json.dumps(header).encode()
-    codecs_used = {}
+    codecs_used, based = {}, 0
     jobs = [
         (base_paths[r["base"][0]], r["base"][1], r.get("base_dtype"), src_path, r["offset"], r["length"], r["dtype"])
         for r in regions if r["kind"] == "ans16"
@@ -2022,9 +2029,13 @@ def write_container(src_path, out, header, base_paths=(), levels=(19, 9), worker
                             options.append((codec | STANDALONE, alone))
                 codec, payload = min(options, key=lambda o: len(o[1]))
                 codecs_used[codec] = codecs_used.get(codec, 0) + 1
+                if "base" in region and not codec & STANDALONE:
+                    based += length
                 out.write(FRAME_HEAD.pack(codec, length, len(payload), crc))
                 out.write(payload)
                 PROGRESS.add(length)
+            if header["bases"] and based < MIN_BASE_USE * header["original_size"]:
+                raise UnusedBase  # a model would need another for nothing
     finally:
         if coded is not None:
             coded.close()
@@ -2035,18 +2046,33 @@ def write_container(src_path, out, header, base_paths=(), levels=(19, 9), worker
     return codecs_used
 
 
-def store_blob(p, sha, size, fill, replace=False, keep=None):
+def store_blob(p, sha, size, fill, replace=False, keep=None, spool=False):
     """Write the blob of the file `sha` (`size` bytes) with fill(out), end it with its SHA-256, and decode it back
     from disk (blob_restores) before it takes its place, so a blob that does not restore its file exactly is never
     used (BlobFailed). In a pack folder it goes over an existing blob only if `replace`, and with keep(its size)
-    false not at all (NotSmaller). Returns its size."""
+    false not at all (NotSmaller). spool: into a new pack file, fill writes to a temporary file first (a delta, which
+    may turn out to save nothing: UnusedBase), since a member of the pack file, once begun, is there. Returns its
+    size."""
     if isinstance(p, NewFilePack):
         info = zipfile.ZipInfo(blob_rel(sha), time.localtime()[:6])
         info.compress_type = zipfile.ZIP_STORED
-        with p.zip.open(info, "w", force_zip64=True) as dst:
-            out = HashingWriter(dst)
-            fill(out)
-            dst.write(out.hash.digest())
+        if spool:
+            fd, aside = tempfile.mkstemp(prefix="oc-blob-", suffix=".part", dir=os.environ.get("OC_TMP") or None)
+            try:
+                with os.fdopen(fd, "w+b") as tmp:
+                    out = HashingWriter(tmp)
+                    fill(out)
+                    tmp.seek(0)
+                    with p.zip.open(info, "w", force_zip64=True) as dst:
+                        shutil.copyfileobj(tmp, dst, 16 << 20)
+                        dst.write(out.hash.digest())
+            finally:
+                os.remove(aside)
+        else:
+            with p.zip.open(info, "w", force_zip64=True) as dst:
+                out = HashingWriter(dst)
+                fill(out)
+                dst.write(out.hash.digest())
         p.f.flush()
         span = member_span(p.temp_path, info)
         problem = blob_restores(p, sha, size, span, counted=True)
@@ -2099,6 +2125,7 @@ SAMPLE_BYTES = 512 << 10
 FIRST_ROUND = 4  # every candidate is scored on this many windows first ...
 FINALISTS = 4  # ... and only this many of the best on all of them
 MIN_BASE_GAIN = 0.01  # share of the standalone estimate a base must save
+MIN_BASE_USE = 0.01  # share of a file a delta must code against its bases, else it is stored without one
 RELEASE_GAIN = 0.1  # share of a kept base's room that letting it go must be estimated to save (rebase)
 
 
@@ -2487,7 +2514,8 @@ def print_entry(rec, info, t0, new=True):
 def pack_blob(args, p, src, rec, fmt, tensors, regions, base, manifests, blocked=frozenset(), replace=False, keep=None):
     """Store the file at src (its record rec) as its blob: a delta against the model `base` if its tensors are found
     there (by name, in any of its files whose blobs are not `blocked`), else standalone (`regions`). It is decoded
-    back before it takes its place; an ans16 delta that fails is redone as an XOR delta. Returns blob_info of it."""
+    back before it takes its place; an ans16 delta that fails is redone as an XOR delta, and one that would read its
+    base for (almost) nothing is stored standalone instead (UnusedBase). Returns blob_info of it."""
     levels, chunk_size = (args.zstd_level, args.zstd_tensor_level), args.chunk_mib << 20
     files = [f for f in manifests[base]["files"] if f["sha256"] not in blocked] if base else []
     for codec in dict.fromkeys([args.delta_codec, "xor"]):
@@ -2502,8 +2530,10 @@ def pack_blob(args, p, src, rec, fmt, tensors, regions, base, manifests, blocked
                 base_paths.append(cached_base(p, b["sha256"]))
             PROGRESS.at(rec["path"])
             fill = lambda out: write_container(src, out, header, base_paths, levels, args.workers)  # noqa: E731
-            store_blob(p, rec["sha256"], rec["size"], fill, replace, keep)
+            store_blob(p, rec["sha256"], rec["size"], fill, replace, keep, spool=bool(bases))
             return blob_info(p, rec["sha256"])
+        except UnusedBase:
+            break
         except BlobFailed as e:
             if not bases or codec == "xor" or isinstance(p, NewFilePack):
                 hint = "; nothing written: pack again with --delta-codec xor" if bases and codec != "xor" else ""
@@ -2511,6 +2541,8 @@ def pack_blob(args, p, src, rec, fmt, tensors, regions, base, manifests, blocked
             say(f"    ans16 failed verification ({e}); redoing this file as an XOR delta")
         finally:
             release_cached_bases()
+    say(f"    {rec['path']}: coded against {base} it saves nothing; stored without a base")
+    return pack_blob(args, p, src, rec, fmt, tensors, regions, None, manifests, blocked, replace, keep)
 
 
 def pack_model(args, p, source, name, paths, manifests, base):

@@ -314,7 +314,7 @@ def check_auto_base():
         ("t/D", {"w": ("BF16", [2000, cols], bf(d)), "n": norm}, "t/B"),
         ("t/E", {"n": norm, "w": ("F16", [2128, cols], e.tobytes())}, "t/D"),  # F16, extended vocabulary
         ("t/D2", {"w": ("BF16", [2000, cols], bf(d + np.float32(1e-3))), "n": norm}, None),  # --no-base
-        ("t/C2", {"w": ("BF16", [2000, cols], bf(c * np.float32(1.01))), "n": norm}, "t/A"),  # --base t/A
+        ("t/C2", {"w": ("BF16", [2000, cols], bf(c * np.float32(1.01))), "n": norm}, None),  # --base t/A: it saves nothing
     ]
     options = {"t/D2": ["--no-base"], "t/C2": ["--base", "t/A"]}
     originals = {}
@@ -328,8 +328,9 @@ def check_auto_base():
                 json.dump({"version": 1}, fh)
         code, out = pack(folder, archive, name, *options.get(name, []))
         got = base_of(archive, name) if code == 0 else "pack failed"
-        what = {"t/D2": " (--no-base)", "t/C2": " (--base t/A, an unrelated model)"}.get(name, "")
-        expect(f"{name} picks {want or 'no base'}{what}", code == 0 and got == want, got if got != want else "")
+        what = {"t/D2": " (--no-base)", "t/C2": " (--base t/A, an unrelated model, which would save nothing)"}.get(name, "")
+        ok = code == 0 and got == want and (name != "t/C2" or "saves nothing" in out)
+        expect(f"{name} picks {want or 'no base'}{what}", ok, got if got != want else "")
         if got != want:
             print(out)
     before = blobs(archive)
@@ -659,6 +660,45 @@ def check_damage():
     code, out = tool("remove", gone, "t/Base", "t/Tune", "t/Side")
     expect("removing every model of a pack with a missing blob: nothing left over", code == 0 and blobs(gone) == set(),
            "" if code == 0 else out[-300:])
+
+
+def check_unused_base():
+    """A base a delta would read for (almost) nothing is not kept, in a pack folder and in a new pack file; a
+    safetensors file is recognised by its content whatever its name (ComfyUI's .sft)."""
+    print("bases that save nothing; safetensors by content")
+    root = os.path.join(scratch, "unused")
+    shutil.rmtree(root, ignore_errors=True)
+    a = (rng.standard_normal(1 << 18) * 0.02).astype(np.float32)
+    b = (rng.standard_normal(1 << 18) * 0.02).astype(np.float32)  # unrelated to a, with the same names and shapes
+    src = {}
+    for name, w in (("a", a), ("b", b)):
+        src[name] = os.path.join(root, "src", name)
+        os.makedirs(src[name])
+        write_safetensors(os.path.join(src[name], "model.safetensors"), {"w": ("BF16", [w.size], bf(w))})
+    archive = os.path.join(root, "pack")
+    pack(src["a"], archive, "t/A")
+    code, out = pack(src["b"], archive, "t/B", "--base", "t/A")
+    got = info(archive, "t/B")
+    expect("coded against an unrelated base, a file is stored without it", code == 0 and not got["bases"]
+           and "saves nothing" in out, out[-300:])
+    tmp = os.path.join(root, "tmp")
+    os.makedirs(tmp)
+    new = os.path.join(root, "both.oczip")
+    code, out = tool("pack", src["a"], src["b"], new, "--base", "a", env={"OC_TMP": tmp})
+    got = info(new, "b")
+    code_v, out_v = tool("verify", new)
+    expect("... in a new pack file too (written aside first), which verifies; nothing left aside", code == code_v == 0
+           and not got["bases"] and not os.listdir(tmp), (out + out_v)[-300:])
+    sft = os.path.join(root, "src", "sft")
+    os.makedirs(sft)
+    tune = a + (rng.standard_normal(a.size) * 2e-3).astype(np.float32)
+    write_safetensors(os.path.join(sft, "model.sft"), {"w": ("BF16", [a.size], bf(tune))})
+    code, out = pack(sft, archive, "t/Sft")
+    e, got = entry(archive, "t/Sft", "model.sft"), info(archive, "t/Sft", "model.sft")
+    expect("a .sft file is read as safetensors: its tensors listed, stored as a delta against t/A", code == 0
+           and e.get("format") == "safetensors" and [b["model"] for b in got["bases"]] == ["t/A"], out[-300:])
+    code, out = tool("verify", archive)
+    expect("  and the pack verifies", code == 0, out[-200:])
 
 
 def check_kept_bases():
@@ -2130,6 +2170,7 @@ def main():
     check_remove()
     check_damage()
     check_kept_bases()
+    check_unused_base()
     check_rebase_files()
     check_output()
     check_safety()

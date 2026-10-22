@@ -52,6 +52,10 @@ facing text uses these words:
 - Base choice: per file, among the other models (not the model itself); a blob is never coded against one that
   needs it (`Graph.above`, also when a damaged or partial blob is stored again), and chains stay at most 32 deep
   (`MAX_REFERENCE_DEPTH`). References are per region (a tensor, or up to 64 MiB of one), into the base file's bytes.
+  A delta that, once coded, reads its bases for under `MIN_BASE_USE` (1%) of its file is stored standalone instead
+  (`UnusedBase`, also with `--base`; found with SDXL LoRAs, which share key names but nothing else): into a new pack
+  file a delta is written aside first (`store_blob` spool), since a member once begun cannot be taken back.
+  safetensors is recognised by content too (`.sft`, ComfyUI).
 - **Kept bases are trimmed** (owner: reclaim aggressively): after every sweep, a blob no model lists but others are
   coded against becomes **partial** (`trim_kept`, `write_trimmed`: header `partial`, regions `dropped`, frames of the
   kept ones copied as they are, written and checked, then put in place in one step); dependents are untouched (they

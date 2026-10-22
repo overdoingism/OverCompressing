@@ -65,7 +65,7 @@ except KeyboardInterrupt:
     sys.exit("cancelled")
 """
 
-WEIGHT_SUFFIXES = (".safetensors", ".gguf", ".bin", ".pt", ".pth", ".ckpt", ".onnx", ".h5", ".msgpack")
+WEIGHT_SUFFIXES = (".safetensors", ".sft", ".gguf", ".bin", ".pt", ".pth", ".ckpt", ".onnx", ".h5", ".msgpack")
 COLORS = {"folder": "#fff3c4", "drive": "#fff3c4", "pack": "#e6def8", "oczip": "#d9e8fb", "model": "#dcf1e2",
           "weights": "#fde0dc"}  # row backgrounds by kind; other files keep the list's own
 LEGEND = (("folder", "Folder"), ("pack", "Pack folder"), ("oczip", "Pack file"), ("model", "Model"), ("weights", "Weights"))

@@ -274,7 +274,9 @@ Without `--base`, every new file picks its own base among the other models of th
    fast estimates and compared with storing them standalone. Only the parts of a candidate those windows need are
    decoded.
 3. **Choice**: the smallest estimate wins if it saves at least 1 % over storing the file standalone; otherwise the
-   file gets no base.
+   file gets no base. A delta that, once coded, reads its base for less than 1 % of the file (storing the rest
+   without it came out smaller) is stored standalone instead, so that no model needs another for nothing; this also
+   holds for `--base`.
 
 Files of one folder may pick different bases (e.g. a BF16 GGUF picks a BF16 GGUF, a Q4_K_M one a Q4_K_M), so a model
 may need several models, and several models may need one: what needs what is a graph that grows as you pack, never a
@@ -805,7 +807,8 @@ Qwen/Qwen2.5-7B: org/fine-tune (rebase them to find out)`。這只比對 manifes
    [原理](principles.md#4-matching-tensors-not-files)）。只讀 manifest，不解壓任何東西。
 2. **試算**：從檔案的 tensor 中平均取 16 段（每段 512 KiB），用快速估算對每個候選試壓，並與單獨壓縮比較。候選模型只解開
    這些片段需要的部分。
-3. **決定**：估算最小者勝出，但必須比單獨壓縮至少省下 1%，否則不用 base。
+3. **決定**：估算最小者勝出，但必須比單獨壓縮至少省下 1%，否則不用 base。實際編碼後，若 delta 只有不到檔案 1% 的部分
+   真正用到 base（其餘不用 base 反而更小），就改成單獨存放，免得某個模型平白依賴另一個；指定 `--base` 時也一樣。
 
 同一個資料夾裡的不同檔案可以選不同的 base（例如 BF16 GGUF 選 BF16 GGUF，Q4_K_M 選 Q4_K_M），所以一個模型可能需要好幾個模型，
 好幾個模型也可能需要同一個：誰需要誰是一張隨著打包自然長出來的圖，不會有循環（blob 絕不以需要它的 blob 為基底），深度也不超過
