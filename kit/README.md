@@ -1,8 +1,9 @@
 # Offline restore kit
 
 Everything needed to verify and restore the models in this pack **without network access**.
-Each sibling directory of `_kit/` (e.g. `Qwen__Qwen2.5-0.5B/`) is one packed model; its `manifest.json` lists
-every original file with its SHA-256.
+The pack folder holding `_kit/` holds `ocpack.json`, one manifest per model in `models/` (e.g.
+`models/Qwen__Qwen2.5-0.5B.json`, listing every original file with its SHA-256) and the stored files in `blobs/`,
+each named by the SHA-256 of its original file.
 
 ## What you need on the machine
 
@@ -16,31 +17,32 @@ Windows:
 
 ```
 powershell -ExecutionPolicy Bypass -File _kit\install_windows.ps1
-<venv>\Scripts\python.exe -I _kit\tools\llm_archive.py restore <pack_folder>\Qwen__Qwen2.5-0.5B-Instruct <dest_dir>
+<venv>\Scripts\python.exe -I _kit\tools\llm_archive.py list <pack_folder>
+<venv>\Scripts\python.exe -I _kit\tools\llm_archive.py restore <pack_folder> Qwen/Qwen2.5-0.5B-Instruct <dest_dir>
 ```
 
 Linux:
 
 ```
 sh _kit/install_linux.sh
-~/overcompressing-venv/bin/python -I _kit/tools/llm_archive.py restore <pack_folder>/Qwen__Qwen2.5-0.5B-Instruct <dest_dir>
+~/overcompressing-venv/bin/python -I _kit/tools/llm_archive.py list <pack_folder>
+~/overcompressing-venv/bin/python -I _kit/tools/llm_archive.py restore <pack_folder> Qwen/Qwen2.5-0.5B-Instruct <dest_dir>
 ```
 
-If the pack is a pack file (`.oczip`, made by `llm_archive.py bundle`), extract this `_kit/` folder from it with
+If the pack is a pack file (`.oczip`, made by `llm_archive.py export`), extract this `_kit/` folder from it with
 any ZIP tool first (7-Zip opens it as it is; for Windows Explorer, rename a copy to `.zip`), then give the pack file
-in place of `<pack_folder>` (a model in it is `<file.oczip>/<model folder>`): `verify` and `restore` read it
-without extracting the rest.
+in place of `<pack_folder>`: `list`, `verify` and `restore` read it without extracting the rest.
 
-Or open a window to look through the pack and extract models or single files: `<venv>\Scripts\pythonw.exe -I
+Or open a window to look through the pack and extract models or single files (**⤒ Extract to**):
+`<venv>\Scripts\pythonw.exe -I
 _kit\tools\llm_archive_gui.py` on Windows, `~/overcompressing-venv/bin/python -I _kit/tools/llm_archive_gui.py` on
 Linux (the install scripts print both commands).
 
-`restore` writes byte-identical files and checks each against the manifest's SHA-256. Files can depend on other
-repos in the pack: a delta (`delta_base` / `delta_files` in the manifest) needs its base model's files, and a file
-identical to one archived elsewhere (`"method": "same"`) is restored from that copy. **Do not delete a repo
-directory other repos depend on**; `verify` names any missing dependency. All of these need the directories present in the same pack
-folder. ans16 deltas first restore the base into a temporary file: set `OC_TMP` to a folder with room for one
-weight file if the system temp folder is small. `OC_WORKERS` limits the CPU cores used.
+`restore` writes byte-identical files and checks each against the manifest's SHA-256. A stored file may be a delta
+against other stored files (its header names them by SHA-256): they are restored first, from the same pack. **Change
+the pack only through the tool** (and copy it whole): a stored file deleted by hand breaks every model that needs it;
+`verify` names what is missing. ans16 deltas first restore the base into a temporary file: set `OC_TMP` to a folder
+with room for one weight file if the system temp folder is small. `OC_WORKERS` limits the CPU cores used.
 
 ## Check
 
@@ -58,8 +60,9 @@ weight file if the system temp folder is small. `OC_WORKERS` limits the CPU core
 | `python/linux/` | python-build-standalone CPython 3.13.16 (SHA256SUMS + GitHub attestation verified) |
 | `wheels/win_amd64/` | Windows wheels (numpy, zstandard) |
 | `wheels/linux_x86_64/` | Linux wheels (numpy, zstandard) |
-| `tools/llm_archive.py` | the archiver: pack / verify / restore |
-| `tools/llm_archive_gui.py` | a small window for it (Tkinter, part of the bundled Python): pack, bundle, verify, extract; opens a folder or a pack file (`.oczip`) |
+| `tools/llm_archive.py` | the archiver: pack / list / verify / restore / remove / rename / rebase / export |
+| `tools/llm_archive_gui.py` | a small window for it (Tkinter, part of the bundled Python): the models of a pack as a list (or by base), with a filter; pack, add files, save .oczip, extract, verify, remove, rename |
+| `tools/BUILD` | which build of the two tools this is (the date and commit each was last changed in); `llm_archive.py --version` and the window's title show it |
 | `tools/ARCHIVE_FORMAT.md` | on-disk format; enough to restore by hand if the tool itself is unusable |
 | `tools/test_ans16.py` | self-test of the ans16 delta decoder: `python -I tools/test_ans16.py` (prints ALL PASSED) |
 | `tools/test_formats.py` | self-test of the safetensors/GGUF/other-file containers: `python -I tools/test_formats.py <scratch_dir>` |
@@ -81,8 +84,8 @@ matched their RECORD hashes, and Windows Defender found no threats.
 這個資料夾是離線還原工具包，在完全沒有網路的情況下，也能驗證、還原這份歸檔裡的模型。
 
 - 工具包已內附 CPython 3.13.16：Windows 用 python.org 官方安裝檔，Linux 用 python-build-standalone。電腦上沒有 Python 3.13 時，安裝腳本會自動安裝或解開它。
-- 先執行 `install_windows.ps1` 或 `install_linux.sh` 建立環境，再用 `tools/llm_archive.py restore` 還原。
-- 檔案可能依賴歸檔裡的其他 repo：delta 需要 base 模型的檔案；和其他地方完全相同的檔案（`"method": "same"`）只存引用，還原時從那份複製。**不要刪除被其他 repo 依賴的 repo 資料夾**，`verify` 會指出缺少的依賴。
+- 先執行 `install_windows.ps1` 或 `install_linux.sh` 建立環境，再用 `tools/llm_archive.py list` 看有哪些模型、用 `restore <pack> <模型名稱> <目的資料夾>` 還原。
+- pack 資料夾裡有 `ocpack.json`、`models/`（每個模型一份 manifest）與 `blobs/`（儲存檔，以原始檔的 SHA-256 命名，相同的檔案只存一份）。儲存檔可能是以其他儲存檔為基底的差異檔，還原時會先還原它們。**只透過工具修改 pack**（要複製就整個資料夾一起）：用手刪掉儲存檔，會讓需要它的模型壞掉，`verify` 會指出缺少什麼。
 - ans16 delta 會先把 base 還原成暫存檔；如果系統暫存資料夾空間不夠，請用 `OC_TMP` 環境變數指定別的資料夾。
 - 用 `verify` 檢查損毀；工具包本身可用 `SHA256SUMS` 核對。本工具只負責偵測、不負責修復：請保留多份副本，或自行選用修復方案（比較見 `docs/protection.md`）。
 - 就算工具本身壞了，照著 `tools/ARCHIVE_FORMAT.md` 也能手動還原。

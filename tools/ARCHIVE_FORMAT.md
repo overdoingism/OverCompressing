@@ -1,75 +1,102 @@
-# OverCompressing archive format, version 3
+# OverCompressing pack format, version 4
 
-Written by `llm_archive.py` (tool version 4). This spec is enough to restore the data without the tool: you need a
-DEFLATE decoder (zlib, RFC 1951), a zstd decoder, SHA-256, a few bit operations (byte planes), and for ans16 deltas
-the rANS decoder described below.
+Written by `llm_archive.py` (tool version 5). This spec is enough to restore the data without the tool: you need a
+JSON reader, a DEFLATE decoder (zlib, RFC 1951), a zstd decoder, SHA-256, a few bit operations (byte planes), and for
+ans16 deltas the rANS decoder described below.
 
 ## Layout
 
+A pack is a folder (a *pack folder*) or the same tree in one ZIP file (a *pack file*, `.oczip`, below):
+
 ```
-<pack_folder>/
-  <name>/                   one directory per packed model folder ("/" in the name becomes "__"); it must hold that
-                            model only: the manifest's `repo` must map to the directory's name
-    manifest.json           never the name of a stored file (a source file called manifest.json is stored as
-                            manifest.json.1, …); no stored file name ends in .part, the suffix of temporary files
-    <path>                  small non-weight files (<= 1 MiB), stored byte-for-byte; after a re-pack that changed
-                            one, the name may be <path>.1
-    <path>.ocz              every other file, in an OCZ3 container (files identical to one stored elsewhere in the
-                            archive are not stored again: their manifest entry points at it); after a re-pack or a
-                            rebase the name may be <path>.1.ocz: always use `stored` from the manifest
-                            Stored names follow the original folder tree, each name made valid on Windows and
-                            POSIX. Where a file and a folder would get one name (also when they differ only in
-                            case, or while a re-pack keeps the old version's files), the later one gets .1, .2, ...
-                            (a folder too: a_.1/x.txt.ocz). A folder left empty by a re-pack is removed.
+<pack>/
+  ocpack.json               {"format": "overcompressing-pack", "format_version": 4, "changed": "<time>"}: what
+                            makes the folder a pack; rewritten last by every change (pack, remove, rename, rebase,
+                            export --delete), with `changed` the UTC time in ISO 8601, so its time stamp tells a
+                            watcher once per complete change (readers check only `format` and `format_version`)
+  models/
+    <Org__Name>.json        one manifest per model; "/" in the model's name becomes "__" (Qwen/Qwen2.5-7B ->
+                            models/Qwen__Qwen2.5-7B.json)
+  blobs/
+    <ab>/<sha256>.ocz       one blob per distinct file: an OCZ4 container named by the SHA-256 of the ORIGINAL
+                            file (64 lowercase hex digits; <ab> is its first two), shared by every model that has
+                            that file
   _kit/                     optional offline restore kit (tools, wheels, Python, docs)
-  .overcompressing.lock     empty; the tools lock it while they run (pack/rebase alone, verify/restore together;
-                            readers skip it only on a read-only volume or with --no-lock)
+  .overcompressing.lock     empty; the tools lock it while they run (pack, remove, rename, rebase and
+                            export --delete alone; list, verify, restore and export together; readers skip it only
+                            on a read-only volume or with --no-lock)
 ```
+
+To restore a model: read its manifest; for each file, decode `blobs/<ab>/<sha256>.ocz` (its `sha256`), which gives
+back the original bytes, and check them against `size` and `sha256`.
+
+A blob refers to nothing but the blobs it is coded against (its bases, by SHA-256), and a manifest to nothing but its
+files' blobs. Nothing records which models need which blobs: that follows from the manifests and the blobs' headers.
+A blob that no manifest needs, directly or through the bases of blobs that are needed, is garbage; `pack`, `remove`
+and `rebase` delete such blobs (never while a manifest or a needed blob cannot be read). A blob a removed model
+listed stays as long as another model's blob is coded against it.
+
+Files the tool did not write (your notes, recovery data) may lie in the pack folder; the tool never touches them,
+and `export` leaves them out. Temporary files are `.oc-*.part`.
 
 ### Pack file (`.oczip`)
 
-The `bundle` command puts a whole `<pack_folder>` into one file: a ZIP archive (ZIP64 where needed) whose member
-names are the paths relative to `<pack_folder>`, with `/` separators and UTF-8 names. Every container (`*.ocz`, and
-every `stored` name of a container in a manifest) is stored with method 0 (no compression, no encryption), so it can
-be read in place at its offset: the member's local header offset plus 30 plus the lengths of its name and extra field.
-Other members are stored or Deflate-compressed (method 8). The lock file and `.oc-*.part` files are not put in; no name
-appears twice and none has an empty, `.` or `..` part. A model's manifest is `<folder>/manifest.json`, exactly as in
-the folder. Extracting the ZIP with any tool gives back the pack folder, byte for byte.
+A ZIP archive (ZIP64 where needed) whose member names are the paths above, relative to the pack, with `/`
+separators and UTF-8 names: `ocpack.json`, `models/...`, `blobs/...` and optionally `_kit/...`. Every blob is stored
+with method 0 (no compression, no encryption), so it can be read in place at its offset: the member's local header
+offset plus 30 plus the lengths of its name and extra field. Other members are stored or Deflate-compressed
+(method 8). No name appears twice and none has an empty, `.` or `..` part. A pack file is written whole and never
+changed; extracting it with any ZIP tool gives a pack folder.
 
-## manifest.json
+## Model manifest (`models/<Org__Name>.json`)
 
 | field | meaning |
 |---|---|
-| `format`, `format_version` | `"overcompressing-archive"`, `3` |
-| `repo`, `revision` | the model's name in the archive (`--name`), and an optional free-text note (`--revision`) |
-| `tool`, `created`, `rebased` | tool version that wrote the manifest; UTC time of the pack, and of the last `rebase` that changed the model (absent if none) |
+| `format`, `format_version` | `"overcompressing-model"`, `4` |
+| `name`, `revision` | the model's name in the pack (`--name`), and an optional free-text note (`--revision`) |
+| `tool`, `created` | the tool that wrote the manifest, its version and build (e.g. `llm_archive 0.5 (2026-10-22 1a2b3c4)`); UTC time of the pack |
 | `base_choice` | how the bases were chosen: `auto`, `forced` (`--base`) or `none` (`--no-base`); `rebase --all` re-chooses only `auto`; if absent, read as `auto`. Not needed to restore |
-| `files[].path` | path inside the repo |
-| `files[].size`, `sha256` | size and SHA-256 of the **original** file, computed when it was packed |
-| `files[].method` | `raw`; `same` (identical to a file stored elsewhere in the archive); or the detected format (`safetensors`, `gguf`, `zstd` for text, `auto` for unknown binaries), with `+ans16` / `+xor` when it is a delta |
-| `files[].stored`, `stored_size`, `stored_sha256` | the file as stored in this repo's directory (`stored` is null for `same`) |
-| `files[].same_as` | `{"repo", "path"}` of the identical file (method `same`) |
-| `files[].delta_base`, `delta_files` | repo id of the base, and `[{"path", "sha256"}]` of its files this delta reads |
-| `files[].matched_bytes` | bytes of this file coded against base tensors |
-| `files[].format`, `tensors` | for parsed safetensors/GGUF files: `[name, dtype, start, end, shape]` of every tensor (absolute byte offsets; shape outermost dimension first, also for GGUF) |
+| `files[].path` | the file's path inside the model folder it was packed from |
+| `files[].size`, `sha256` | size and SHA-256 of the **original** file; the SHA-256 names its blob |
+| `files[].base_choice` | optional: a choice made for this file alone (`pack --add`, `rebase --file`), as `base_choice` above; if absent, the model's |
+| `files[].format`, `tensors` | for parsed safetensors/GGUF files: `[name, dtype, start, end, shape]` of every tensor (absolute byte offsets; shape outermost dimension first, also for GGUF). Used to choose bases, not to restore |
 
-## OCZ3 container
+The manifest's file name must be `repo_dir_name(name) + ".json"`. Two names that would give one file name where case
+is ignored are not allowed in one pack.
+
+## OCZ4 container (a blob)
 
 All integers are little-endian.
 
 ```
-"OCZ3"                       4 bytes magic
+"OCZ4"                       4 bytes magic
 u32 header_len
-header_len bytes of JSON:    {"original_size", "regions": [...], "delta": null | {"repo", "files": [{"path", "sha256"}], "op"}}
+header_len bytes of JSON:    {"original_size", "sha256", "method", "regions": [...], "bases": [...]}
 one frame per region, in order:
   u8  codec                  low 7 bits: 0 = raw, 1 = byte planes, 2 = zstd, 3 = ans16; bit 7 (0x80) = STANDALONE
   u64 raw_len                bytes this frame restores to (= region length)
   u64 payload_len
   u32 crc32                  zlib CRC-32 of the restored ORIGINAL bytes of the region
   payload_len bytes
+32 bytes                     SHA-256 of every byte of the blob before these 32
 ```
 
-`regions` covers the file in order without gaps; each is `{"offset", "length", "kind", "dtype"?, "base"?}`.
+`original_size` and `sha256` are the original file's (the blob's name). `method` is for people only (`safetensors`,
+`gguf`, `zstd` for text, `auto` for other bytes, with `+ans16` / `+xor` for a delta). `bases` lists the blobs this one
+is coded against: `[{"sha256", "size", "model"?, "path"?}]`, `sha256` and `size` being the base file's; `model` and
+`path` say where that file came from when this blob was written, for people only (that model may have been renamed
+or removed since). `regions` covers the file in order without gaps; each is `{"offset", "length", "kind", "dtype"?,
+"base"?, "base_dtype"?}`.
+
+### Partial blobs
+
+A blob that no model lists any more but other blobs are coded against (kept for them after its model was removed) may
+be **partial**: its header has `"partial": true`, and each region that no blob reads is marked `"dropped": true` and has
+no frame (the frames of the other regions follow in order, as they were). A partial blob does not restore its file; it
+gives the bytes of its kept regions to the blobs coded against it, which read only those. Restoring it as a base for
+one of them, take the dropped regions as zeros (each kept region still checks against its CRC-32). Everything else is
+as for any blob: its name is still its file's SHA-256, it ends with the SHA-256 of its bytes. A file a manifest lists
+never has a partial blob: storing the file again replaces it with a whole one.
 
 ### Standalone coding
 
@@ -114,16 +141,15 @@ How files are split: safetensors by its JSON header; GGUF (v2/v3) by its tensor 
 float, quantized ones are tagged `ggml_type_<n>` and run up to the next tensor); anything else in 64 MiB `auto`
 chunks (text files: `zstd`). Regions longer than 64 MiB are cut into 64 MiB pieces.
 
-### Delta coding (`delta` is set)
+### Delta coding (`bases` is not empty)
 
-Tensors of the file that also exist in the base repo, in any of its files, become regions with
-`"base": [i, offset]`: their base bytes are at `offset` in `delta.files[i]`. A tensor matches a base tensor with the
-same name and either the same dtype and byte size, the same element count in another float dtype (see
+Tensors of the file that also exist in the base model, in any of its files, become regions with
+`"base": [i, offset]`: their base bytes are at `offset` in the file of `bases[i]`. A tensor matches a base tensor
+with the same name and either the same dtype and byte size, the same element count in another float dtype (see
 `base_dtype` below), or, for float tensors, the same shape except the first dimension: then only the leading rows
 both have are coded against the base (e.g. an embedding after vocabulary extension), and the target's extra rows
-form a following standalone region. Restore each base
-file first (it may itself be a delta or a `same` reference) and check its SHA-256 against `delta.files[i].sha256`.
-Then, per region:
+form a following standalone region. Restore each base file first (from its own blob, which may itself be a delta)
+and check its SHA-256 against `bases[i].sha256`. Then, per region:
 
 - no `base` key: decode standalone as above.
 - `base` and the STANDALONE flag set: decode standalone as above (storing it without the base was smaller).
@@ -132,7 +158,8 @@ Then, per region:
   with the `length` base bytes at `offset`.
 
 Because matching is by tensor, a delta works across different file names, header sizes, shardings, tensor
-orders, float dtypes and vocabulary sizes. **A delta file is unrecoverable without the base files it lists.** Protect them well (see `docs/protection.md`).
+orders, float dtypes and vocabulary sizes. **A delta blob is unrecoverable without the blobs it lists as bases**;
+the tool keeps them as long as it is needed. A chain of bases is at most 32 blobs deep and never a cycle.
 
 #### Cross-dtype prediction (`base_dtype`)
 
@@ -178,50 +205,49 @@ Encoding is the exact inverse (symbols in reverse order; emit the low 32 bits an
 
 ## Integrity
 
-- Every stored file has `stored_sha256` (detects bit rot before decoding).
+- Every blob ends with its own SHA-256 (detects damage before decoding, with no manifest needed).
+- A partial blob (kept only as a base) is checked through what reads it: every region a blob coded against it reads
+  must be kept, and those blobs' files restore exactly.
 - Every frame has a CRC-32 of the original bytes (localizes damage); ans16 payloads also self-check (step 4).
-- Every original file has its `sha256` (proves the restore is exact).
-- `pack` refuses to finish a file unless it decodes back from disk to the original SHA-256; a failed ans16 delta is
-  redone as an XOR delta. `verify` and `restore` check the stored hashes of every file a file depends on (deltas,
-  `same` references) before decoding, and refuse cyclic references.
-- `rebase`, and `pack` when it re-packs a repo, write each new stored file under a name the current manifest does
-  not use (`<path>.ocz` and `<path>.1.ocz` alternate; a file stored byte-for-byte keeps `<path>` if its bytes are
-  unchanged, else alternates with `<path>.1`), decode it back, write the new manifest to a temporary `.oc-*.part` file and
-  rename it over `manifest.json`, and only then delete the old stored files, so the archive is complete at every
-  moment. Other repos refer to a file by repo, path and SHA-256, which neither command changes.
+- Every original file has its `sha256`, which is its blob's name (proves the restore is exact).
+- `pack` and `rebase` write a blob to a temporary `.oc-*.part` file and decode it back from there to the original
+  SHA-256 before it takes its name; a failed ans16 delta is redone as an XOR delta. In a pack file, blobs are decoded
+  back from the unfinished file the same way. `verify` and `restore` check the blob, and every blob it is coded
+  against, before decoding, and refuse cycles and chains deeper than 32.
+- A file already in the pack (by SHA-256) is not stored again; if its blob is damaged, the next pack of that file
+  stores it again.
+- A manifest is replaced in one step (written to a temporary file, then renamed over the old one), last: after its
+  blobs are in place and before blobs it no longer needs are deleted, so the pack is complete at every moment.
+  `rebase` replaces a blob by a new one that restores the same file, so nothing that needs it changes.
 - Names and paths in a manifest are checked before they are used. A model name is one or more parts separated by
   `/`, each of letters, digits, `-_.+@()[]` and spaces, not empty, not starting or ending with a space, not ending
-  with a dot, not a Windows device name, and not mapping to `_kit`. A file path (`path`, `stored`, `same_as.path`,
-  `delta_files[].path`) is relative, uses `/`, and has no empty, `.` or `..` part and no NUL. `path` is the original
-  name and may hold any other character; `stored` also has no `\` (on Windows no `:` and no part ending in a dot or
-  space either), and new stored names are valid on Windows and POSIX and never differ from one another only in case,
-  so a model folder can be copied between systems. `restore` refuses paths that would land outside its destination
-  and never writes through a link (a symlink or junction below the destination stops it), writes a name its system does not allow with `_` for each character it does
-  not allow (on Windows: `<>:"\|?*`, control characters, trailing dots and spaces; device names get `_` after the
-  stem), and keeps two paths that would be one file apart with ` (1)`, ` (2)`, ... before the extension of the later
-  one (paths that needed no change keep their names).
-- `pack` refuses to re-pack a repo when another repo refers to one of its files (by path and SHA-256) that the
-  re-pack would change or drop, since that repo could no longer be restored.
-- Every manifest entry is checked before use: `path`, `size` (a whole number of at least 0) and `sha256` (64 lowercase
-  hex digits); a known `method` (`raw`, `same`, `zstd`, `auto`, `safetensors`, `gguf`, or one of the last two with
-  `+ans16` / `+xor`); for `same`, `same_as` with a valid repo and path; otherwise `stored`, `stored_size` and
-  `stored_sha256`; for a delta, `delta_base` and a non-empty `delta_files` of paths and SHA-256s. No path may be
-  listed twice. A manifest that fails is reported by `verify` and blocks `pack` and `rebase` until it is fixed.
-- Every container is checked before anything in it is decoded: magic; a header of at most 64 MiB that is valid
-  UTF-8 JSON without duplicate keys, `NaN` or `Infinity`; at most 4,194,304 regions, each 1 byte to 1 GiB long, with
-  whole-number offsets and lengths (not `true`, not `0.0`), covering `original_size` in order without gaps, of a
-  known kind, with base references only on delta regions and only into `delta.files`; one frame per region whose
-  `raw_len` is the region's length and whose codec fits the region; every payload inside the file; nothing after the
-  last frame; and `original_size` equal to the manifest's `size`. A zstd payload must be exactly one frame, its
-  declared content size no larger than its region, and it is decoded with output capped at that size. An ans16
-  payload's lengths must add up exactly, its header fields stay in range (precision 1–30, 1–65,536 lanes, 1–257
-  contexts) and its tables (at most 65,536 symbols per context, frequencies summing to `2^prec`) fit. Manifests and
-  safetensors headers with duplicate JSON keys, `NaN` or `Infinity` are refused too; a GGUF file whose sizes
-  overflow, whose tensor names are not valid UTF-8 or repeat, is stored as plain bytes.
+  with a dot and not a Windows device name. A file path (`path`) is relative, uses `/`, and has no empty, `.` or `..`
+  part and no NUL; it may hold any other character. `restore` refuses paths that would land outside its destination
+  and never writes through a link (a symlink or junction below the destination stops it), writes a name its system
+  does not allow with `_` for each character it does not allow (on Windows: `<>:"\|?*`, control characters, trailing
+  dots and spaces; device names get `_` after the stem), and keeps two paths that would be one file apart with
+  ` (1)`, ` (2)`, ... before the extension of the later one (paths that needed no change keep their names).
+- Every manifest is checked before use: this format and version; a valid `name` matching its file name; for every
+  entry a `path`, `size` (a whole number of at least 0) and `sha256` (64 lowercase hex digits), and for a parsed file
+  a known `format` and a tensor table inside the file; no path listed twice. A manifest that fails is reported by
+  `verify` and blocks `pack`, `remove`, `rename` and `rebase` until it is fixed (its model's blobs would otherwise
+  look unused).
+- Every blob is checked before anything in it is decoded: its trailing SHA-256; magic; a header of at most 64 MiB that
+  is valid UTF-8 JSON without duplicate keys, `NaN` or `Infinity`, naming the file the blob is named after; at most
+  4,194,304 regions, each 1 byte to 1 GiB long, with whole-number offsets and lengths (not `true`, not `0.0`),
+  covering `original_size` in order without gaps, of a known kind, with base references only on delta regions, only
+  into `bases` and only to bytes inside the base file; one frame per region whose `raw_len` is the region's length
+  and whose codec fits the region; every payload inside the blob; nothing after the last frame but the SHA-256. A
+  zstd payload must be exactly one frame, its declared content size no larger than its region, and it is decoded
+  with output capped at that size. An ans16 payload's lengths must add up exactly, its header fields stay in range
+  (precision 1–30, 1–65,536 lanes, 1–257 contexts) and its tables (at most 65,536 symbols per context, frequencies
+  summing to `2^prec`) fit. Manifests and safetensors headers with duplicate JSON keys, `NaN` or `Infinity` are
+  refused too; a GGUF file whose sizes overflow, whose tensor names are not valid UTF-8 or repeat, is stored as plain
+  bytes.
 - Every file a tool writes goes first to a new, randomly named temporary file (`.oc-*.part`) created exclusively, and
   is put in place only after it is synced to disk. A new name is taken only if nothing is there, in one step (a hard
   link, then the temporary name removed; where the file system has no hard links, a rename that refuses an existing
-  name; with neither, the tool stops rather than check first and rename after). Links below the archive's model
-  folders and the restore destination are never followed (on Windows: checked as a best effort).
-- Repair data is not part of the format; add your own (copies, PAR2, a self-healing file system, …) and rebuild
-  it after re-packing or rebasing a repo. See `docs/protection.md`.
+  name; with neither, the tool stops rather than check first and rename after). Links below the pack folder and the
+  restore destination are never followed (on Windows: checked as a best effort).
+- Repair data is not part of the format: bit-level damage is for the hardware and the file system (RAID, ECC,
+  ZFS/Btrfs/ReFS) or copies. See `docs/protection.md`.

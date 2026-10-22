@@ -65,25 +65,27 @@ hashes Hugging Face publishes).
 ```bash
 python -I tools/llm_archive.py pack    models/Qwen2.5-0.5B packs --name Qwen/Qwen2.5-0.5B
 python -I tools/llm_archive.py pack    models/Qwen2.5-0.5B-Instruct packs --name Qwen/Qwen2.5-0.5B-Instruct
+python -I tools/llm_archive.py list    packs
 python -I tools/llm_archive.py verify  packs
-python -I tools/llm_archive.py restore packs/Qwen__Qwen2.5-0.5B-Instruct restored
+python -I tools/llm_archive.py restore packs Qwen/Qwen2.5-0.5B-Instruct restored
 ```
 
 Get the model folders with any tool you like (OverCompressing never downloads) → pack the base → pack the fine-tune
-(it finds its base in the pack folder by itself and is stored as a delta) → verify → restore. Each model is a
-folder in the pack folder (`packs`); models refer to one another there. Prefer a window?
-`python -I tools/llm_archive_gui.py packs` does pack, verify and extract with a few clicks. Want one file?
-`python -I tools/llm_archive.py bundle packs models.oczip --delete` puts the whole pack into one pack file (`.oczip`,
-a ZIP), verifies it and removes the folder's files; `verify` and `restore` read the pack file as it is.
+(it finds its base in the pack by itself and is stored as a delta) → verify → restore. Every file is stored once,
+named by its SHA-256 and shared by every model that has it; `remove` deletes only what no other model still needs.
+Prefer a window? `python -I tools/llm_archive_gui.py packs` lists the models of the pack (or shows them by base) and does the rest
+with a few clicks. Just one model in one file? `python -I tools/llm_archive.py pack models/Qwen2.5-0.5B
+Qwen2.5-0.5B.oczip`. Every command can report progress and print JSON lines (`--progress`, `--json`), for scripts and
+agents.
 
 Two forms of a pack / pack 的兩種形態:
 
-- **Pack folder (`.ocz` + `manifest.json`, one folder per model): for upkeep.** Add, re-pack or rebase one model at a
-  time; models share data within the folder.
-  **pack 資料夾：便於高效能維護。** 每個模型一個資料夾，可逐一新增、重新打包或 rebase；模型之間在資料夾內共用資料。
-- **Pack file (`.oczip`, one ZIP file): for cold storage.** Written once and verified; copy it, add repair data, shelve
-  it. `verify` and `restore` read it as it is.
-  **pack 檔：便於冷儲存管理。** 一次寫完並驗證；方便複製、加修復資料、離線保存；`verify` 與 `restore` 可直接讀取。
+- **Pack folder (`ocpack.json`, `models/`, `blobs/`): for upkeep.** Add, re-pack, remove, rename or rebase models one
+  change at a time.
+  **pack 資料夾：便於高效能維護。** 逐一新增、重新打包、移除、改名或 rebase 模型。
+- **Pack file (`.oczip`, the same tree in one ZIP file): for cold storage.** Made by `pack` or `export`, written once;
+  copy it, shelve it. `list`, `verify` and `restore` read it as it is.
+  **pack 檔：便於冷儲存管理。** 由 `pack` 或 `export` 一次寫成；方便複製、離線保存；`list`、`verify` 與 `restore` 可直接讀取。
 
 → **[Usage / 使用方式（中英對照）](docs/usage.md)**
 
@@ -99,9 +101,9 @@ Needs CPython 3.13 with numpy and zstandard, both available as prebuilt wheels: 
 
 ## Protecting the archive / 防護與修復
 
-OverCompressing detects damage but leaves repair to you: several copies, PAR2, RAR recovery records, ZFS/Btrfs/ReFS,
-optical ECC or tape all work. **[docs/protection.md](docs/protection.md)** (中英對照) compares them and lists what matters for
-an archive with deltas (protect bases most, rebuild repair data after a re-pack or rebase).
+OverCompressing detects damage but leaves repair to the storage: RAID, ECC, ZFS/Btrfs/ReFS, several copies, optical
+ECC or tape. **[docs/protection.md](docs/protection.md)** (中英對照) compares them and lists what matters for a pack
+with deltas (protect bases most, rebuild repair data after a change).
 
 ## Archive format / 歸檔格式
 
@@ -111,8 +113,8 @@ without this tool: **[tools/ARCHIVE_FORMAT.md](tools/ARCHIVE_FORMAT.md)**.
 ## Repository layout / 目錄結構
 
 ```
-tools/llm_archive.py       the archiver (pack / rebase / verify / restore / bundle)
-tools/llm_archive_gui.py   a small window (Tkinter) for pack, bundle, verify and restore
+tools/llm_archive.py       the archiver (pack / list / verify / restore / remove / rename / rebase / export)
+tools/llm_archive_gui.py   a small window (Tkinter): a pack as the list of its models, and the actions above
 tools/ARCHIVE_FORMAT.md    format specification
 tools/compare_tensors.py   how well a fine-tune lines up with a base
 tools/test_*.py            self-tests (ans16 coder, formats, conversions)

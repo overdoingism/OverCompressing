@@ -38,6 +38,7 @@ echo "restore environment OK"
 
 ARCHIVE=$(dirname "$KIT")
 echo
-echo "Restore a model:   $VENV/bin/python -I $KIT/tools/llm_archive.py restore $ARCHIVE/<model folder> <dest_dir>"
+echo "List the models:   $VENV/bin/python -I $KIT/tools/llm_archive.py list $ARCHIVE"
+echo "Restore a model:   $VENV/bin/python -I $KIT/tools/llm_archive.py restore $ARCHIVE <model name> <dest_dir>"
 echo "Check the pack:    $VENV/bin/python -I $KIT/tools/llm_archive.py verify $ARCHIVE"
 echo "Or use a window:  $VENV/bin/python -I $KIT/tools/llm_archive_gui.py"

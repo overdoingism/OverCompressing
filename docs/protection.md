@@ -2,20 +2,26 @@
 
 **English** · [中文](#防護與修復建議)
 
-OverCompressing **detects** damage — every stored file has a SHA-256, every frame a CRC-32, and `verify` checks the
-whole dependency chain — but it does **not repair** it. Repair is left to whatever protection fits your storage; this
-page compares common options and lists what matters for this kind of archive.
+OverCompressing **detects** damage — every stored file (blob) ends with its own SHA-256, every frame has a CRC-32,
+and `verify` checks the whole chain of bases — but it does **not repair** it. Bit-level damage is the job of the
+hardware and the file system (RAID, ECC, ZFS/Btrfs/ReFS); if those cannot stop it, little else will. This page
+compares common options and lists what matters for this kind of pack.
 
 ## What matters for this archive
 
-1. **Protect bases more than anything else.** A fine-tune stored as a delta, and any file stored as a `same`
-   reference, cannot be restored without the files they point to. A damaged base shard breaks every model built on
-   it, so give base repos the most copies or redundancy.
-2. **Regenerate repair data after every re-pack.** `pack` and `rebase` rewrite a repo's stored files; recovery data
-   made earlier now describes old contents, and using it would "repair" files back to them. OverCompressing never
-   deletes files it did not create, so remove or rebuild such data yourself.
-3. **Protect `_kit/` too**, and keep a copy of it with every copy of the archive.
-4. **Verify regularly and after every repair**: `python -I tools/llm_archive.py verify <pack_folder>`.
+1. **Protect bases more than anything else.** A fine-tune stored as a delta cannot be restored without the blobs it
+   is coded against, and a file several models share is one blob. A damaged base blob breaks every model built on
+   it, so give the pack the most copies or redundancy you can.
+2. **Regenerate repair data after every change.** `pack`, `remove` and `rebase` add, replace and delete blobs;
+   recovery data made earlier now describes old contents. OverCompressing never deletes files it did not create, so
+   remove or rebuild such data yourself. A pack file never changes: make its repair data once.
+3. **Protect `_kit/` too**, and keep a copy of it with every copy of the pack.
+4. **Verify regularly and after every repair**: `python -I tools/llm_archive.py verify <pack>`.
+5. **When verify fails, read its damage report** (usage, section 4): it says which blobs are at fault, which files
+   are lost because of them (their own blob, or one they are coded against), and what to do. Storing the original of
+   a file again (`pack … --add --file`) heals it and everything coded against it, so keep, or know where to get,
+   the originals of your bases; the report gives each lost file's SHA-256 to find it by. What cannot be healed can be
+   given up with `remove`, or in the window with − Clean up.
 
 ## Options
 
@@ -31,37 +37,23 @@ page compares common options and lists what matters for this kind of archive.
 A sensible combination for a model collection: two or more copies on different media (one off-site), PAR2 or a
 self-healing file system on each, and a periodic `verify`.
 
-## Example: PAR2 per repo
+## Example: PAR2 for a pack file
 
-Run inside one repo directory of the archive (e.g. `archive/Qwen__Qwen2.5-7B/`). Protect `manifest.json` and every
-stored file, i.e. the `stored` field of each manifest entry:
-
-```bash
-# list the files to protect
-python -c "import json; m = json.load(open('manifest.json')); print('\n'.join(['manifest.json'] + [e['stored'] for e in m['files'] if e.get('stored')]))" > protect.txt
-
-# create 5 % recovery data (bash)
-xargs -d '\n' par2 create -r5 -n1 -B. recovery.par2 < protect.txt
-```
-
-```powershell
-# create 5 % recovery data (PowerShell)
-par2 create -r5 -n1 -B. recovery.par2 (Get-Content protect.txt)
-```
-
-Later:
+A pack file (`.oczip`) is one file that never changes: the simplest thing to protect. Next to it:
 
 ```bash
-par2 verify recovery.par2                                          # detect
-par2 repair recovery.par2                                          # repair
-python -I <path>/llm_archive.py verify <pack_folder>/<model folder>  # confirm with OverCompressing
+par2 create -r5 -n1 models.oczip.par2 models.oczip                # create 5 % recovery data
+par2 verify models.oczip.par2                                      # detect
+par2 repair models.oczip.par2                                      # repair
+python -I <path>/llm_archive.py verify models.oczip                # confirm with OverCompressing
 ```
 
-During development, a single flipped byte in a 630 MB container was found and repaired this way with 5 % PAR2 data
+During development, a single flipped byte in a 630 MB stored file was found and repaired this way with 5 % PAR2 data
 (par2cmdline 1.4.0: 1 of 1991 blocks damaged, repaired, SHA-256 restored).
 
-After repairing, par2 leaves the damaged originals as `*.1` files; delete them once `verify` passes. After a re-pack
-or a `rebase` that changed the repo, delete `recovery*.par2` and create it again.
+After repairing, par2 leaves the damaged original as a `*.1` file; delete it once `verify` passes. For a pack folder
+that is still changing, a self-healing file system or copies fit better than PAR2, which would have to be rebuilt
+after every change.
 
 ---
 
@@ -69,17 +61,22 @@ or a `rebase` that changed the repo, delete `recovery*.par2` and create it again
 
 [English](#protecting-the-archive) · **中文**
 
-OverCompressing 只負責**偵測**損毀：每個儲存檔都有 SHA-256、每個區塊都有 CRC-32，`verify` 會檢查整條依賴鏈。
-它**不負責修復**。修復交給最適合你儲存方式的方案；本頁比較常見的做法，並列出這類歸檔需要特別注意的地方。
+OverCompressing 只負責**偵測**損毀：每個儲存檔（blob）結尾都有它自己的 SHA-256、每個區塊都有 CRC-32，`verify` 會檢查整條
+基底鏈。它**不負責修復**。位元層級的損毀是硬體與檔案系統（RAID、ECC、ZFS/Btrfs/ReFS）的工作；如果它們擋不住，其他方案也幫不了
+多少。本頁比較常見的做法，並列出這類 pack 需要特別注意的地方。
 
 ## 這類歸檔要注意的事
 
-1. **base 最需要保護。** 以 delta 或 `same` 引用儲存的檔案，少了它指向的檔案就無法還原；base 的一個分片損毀，
-   會連帶影響所有以它為基礎的模型，所以 base repo 應該有最多副本或最高冗餘。
-2. **每次重新打包後都要重建修復資料。** `pack` 與 `rebase` 會改寫該 repo 的儲存檔，舊的修復資料描述的是舊內容，
-   拿它修復會把檔案改回舊版。本工具不會刪除不是它建立的檔案，請自行移除或重建。
-3. **`_kit/` 也要保護**，每一份歸檔副本都要附上它。
-4. **定期驗證，修復後也要驗證**：`python -I tools/llm_archive.py verify <pack_folder>`。
+1. **base 最需要保護。** 以差異方式存放的微調模型，少了它所依據的 blob 就無法還原；多個模型共用的檔案也只有一個 blob。
+   base 的一個 blob 損毀，會連帶影響所有以它為基礎的模型，所以請給 pack 盡可能多的副本或冗餘。
+2. **每次變更後都要重建修復資料。** `pack`、`remove` 與 `rebase` 會新增、取代、刪除 blob，舊的修復資料描述的是舊內容。
+   本工具不會刪除不是它建立的檔案，請自行移除或重建。pack 檔永遠不會改變：修復資料做一次就好。
+3. **`_kit/` 也要保護**，每一份 pack 副本都要附上它。
+4. **定期驗證，修復後也要驗證**：`python -I tools/llm_archive.py verify <pack>`。
+5. **verify 失敗時，請看它的損毀報告**（使用說明第 4 節）：它會說明哪些 blob 出了問題、哪些檔案因此遺失（自己的 blob 壞了，
+   或它所依據的 blob 壞了），以及該怎麼處理。把檔案的原檔重新存進去（`pack … --add --file`），它和所有以它為基礎的檔案都會
+   一起恢復，所以請保留 base 的原檔，或至少知道去哪裡取得；報告會列出每個遺失檔案的 SHA-256，方便找回。救不回來的，可以用
+   `remove` 放棄，或在視窗中用 − Clean up 處理。
 
 ## 方案比較
 
@@ -94,34 +91,19 @@ OverCompressing 只負責**偵測**損毀：每個儲存檔都有 SHA-256、每�
 
 建議組合：兩份以上、不同媒體（其中一份放在異地），每份再搭配 PAR2 或自我修復檔案系統，並定期 `verify`。
 
-## 範例：每個 repo 一份 PAR2
+## 範例：為 pack 檔加上 PAR2
 
-在歸檔的某個 repo 資料夾內執行（例如 `archive/Qwen__Qwen2.5-7B/`），保護 `manifest.json` 與每個儲存檔
-（也就是 manifest 中各項的 `stored` 欄位）：
-
-```bash
-# 列出要保護的檔案
-python -c "import json; m = json.load(open('manifest.json')); print('\n'.join(['manifest.json'] + [e['stored'] for e in m['files'] if e.get('stored')]))" > protect.txt
-
-# 建立 5% 修復資料（bash）
-xargs -d '\n' par2 create -r5 -n1 -B. recovery.par2 < protect.txt
-```
-
-```powershell
-# 建立 5% 修復資料（PowerShell）
-par2 create -r5 -n1 -B. recovery.par2 (Get-Content protect.txt)
-```
-
-之後：
+pack 檔（`.oczip`）是一個永遠不會改變的檔案，最容易保護。在它旁邊執行：
 
 ```bash
-par2 verify recovery.par2                                          # 檢查
-par2 repair recovery.par2                                          # 修復
-python -I <路徑>/llm_archive.py verify <pack_folder>/<模型資料夾>  # 用本工具確認
+par2 create -r5 -n1 models.oczip.par2 models.oczip                # 建立 5% 修復資料
+par2 verify models.oczip.par2                                      # 檢查
+par2 repair models.oczip.par2                                      # 修復
+python -I <路徑>/llm_archive.py verify models.oczip                # 用本工具確認
 ```
 
-開發期間實測：630 MB 容器檔中翻轉 1 個 byte，用 5% 的 PAR2 資料（par2cmdline 1.4.0）成功找出並修復（1991 個區塊
+開發期間實測：630 MB 儲存檔中翻轉 1 個 byte，用 5% 的 PAR2 資料（par2cmdline 1.4.0）成功找出並修復（1991 個區塊
 壞 1 個），SHA-256 恢復正確。
 
-修復後 par2 會把損毀的原檔留成 `*.1`，`verify` 通過後再刪除。重新打包後，或 `rebase` 改變了該 repo 之後，請刪除
-`recovery*.par2` 並重新建立。
+修復後 par2 會把損毀的原檔留成 `*.1`，`verify` 通過後再刪除。仍在變動中的 pack 資料夾，比起每次變更後都得重建的 PAR2，
+更適合用自我修復檔案系統或多份副本。

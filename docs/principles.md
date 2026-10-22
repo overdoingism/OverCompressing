@@ -87,20 +87,21 @@ ans16 delta above half the original size), and the smaller is kept, so a weak ba
 
 ### Which base
 
-Unless `--base` names one, each file chooses its own base. The candidates are the archived models whose manifests
+Unless `--base` names one, each file chooses its own base. The candidates are the packed models whose manifests
 list tensors that match this file's by the rules above, so finding them decompresses nothing. Then 16 windows of
 512 KiB, spread over the file's tensor bytes, are coded against each candidate with fast estimates (the empirical
 entropy of the ans16 residual given its context, or zstd of the XOR) and compared with an estimate of storing them
 standalone (for floats, the entropy of each byte plane). Only the regions of a candidate that the windows touch are
 decoded, through its own chain of deltas, and an ans16 region only up to the window's end. All candidates are scored
-on 4 windows, the best 4 on all 16. The smallest estimate wins if it saves at least 1 % of the standalone size; a tie
-goes to the base with the shorter reference chain. Models that need the one being packed are never candidates, so no
-cycle can form.
+on 4 windows, the best 4 on all 16. The smallest estimate wins if it saves at least 1 % of the standalone size.
+A blob is never coded against one that needs it (directly or through others), so no cycle can form.
 
 ## 5. Identical files
 
-A file larger than 1 MiB whose SHA-256 is already in the archive (a shared tokenizer, a re-uploaded GGUF) is stored
-as a reference to that copy.
+Every file is stored once, as a blob named by its SHA-256: a file already in the pack (a shared tokenizer, a
+re-uploaded GGUF, a config two models have) is not stored again, only listed in the new model's manifest. A delta
+blob names the blobs it is coded against, so what needs what is a graph that grows as models are packed; removing a
+model deletes only the blobs no remaining model needs, directly or as a base.
 
 ## 6. Integrity
 
@@ -108,8 +109,8 @@ as a reference to that copy.
   hashes your source publishes, e.g. Hugging Face's, if you need provenance).
 - `pack` finishes a file only after decoding it back **from disk** to the same SHA-256; a failed ans16 delta is
   redone as an XOR delta.
-- Stored files carry their own SHA-256, every frame a CRC-32, every ans16 block a self-check. `verify` and `restore`
-  check the whole dependency chain (bases, references) before decoding, and refuse cyclic references.
+- Every blob ends with its own SHA-256, every frame has a CRC-32, every ans16 block a self-check. `verify` and
+  `restore` check the whole chain of bases before decoding, and refuse cycles.
 - Repair is not built in: damage is reported precisely, and [protection.md](protection.md) compares ways to make
   it repairable (copies, PAR2, self-healing file systems, …).
 

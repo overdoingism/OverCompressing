@@ -9,6 +9,7 @@ downloads. Every downloaded file is checked against the SHA-256 recorded below o
 
 import argparse
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -139,6 +140,12 @@ def main():
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         (shutil.copytree if os.path.isdir(src) else shutil.copyfile)(src, dst)
     print(f"  copied     {len(REPO_FILES)} files/folders from the repository")
+    sys.path.insert(0, os.path.join(REPO, "tools"))
+    import llm_archive  # noqa: E402  (for build_of: the kit has no git to ask)
+    builds = {name: llm_archive.build_of(os.path.join(REPO, "tools", name)) for name in ("llm_archive.py", "llm_archive_gui.py")}
+    with open(os.path.join(out, "tools", "BUILD"), "w", encoding="utf-8", newline="\n") as f:
+        json.dump(builds, f, indent=1)
+    print(f"  BUILD      {', '.join(f'{name} {build}' for name, build in builds.items())}")
     for rel, url, sha in DOWNLOADS:
         fetch(out, rel, url, sha, args.cache)
     for plat in WHEEL_PLATFORMS:

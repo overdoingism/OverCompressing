@@ -1,27 +1,35 @@
 """Lossless archiver for model folders. safetensors and GGUF files are split per tensor (float tensors: byte planes,
-the exponents entropy-coded; quantized tensors, metadata, text: zstd; other binaries: whichever is smaller). A tensor that
-also exists in a base model already in the pack (same name, in any of its files) is stored as a delta against it
-(ans16 for 16-bit floats), so different file names, headers, shardings and tensor orders still share data. Each file
-picks its base by sampling every model in the pack, unless --base names one or --no-base turns deltas off. Files
-larger than 1 MiB that are identical to one already in the pack are stored as a reference. See ARCHIVE_FORMAT.md.
+the exponents entropy-coded; quantized tensors, metadata, text: zstd; other binaries: whichever is smaller). A tensor
+that also exists in another model of the pack (same name, in any of its files) is stored as a delta against it (ans16
+for 16-bit floats), so different file names, headers, shardings and tensor orders still share data. Each file picks
+its base by sampling every model in the pack, unless --base names one or --no-base turns deltas off. See
+ARCHIVE_FORMAT.md.
 
-    python -I llm_archive.py pack    <source_dir> <pack_folder | new.oczip> [--name NAME] [--base MODEL | --no-base]
-                                     [--exclude GLOB ... | --file PATH ...]
-    python -I llm_archive.py rebase  (<model_folder> ... | <pack_folder> --all) [--base MODEL | --no-base] [--dry-run]
-    python -I llm_archive.py verify  <model_folder | pack_folder | pack_file> ...
-    python -I llm_archive.py restore <model_folder> <dest_dir> [--overwrite] [--file PATH ...] [--flat]
-    python -I llm_archive.py bundle  <pack_folder> <pack_file.oczip> [--verify | --no-verify] [--delete] [--overwrite]
+    python -I llm_archive.py pack    <source_dir> ... <pack_folder | new.oczip> [--name NAME] [--replace | --add]
+                                     [--base MODEL | --no-base] [--exclude GLOB ... | --file PATH ...]
+    python -I llm_archive.py list    <pack> [MODEL]
+    python -I llm_archive.py verify  <pack> [MODEL ...]
+    python -I llm_archive.py restore <pack> MODEL <dest_dir> [--overwrite] [--file PATH ...] [--flat]
+    python -I llm_archive.py remove  <pack_folder> MODEL ... [--file PATH ...] [--dry-run]
+    python -I llm_archive.py rename  <pack_folder> MODEL NEW_NAME | <pack_folder> MODEL --file PATH NEW_PATH
+    python -I llm_archive.py rebase  <pack_folder> (MODEL ... | --all) [--base MODEL | --no-base] [--dry-run]
+    python -I llm_archive.py export  <pack> <new.oczip> [MODEL ...] [--verify | --no-verify] [--delete]
 
-A pack is a folder (the pack folder) holding one folder per model: a model folder, with the model's manifest.json and
-its stored files. Models refer to one another by name within their pack folder. bundle puts a whole pack folder into
-one pack file (.oczip, a ZIP), which verify and restore read like the folder: <file.oczip>/<model folder> names a
-model in it. pack into a new .oczip packs into a folder of its own, then bundles it.
-llm_archive_gui.py is a small window for pack, bundle, verify and restore.
+A pack holds models. It is a folder (a pack folder: ocpack.json, models/, blobs/) or the same tree in one ZIP file (a
+pack file, .oczip), which list, verify and restore read where it lies. Every file is stored once, as a blob named by
+the SHA-256 of the original file and shared by every model that has it; a model is its manifest, the list of its
+files. A blob coded as a delta names the blobs it is coded against, so removing a model deletes only the blobs no
+remaining model needs. <pack> is a pack folder or a pack file; MODEL is a model's name (Org/Name).
+llm_archive_gui.py is a small window for all of this.
 
 The tool never downloads anything: get the model files however you like, then pack the folder. rebase re-chooses the
-bases of models already in the pack (e.g. after a closer ancestor was packed), restoring each file it re-packs.
+bases of models already in the pack (e.g. after a closer ancestor was packed, or a base was removed).
 
-Damage is detected (SHA-256 / CRC) but not repaired here; see docs/protection.md for ways to add repair data.
+Every command prints one line per result (a file packed, verified or restored, a model listed) and a summary; with
+--json each of these lines is a JSON object instead, for programs and agents. --progress (on by default when stderr
+is a terminal) reports on stderr, about once a second, how far the current step is.
+
+Damage is detected (SHA-256 / CRC) but not repaired here; see docs/protection.md.
 ans16 deltas restore their base into a temporary file, and rebase the file it re-packs: OC_TMP picks their folder
 (default: the system temp folder). OC_WORKERS caps the worker processes used by ans16 (default: one per CPU).
 """
@@ -41,8 +49,10 @@ import secrets
 import shutil
 import stat
 import struct
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 import zlib
@@ -52,17 +62,109 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import numpy as np
 import zstandard
 
-TOOL_VERSION = "llm_archive 4"
-FORMAT_VERSION = 3
+VERSION = "0.5"  # of this command-line tool (the window has its own); raised by hand for changes people see
+FORMAT_VERSION = 4
 SKIP_DIRS = {".git", ".cache", "__MACOSX"}  # bookkeeping of git / download tools / macOS unzipping: not model files
 SKIP_FILES = {".hf_files.json", "thumbs.db", "desktop.ini", ".ds_store"}  # compared ignoring case: staging metadata of
 # earlier versions of this tool, and the folder-view caches Windows and macOS leave everywhere
-MAGIC = b"OCZ3"
+MAGIC = b"OCZ4"
 CODEC_RAW, CODEC_PLANES, CODEC_ZSTD, CODEC_ANS16 = 0, 1, 2, 3
 CODEC_NAMES = ["raw", "planes", "zstd", "ans16"]
 FRAME_HEAD = struct.Struct("<BQQI")  # codec, raw_len, payload_len, crc32 of the original chunk
 FLOAT_DTYPES = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1, "F8_E5M2": 1}  # float dtypes coded as byte planes
-RAW_COPY_LIMIT = 1 << 20  # files at or below this size are stored as-is
+
+
+# ----------------------------------------------------------------------------------------------- output
+#
+# Results go to stdout, one line each; with --json every line is a JSON object {"event", "text", ...}, "text" being
+# the line people would see. Progress goes to stderr, so a program reading the results never has to tell them apart.
+
+JSON_OUT = False
+
+
+def say(text, event="note", **fields):
+    """One line of output: `text`, or with --json the object {"event": event, "text": text, **fields}."""
+    line = json.dumps({"event": event, "text": text, **fields}) if JSON_OUT else text
+    with PROGRESS.lock:
+        PROGRESS.clear()
+        print(line, flush=True)
+
+
+class Progress:
+    """How far the running step is, reported on stderr about once a second by a thread of its own, so that a step
+    with nothing to count (choosing a base, preparing one) still shows it is alive: the step, the bytes done of its
+    total when that is known, what it is working on, and how long it has run. Silent unless started (--progress)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.tty = False
+        self.step = self.item = self.total = None
+        self.done, self.since, self.shown = 0, time.monotonic(), 0
+
+    def start(self):
+        """Report from now on: on a terminal one line rewritten in place, else a line each time (a JSON object with
+        --json)."""
+        self.tty = sys.stderr.isatty() and not JSON_OUT
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def begin(self, step, total=None, item=None):
+        """A new step, and the bytes it will count (None: not known)."""
+        with self.lock:
+            self.step, self.total, self.item, self.done, self.since = step, total, item, 0, time.monotonic()
+
+    def at(self, item):
+        with self.lock:
+            self.item = item
+
+    def add(self, n):
+        with self.lock:
+            self.done += n
+
+    def end(self):
+        with self.lock:
+            self.step = None
+            self.clear()
+
+    def run(self):
+        while True:
+            time.sleep(1)
+            try:
+                self.report()
+            except (OSError, ValueError):  # stderr went away (the window that ran this closed it)
+                return
+
+    def report(self):
+        with self.lock:
+            if self.step is None:
+                return
+            seconds = int(time.monotonic() - self.since)
+            if JSON_OUT:
+                line = json.dumps({"event": "progress", "step": self.step, "item": self.item, "done": self.done,
+                                   "total": self.total, "seconds": seconds})
+            else:
+                parts = [self.step]
+                if self.total:
+                    parts.append(f"{min(self.done / self.total, 1):.0%} of {human(self.total)}")
+                if self.item:
+                    parts.append(self.item)
+                line = "  ".join(parts + [f"{seconds // 60}:{seconds % 60:02d}"])
+            if self.tty:
+                line = line[:max(20, shutil.get_terminal_size().columns - 1)]
+                sys.stderr.write("\r" + line + " " * max(0, self.shown - len(line)))
+                self.shown = len(line)
+            else:
+                sys.stderr.write(line + "\n")
+            sys.stderr.flush()
+
+    def clear(self):
+        """Take the progress line off a terminal before other output goes there (the lock is held)."""
+        if self.tty and self.shown:
+            sys.stderr.write("\r" + " " * self.shown + "\r")
+            sys.stderr.flush()
+            self.shown = 0
+
+
+PROGRESS = Progress()
 
 
 def repo_dir_name(repo_id):
@@ -71,13 +173,13 @@ def repo_dir_name(repo_id):
 
 NAME_CHARS = "-_.+@()[] "  # besides letters and digits (any script)
 WINDOWS_DEVICES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
-RESERVED_FOLDERS = {"_kit"}  # the offline kit lives next to the models
 
 
 def name_problem(repo):
     """None if `repo` can name a model, else why not. A name is one or more parts separated by "/" (e.g.
     Qwen/Qwen2.5-7B), each made of letters, digits and -_.+@()[] or spaces, not starting or ending with a space, not
-    ending with a dot (so never "." or ".."), and not a Windows device name; its folder must not be _kit."""
+    ending with a dot (so never "." or ".."), and not a Windows device name, so that its manifest file
+    (models/<Org__Name>.json) can be named on every system."""
     if not isinstance(repo, str) or not repo:
         return "a model name cannot be empty"
     for part in repo.split("/"):
@@ -87,8 +189,8 @@ def name_problem(repo):
             return f"bad model name {repo!r}: use letters, digits, {NAME_CHARS.strip()} and spaces, with / between parts"
         if part.split(".")[0].upper() in WINDOWS_DEVICES:
             return f"bad model name {repo!r}: {part} is a reserved file name on Windows"
-    if repo_dir_name(repo).lower() in RESERVED_FOLDERS or len(repo_dir_name(repo)) > 200:
-        return f"bad model name {repo!r}: reserved, or too long"
+    if len(repo_dir_name(repo)) > 200:
+        return f"bad model name {repo!r}: too long"
     return None
 
 
@@ -101,16 +203,6 @@ def path_problem(path):
     for part in path.split("/"):
         if part in ("", ".", "..") or "\0" in part:
             return f"unsafe file path {path!r}"
-    return None
-
-
-def stored_problem(path):
-    """None if `path`, the name of a stored file inside a model folder, is safe to open on this system: path_problem,
-    and no "\\" (a separator on Windows); on Windows also no ":" and no part ending in a dot or space. pack and rebase
-    only write names that pass on every system (StoredNames)."""
-    problem = path_problem(path)
-    if problem or "\\" in path or (os.name == "nt" and any(":" in p or p[-1] in ". " for p in path.split("/"))):
-        return problem or f"stored file name {path!r} cannot be used on this system"
     return None
 
 
@@ -129,12 +221,6 @@ def windows_part(part):
     return name
 
 
-def portable_path(path):
-    """A path valid on Windows and on POSIX systems: the base of stored file names, so an archive can be copied
-    between systems."""
-    return "/".join(windows_part(p) for p in path.split("/"))
-
-
 def local_parts(path):
     """The parts of an original path as this system can name them: changed by windows_part on Windows, as they are
     elsewhere (POSIX allows every character but "/" and NUL)."""
@@ -143,7 +229,8 @@ def local_parts(path):
 
 
 DELTA_FORMATS = ("safetensors", "gguf")
-METHODS = {"raw", "same", "zstd", "auto", *DELTA_FORMATS, *(f"{f}+{k}" for f in DELTA_FORMATS for k in ("ans16", "xor"))}
+MANIFEST_FORMAT, PACK_FORMAT = "overcompressing-model", "overcompressing-pack"
+BASE_CHOICES = ("auto", "forced", "none")
 
 
 def is_sha256(value):
@@ -154,38 +241,42 @@ def is_size(value):
     return type(value) is int and value >= 0
 
 
+def tensors_problem(tensors, size):
+    """None if `tensors` is a tensor table base selection can use: [name, dtype, start, end, shape] for each tensor,
+    inside a file of `size` bytes; else why not."""
+    if not isinstance(tensors, list):
+        return "no tensor table"
+    for t in tensors:
+        if not (isinstance(t, list) and len(t) == 5 and isinstance(t[0], str) and isinstance(t[1], str)
+                and is_size(t[2]) and is_size(t[3]) and t[2] <= t[3] <= size
+                and isinstance(t[4], list) and all(is_size(d) for d in t[4])):
+            return f"bad tensor {str(t)[:80]}"
+    return None
+
+
 def entry_problem(e):
-    """None if a manifest entry can be used: a safe path, its size and SHA-256, a known method and what that method
-    needs (same: the file it refers to; any other: its stored file, with size and SHA-256; a delta: its base files)."""
+    """None if a manifest entry can be used: a safe path, the original file's size and SHA-256 (which also name the
+    blob that stores it) and, for a parsed file, its format and tensor table."""
     if not isinstance(e, dict):
         return "an entry of the manifest is not an object"
     problem = path_problem(e.get("path"))
     if problem:
         return problem
-    where, method = repr(e["path"]), e.get("method")
+    where = repr(e["path"])
     if not is_size(e.get("size")) or not is_sha256(e.get("sha256")):
         return f"{where}: missing or bad size or sha256"
-    if not isinstance(method, str) or method not in METHODS:
-        return f"{where}: unknown method {method!r}"
-    if method == "same":
-        ref = e.get("same_as")
-        if not isinstance(ref, dict):
-            return f"{where}: same_as is missing"
-        return name_problem(ref.get("repo")) or path_problem(ref.get("path"))
-    if not isinstance(e.get("stored"), str) or not is_size(e.get("stored_size")) or not is_sha256(e.get("stored_sha256")):
-        return f"{where}: missing or bad stored, stored_size or stored_sha256"
-    problem = stored_problem(e["stored"])
-    if problem or "+" not in method:
-        return problem
-    files = e.get("delta_files")
-    if not isinstance(files, list) or not files or not all(isinstance(f, dict) and is_sha256(f.get("sha256")) for f in files):
-        return f"{where}: missing or bad delta_files"
-    return name_problem(e.get("delta_base")) or next((p for p in map(path_problem, (f.get("path") for f in files)) if p), None)
+    if "format" in e or "tensors" in e:
+        problem = "unknown format" if e.get("format") not in DELTA_FORMATS else tensors_problem(e.get("tensors"), e["size"])
+        if problem:
+            return f"{where}: {problem}"
+    if e.get("base_choice", "auto") not in BASE_CHOICES:
+        return f"{where}: unknown base_choice {e.get('base_choice')!r}"
+    return None
 
 
 def manifest_problem(manifest):
-    """None if a manifest can be used: its model name, every entry (entry_problem), and no path listed twice. Any
-    JSON value gives an answer, never an exception."""
+    """None if a manifest can be used: this format, its model name, every entry (entry_problem), and no path listed
+    twice. Any JSON value gives an answer, never an exception."""
     try:
         return _manifest_problem(manifest)
     except (TypeError, ValueError, KeyError, AttributeError) as e:  # a shape the checks above did not foresee
@@ -195,9 +286,13 @@ def manifest_problem(manifest):
 def _manifest_problem(manifest):
     if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), list):
         return "malformed manifest: no list of files"
-    problem = name_problem(manifest.get("repo"))
+    if manifest.get("format") != MANIFEST_FORMAT or manifest.get("format_version") != FORMAT_VERSION:
+        return f"not a model manifest of format version {FORMAT_VERSION}"
+    problem = name_problem(manifest.get("name"))
     if problem:
         return problem
+    if manifest.get("base_choice", "auto") not in BASE_CHOICES:
+        return f"unknown base_choice {manifest.get('base_choice')!r}"
     seen = set()
     for e in manifest["files"]:
         problem = entry_problem(e)
@@ -209,15 +304,18 @@ def _manifest_problem(manifest):
     return None
 
 
-def sha256_file(path):
+def sha256_file(path, counted=False):
     with open(path, "rb") as f:
-        return sha256_stream(f)
+        return sha256_stream(f, counted)
 
 
-def sha256_stream(f):
+def sha256_stream(f, counted=False):
+    """counted: the bytes go to the progress report."""
     h = hashlib.sha256()
     while block := f.read(16 << 20):
         h.update(block)
+        if counted:
+            PROGRESS.add(len(block))
     return h.hexdigest()
 
 
@@ -450,7 +548,7 @@ def checked_candidate(codec, make, data, dtype):
         if len(payload) < len(data) and decode_payload(codec, payload, len(data), dtype) == data:
             return payload
     except Exception as e:  # a codec bug must never cost data: the caller falls back to another codec
-        print(f"    {CODEC_NAMES[codec]} failed self-check ({type(e).__name__}); falling back")
+        say(f"    {CODEC_NAMES[codec]} failed self-check ({type(e).__name__}); falling back")
     return None
 
 
@@ -988,31 +1086,41 @@ def _ans16_decode_job(job):
     return ans16_decode(base, payload, dtype).tobytes()
 
 
-# ----------------------------------------------------------------------------------------------- container I/O
+# ----------------------------------------------------------------------------------------------- blobs
+#
+# Every file a pack stores is a blob: one OCZ4 container, named by the SHA-256 of the original file and shared by
+# every model that has that file. Its header says how to restore it, including the blobs it is coded against (its
+# bases, by SHA-256); its last 32 bytes are the SHA-256 of all its bytes before them, so a blob shows its own damage
+# before any decoder reads it. Byte-level spec: ARCHIVE_FORMAT.md.
 
 
 MAX_HEADER = 64 << 20  # bytes of container header JSON
 MAX_REGION = 1 << 30  # bytes one region restores to (--chunk-mib is at most 1024)
 MAX_REGIONS = 1 << 22
 REGION_KINDS = {"float", "zstd", "auto", "ans16", "xor"}
+TRAILER = 32  # the SHA-256 that ends a blob
 
 
 def container_header_problem(header):
-    """None if a container header can be used: regions that cover original_size in order without gaps, each within
-    MAX_REGION, of a known kind, and base references that point into the delta's files; else why not."""
-    if not isinstance(header, dict) or not is_size(header.get("original_size")):
-        return "no original_size"
-    regions, delta = header.get("regions"), header.get("delta")
+    """None if a container header can be used: the original file's size and SHA-256; bases, each a blob by the
+    SHA-256 and size of its file; regions that cover the file in order without gaps, each within MAX_REGION, of a
+    known kind, with base references only on delta regions and only into the bases; else why not."""
+    if not isinstance(header, dict) or not is_size(header.get("original_size")) or not is_sha256(header.get("sha256")):
+        return "no original_size or sha256"
+    regions, bases = header.get("regions"), header.get("bases")
     if not isinstance(regions, list) or len(regions) > MAX_REGIONS:
         return "no list of regions, or too many"
-    files = []
-    if delta is not None:
-        files = delta.get("files") if isinstance(delta, dict) else None
-        if (name_problem(delta.get("repo")) if isinstance(delta, dict) else True) or not isinstance(files, list) or not files \
-                or not all(isinstance(f, dict) and not path_problem(f.get("path")) and is_sha256(f.get("sha256")) for f in files):
-            return "malformed delta"
+    if not isinstance(bases, list) or not all(isinstance(b, dict) and is_sha256(b.get("sha256")) and is_size(b.get("size"))
+                                              for b in bases):
+        return "malformed bases"
+    if not isinstance(header.get("method", ""), str):
+        return "malformed method"
+    if header.get("partial", True) is not True:
+        return "malformed partial"
     pos = 0
     for r in regions:
+        if isinstance(r, dict) and "dropped" in r and (r["dropped"] is not True or header.get("partial") is not True):
+            return f"region at {pos}: dropped, but not in a partial blob"
         if not isinstance(r, dict) or not is_size(r.get("offset")) or r["offset"] != pos or not is_size(r.get("length")) or not 0 < r["length"] <= MAX_REGION \
                 or r.get("kind") not in REGION_KINDS or not isinstance(r.get("dtype", ""), str):
             return f"region at {pos} malformed, out of order or too long"
@@ -1020,35 +1128,42 @@ def container_header_problem(header):
         if (base is not None) != (r["kind"] in ("ans16", "xor")):
             return f"region at {pos}: a delta region needs a base reference, and only a delta region has one"
         if base is not None:
-            if not (isinstance(base, list) and len(base) == 2 and type(base[0]) is int and 0 <= base[0] < len(files) and is_size(base[1])):
+            if not (isinstance(base, list) and len(base) == 2 and type(base[0]) is int and 0 <= base[0] < len(bases) and is_size(base[1])):
                 return f"region at {pos}: bad base reference"
             if r.get("base_dtype", "BF16") not in FLOAT_BYTES or ("base_dtype" in r and r.get("dtype") not in ANS16_EXPONENT):
                 return f"region at {pos}: bad base_dtype"
             if r["kind"] == "ans16" and (r.get("dtype") not in ANS16_EXPONENT or r["length"] % 2):
                 return f"region at {pos}: bad ans16 region"
+            scale = FLOAT_BYTES[r["base_dtype"]] // FLOAT_BYTES[r["dtype"]] if "base_dtype" in r else 1
+            if base[1] + r["length"] * scale > bases[base[0]]["size"]:
+                return f"region at {pos}: its base bytes run past the end of the base file"
         pos += r["length"]
     return None if pos == header["original_size"] else "regions do not add up to original_size"
 
 
 def read_container(f, start=0, size=None):
-    """(header, [(codec, raw_len, payload offset, payload_len, crc)]) of an open container (the file f, or `size`
-    bytes of it from `start`, where a container lies in an .oczip; offsets count from there), checked before anything
-    is decoded: the header (container_header_problem), one frame per region restoring to exactly its length with a
-    codec that fits the region, every payload inside the file, and nothing after the last one. ValueError if not."""
+    """(header, [(codec, raw_len, payload offset, payload_len, crc), or None for a region a partial blob dropped]) of
+    an open container (the file f, or `size` bytes of it from `start`, where a blob lies in a pack file; offsets
+    count from there), checked before anything is decoded: the header (container_header_problem), one frame per region restoring to exactly its length with a
+    codec that fits the region, every payload inside the blob, and nothing after the last one but the blob's
+    SHA-256. ValueError if not."""
     size = os.fstat(f.fileno()).st_size - start if size is None else size
     f.seek(start)
     if f.read(4) != MAGIC:
         raise ValueError(f"not an {MAGIC.decode()} container")
     (n,) = struct.unpack("<I", f.read(4).ljust(4, b"\0"))
-    if n > min(MAX_HEADER, size - 8):
+    if n > min(MAX_HEADER, size - 8 - TRAILER):
         raise ValueError("container header too long for the file")
     header = strict_json(f.read(n))
     problem = container_header_problem(header)
     if problem:
         raise ValueError(f"container header: {problem}")
-    frames, pos = [], 8 + n
+    frames, pos, end = [], 8 + n, size - TRAILER
     for region in header["regions"]:
-        if pos + FRAME_HEAD.size > size:
+        if region.get("dropped"):  # a partial blob keeps no frame for it
+            frames.append(None)
+            continue
+        if pos + FRAME_HEAD.size > end:
             raise ValueError("container cut short")
         f.seek(start + pos)
         codec, raw_len, payload_len, crc = FRAME_HEAD.unpack(f.read(FRAME_HEAD.size))
@@ -1056,326 +1171,452 @@ def read_container(f, start=0, size=None):
         kind = codec & ~STANDALONE
         fits = (kind in (CODEC_RAW, CODEC_ZSTD) or (kind == CODEC_PLANES and region_planes_dtype(region))
                 or (codec == CODEC_ANS16 and region["kind"] == "ans16")) and not (codec & STANDALONE and "base" not in region)
-        if raw_len != region["length"] or not fits or payload_len > size - pos:
+        if raw_len != region["length"] or not fits or payload_len > end - pos:
             raise ValueError(f"container frame at {region['offset']} does not fit its region")
         frames.append((codec, raw_len, pos, payload_len, crc))
         pos += payload_len
-    if pos != size:
-        raise ValueError("bytes after the last frame of the container")
+    if pos != end:
+        raise ValueError("bytes after the last frame of the container, other than its SHA-256")
     return header, frames
 
 
-# ----------------------------------------------------------------------------------------------- reading an archive
+def blob_damage(span, sha):
+    """Why the bytes at span (path, start, size) are not an intact blob of the file `sha`, or None: its last 32 bytes
+    must be the SHA-256 of the rest, its container valid (read_container) and its header naming that file."""
+    path, start, size = span
+    try:
+        with open(path, "rb") as f:
+            if size < 8 + TRAILER:
+                return "too short to be a blob"
+            f.seek(start)
+            h, left = hashlib.sha256(), size - TRAILER
+            while left:
+                block = f.read(min(left, 16 << 20))
+                if not block:
+                    return "cut short"
+                h.update(block)
+                left -= len(block)
+            if f.read(TRAILER) != h.digest():
+                return "damaged (its SHA-256 does not match)"
+            header, _ = read_container(f, start, size)
+    except OSError as e:
+        return f"unreadable ({e.strerror or e})"
+    except ValueError as e:
+        return f"malformed ({e})"
+    if header["sha256"] != sha:
+        return "the blob of another file"
+    return None
+
+
+# ----------------------------------------------------------------------------------------------- packs
 #
-# An archive is a folder, or that folder in one .oczip file (a ZIP; see bundle). verify and restore read either.
-# Containers in an .oczip are stored uncompressed, so they are read where they lie in it; the other files
-# (manifests, files stored as-is) may be Deflate-compressed there and are read through zipfile.
+# A pack is a folder (FolderPack) or the same tree in one ZIP file (FilePack, read where it lies; NewFilePack while
+# pack writes a new one):
+#
+#     ocpack.json                   {"format": "overcompressing-pack", "format_version": 4}: what makes it a pack
+#     models/<Org__Name>.json       one manifest per model: the paths, sizes and SHA-256s of its files
+#     blobs/<ab>/<sha256>.ocz       one blob per distinct file, shared by every model that has that file
+#     _kit/                         the offline restore kit, if one was put there
+#
+# In a pack file the blobs are stored as they are (ZIP method 0) and read where they lie; the other members may be
+# Deflated. A model refers to nothing but its blobs, and a blob to nothing but the blobs it is coded against: what a
+# pack holds is a graph that grows as models are packed. The tool walks it when it needs to (to delete what no model
+# needs, to show what needs what) and never stores it.
 
 OCZIP = ".oczip"
-_ZIPS = {}  # .oczip path -> its ZipFile, opened once for the program's run
+MARKER = "ocpack.json"
+MODELS, BLOBS, KIT = "models", "blobs", "_kit"
+MARKER_JSON = {"format": PACK_FORMAT, "format_version": FORMAT_VERSION}
 MAX_MANIFEST = 256 << 20
 
 
-def is_oczip(archive_root):
-    return archive_root.lower().endswith(OCZIP)
+def is_oczip(path):
+    return path.lower().endswith(OCZIP)
 
 
-def oczip(archive_root):
-    """The ZipFile of a single-file archive; ValueError if it is not a ZIP, or names a file twice or unsafely."""
-    z = _ZIPS.get(archive_root)
-    if z is None:
+def blob_rel(sha):
+    return f"{BLOBS}/{sha[:2]}/{sha}.ocz"
+
+
+def blob_of(rel):
+    """The SHA-256 a pack member's path names as a blob, or None if it is not a blob's path."""
+    parts = rel.split("/")
+    if len(parts) == 3 and parts[0] == BLOBS and parts[2].endswith(".ocz"):
+        sha = parts[2][:-4]
+        if is_sha256(sha) and parts[1] == sha[:2]:
+            return sha
+    return None
+
+
+def manifest_rel(name):
+    return f"{MODELS}/{repo_dir_name(name)}.json"
+
+
+def name_key(name):
+    """Two model names with the same key would have one manifest file on Windows and macOS, which ignore case (and
+    "Org/Name" and "Org__Name" one everywhere), so a pack never holds both."""
+    return repo_dir_name(name).casefold()
+
+
+class FolderPack:
+    """A pack folder."""
+
+    kind = "pack folder"
+
+    def __init__(self, root):
+        self.root = os.path.abspath(root)
+
+    def full(self, rel):
+        return os.path.join(self.root, *rel.split("/"))
+
+    def read(self, rel, limit=MAX_MANIFEST):
+        with open(self.full(rel), "rb") as f:
+            data = f.read(limit + 1)
+        if len(data) > limit:
+            raise ValueError(f"{rel} is larger than {human(limit)}")
+        return data
+
+    def blob_span(self, sha):
+        path = self.full(blob_rel(sha))
+        return path, 0, os.path.getsize(path)
+
+    def blob_ids(self):
+        found = set()
+        with contextlib.suppress(FileNotFoundError, NotADirectoryError):
+            with os.scandir(self.full(BLOBS)) as folders:
+                for d in folders:
+                    if d.is_dir(follow_symlinks=False):
+                        with os.scandir(d.path) as files:
+                            found.update(blob_of(f"{BLOBS}/{d.name}/{e.name}") for e in files if e.is_file(follow_symlinks=False))
+        found.discard(None)
+        return found
+
+    def manifest_files(self):
         try:
-            z = zipfile.ZipFile(archive_root)
+            return sorted(n for n in os.listdir(self.full(MODELS)) if n.endswith(".json") and not n.startswith(".oc-"))
+        except (FileNotFoundError, NotADirectoryError):
+            return []
+
+    def leftovers(self):
+        """Temporary files (.oc-*.part) of runs that stopped without deleting them: in the pack's own folders only."""
+        found = []
+        for rel in ("", MODELS, BLOBS, *(f"{BLOBS}/{d}" for d in self._subfolders())):
+            with contextlib.suppress(FileNotFoundError, NotADirectoryError):
+                with os.scandir(self.full(rel) if rel else self.root) as entries:
+                    found += [f"{rel}/{e.name}" if rel else e.name for e in entries
+                              if e.name.startswith(".oc-") and e.name.endswith(".part") and e.is_file(follow_symlinks=False)]
+        return found
+
+    def _subfolders(self):
+        with contextlib.suppress(FileNotFoundError, NotADirectoryError):
+            with os.scandir(self.full(BLOBS)) as folders:
+                return [d.name for d in folders if d.is_dir(follow_symlinks=False)]
+        return []
+
+
+class FilePack:
+    """A pack file (.oczip), read where it lies and never written to (opened once per run: open_pack)."""
+
+    kind = "pack file"
+
+    def __init__(self, root):
+        self.root = os.path.abspath(root)
+        try:
+            self.zip = zipfile.ZipFile(self.root)
         except zipfile.BadZipFile as e:
             raise ValueError(f"not a readable pack file ({e})") from None
-        names = z.namelist()
+        names = self.zip.namelist()
         bad = next((n for n in names if path_problem(n.rstrip("/"))), None)
         if bad is not None or len(set(names)) != len(names):
-            z.close()
+            self.zip.close()
             raise ValueError(f"unsafe file name {bad!r} in it" if bad is not None else "a file name appears twice in it")
-        _ZIPS[archive_root] = z
-    return z
+        self.names = set(names)
+
+    def read(self, rel, limit=MAX_MANIFEST):
+        try:
+            with self.zip.open(rel) as f:
+                data = f.read(limit + 1)
+        except KeyError:
+            raise FileNotFoundError(errno.ENOENT, "not in the pack file", rel) from None
+        except (RuntimeError, NotImplementedError, zipfile.BadZipFile) as e:  # encrypted, an unknown method, a bad CRC
+            raise ValueError(f"{rel}: {e}") from None
+        if len(data) > limit:
+            raise ValueError(f"{rel} is larger than {human(limit)}")
+        return data
+
+    def blob_span(self, sha):
+        try:
+            info = self.zip.getinfo(blob_rel(sha))
+        except KeyError:
+            raise FileNotFoundError(errno.ENOENT, "not in the pack file", blob_rel(sha)) from None
+        return member_span(self.root, info)
+
+    def blob_ids(self):
+        return {sha for n in self.names if (sha := blob_of(n))}
+
+    def manifest_files(self):
+        return sorted(n.split("/", 1)[1] for n in self.names
+                      if n.startswith(MODELS + "/") and n.count("/") == 1 and n.endswith(".json"))
+
+    def close(self):
+        self.zip.close()
 
 
-def archive_file(archive_root, rel):
-    """rel ("/"-separated, inside the archive) opened for reading: from the folder, or from the .oczip."""
-    if not is_oczip(archive_root):
-        return open(os.path.join(archive_root, *rel.split("/")), "rb")
-    try:
-        return oczip(archive_root).open(rel)
-    except KeyError:
-        raise FileNotFoundError(errno.ENOENT, "not in the archive", rel) from None
-    except (RuntimeError, NotImplementedError) as e:  # encrypted, or compressed in a way zipfile cannot read
-        raise ValueError(f"{rel}: {e}") from None
-
-
-def container_span(archive_root, rel):
-    """(path, start, size): where the container rel lies on disk. In a folder, a file of its own; in an .oczip, its
-    bytes inside it, which must be stored uncompressed (ValueError otherwise)."""
-    if not is_oczip(archive_root):
-        path = os.path.join(archive_root, *rel.split("/"))
-        return path, 0, os.path.getsize(path)
-    try:
-        info = oczip(archive_root).getinfo(rel)
-    except KeyError:
-        raise FileNotFoundError(errno.ENOENT, "not in the archive", rel) from None
+def member_span(path, info):
+    """(path, start, size): where the bytes of a member stored as it is lie in the ZIP file at `path` (its local
+    header's offset plus 30 plus the lengths of its name and extra field); ValueError if it is compressed."""
     if info.compress_type != zipfile.ZIP_STORED or info.flag_bits & 1 or info.compress_size != info.file_size:
-        raise ValueError(f"{rel} is compressed or encrypted in the pack file: containers must be stored as they are")
-    with open(archive_root, "rb") as f:
+        raise ValueError(f"{info.filename} is compressed or encrypted in the pack file: blobs must be stored as they are")
+    with open(path, "rb") as f:
         f.seek(info.header_offset)
-        head = f.read(30)  # the ZIP local file header, then its name and extra field
+        head = f.read(30)
         end = os.fstat(f.fileno()).st_size
     if len(head) != 30 or head[:4] != b"PK\x03\x04":
-        raise ValueError(f"{rel}: no ZIP local header where the pack file says it is")
+        raise ValueError(f"{info.filename}: no ZIP local header where the pack file says it is")
     start = info.header_offset + 30 + sum(struct.unpack("<HH", head[26:30]))
     if start + info.file_size > end:
-        raise ValueError(f"{rel} runs past the end of the pack file")
-    return archive_root, start, info.file_size
+        raise ValueError(f"{info.filename} runs past the end of the pack file")
+    return path, start, info.file_size
 
 
-def model_folders(archive_root):
-    """The archive's top-level folders that hold a manifest.json, sorted."""
-    if is_oczip(archive_root):
-        return sorted({n[:-len("/manifest.json")] for n in oczip(archive_root).namelist()
-                       if n.endswith("/manifest.json") and n.count("/") == 1})
-    if not os.path.isdir(archive_root):
-        return []
-    return [d for d in sorted(os.listdir(archive_root)) if os.path.exists(os.path.join(archive_root, d, "manifest.json"))]
+class NewFilePack:
+    """A pack file being written (pack into a new .oczip): each blob goes in as it is made and is read back from the
+    unfinished file, to check it and as a base for the files after it; each manifest goes in when its model is done.
+    The file gets its name only once it is complete (SafeTree.placing)."""
+
+    kind = "pack file"
+
+    def __init__(self, f, root):
+        self.f, self.root, self.temp_path = f, root, f.temp_path
+        self.zip = zipfile.ZipFile(f, "w", allowZip64=True)
+        self.spans, self.members = {}, {}  # blob sha -> (start, size); other member -> its bytes
+        self.put(MARKER, json.dumps(MARKER_JSON).encode())
+
+    def put(self, rel, data):
+        info = zipfile.ZipInfo(rel, time.localtime()[:6])
+        info.compress_type = zipfile.ZIP_DEFLATED
+        self.zip.writestr(info, data)
+        self.members[rel] = data
+
+    def read(self, rel, limit=MAX_MANIFEST):
+        if rel not in self.members:
+            raise FileNotFoundError(errno.ENOENT, "not in the pack file", rel)
+        return self.members[rel]
+
+    def blob_span(self, sha):
+        if sha not in self.spans:
+            raise FileNotFoundError(errno.ENOENT, "not in the pack file", blob_rel(sha))
+        return (self.temp_path, *self.spans[sha])
+
+    def blob_ids(self):
+        return set(self.spans)
+
+    def manifest_files(self):
+        return sorted(rel.split("/", 1)[1] for rel in self.members if rel.startswith(MODELS + "/"))
 
 
-def read_manifest(archive_root, folder):
-    """The JSON of folder/manifest.json in the archive, unchecked; ValueError if it cannot be read as JSON."""
-    try:
-        with archive_file(archive_root, f"{folder}/manifest.json") as f:
-            data = f.read(MAX_MANIFEST + 1)
-    except zipfile.BadZipFile as e:  # a CRC mismatch inside the .oczip
-        raise ValueError(str(e)) from None
-    if len(data) > MAX_MANIFEST:
-        raise ValueError(f"larger than {human(MAX_MANIFEST)}")
-    return strict_json(data)
+_OPEN = {}  # pack file path -> its FilePack, opened once for the program's run
 
 
-def split_oczip(path):
-    """(the .oczip that `path` names or is inside, the "/"-separated rest of the path in it), or (None, None)."""
-    probe, rest = os.path.normpath(path), []
-    while True:
-        if is_oczip(probe) and os.path.isfile(probe):
-            return probe, "/".join(reversed(rest))
-        up = os.path.dirname(probe)
-        if not up or up == probe:
-            return None, None
-        rest.append(os.path.basename(probe))
-        probe = up
-
-
-def model_manifest(archive_root, folder):
-    """The manifest of model folder `folder` of an archive, checked (manifest_problem) and naming the model the folder
-    is named after; ValueError or OSError if the folder is not that."""
-    manifest = read_manifest(archive_root, folder)
-    problem = manifest_problem(manifest)
-    if not problem and os.path.normcase(repo_dir_name(manifest["repo"])) != os.path.normcase(folder):
-        problem = f"it holds the model {manifest['repo']!r}, whose folder is {repo_dir_name(manifest['repo'])}"
+def open_pack(path):
+    """The pack at `path`: a pack folder (FolderPack) or a pack file (FilePack). ValueError if it is neither, or a
+    pack of another format."""
+    if is_oczip(path) and os.path.isfile(path):
+        key = os.path.normcase(os.path.abspath(path))
+        if key not in _OPEN:
+            _OPEN[key] = FilePack(path)
+        p = _OPEN[key]
+    elif os.path.isdir(path):
+        p = FolderPack(path)
+    else:
+        raise ValueError(f"not a pack folder or a pack file ({OCZIP})")
+    problem = marker_problem(p)
     if problem:
         raise ValueError(problem)
-    return manifest
+    return p
 
 
-def model_at(path):
-    """(archive_root, model name) of the model whose folder `path` is: a folder holding its manifest.json, or
-    <file.oczip>/<folder> for one in an .oczip. Its archive is the folder (or .oczip) its folder is in, where the
-    models it refers to are found by name. ValueError if `path` is not a model folder."""
-    single, inner = split_oczip(path)
-    if single:
-        if not inner or "/" in inner:
-            raise ValueError(f"{path} is not a model folder of {single}")
-        root, folder = single, inner
-    else:
-        full = os.path.abspath(path)
-        if not os.path.isfile(os.path.join(full, "manifest.json")):
-            raise ValueError(f"{path} is not a model folder (no manifest.json in it)")
-        root, folder = os.path.dirname(full), os.path.basename(full)
+def marker_problem(p):
     try:
-        return root, model_manifest(root, folder)["repo"]
-    except OSError as e:
-        raise ValueError(f"{path}: {e.strerror or e}") from None
+        marker = strict_json(p.read(MARKER, 1 << 16))
+    except FileNotFoundError:
+        return f"not a pack (no {MARKER} in it)"
+    except (OSError, ValueError) as e:
+        return f"{MARKER} cannot be read ({e})"
+    if not isinstance(marker, dict) or marker.get("format") != PACK_FORMAT:
+        return f"its {MARKER} is not a pack's"
+    if marker.get("format_version") != FORMAT_VERSION:
+        return f"a pack of format version {marker.get('format_version')!r}: this tool reads version {FORMAT_VERSION}"
+    return None
 
 
-def archive_target(path):
-    """What verify (or rebase) is given, as (archive_root, [model name], or None for all its models): a model folder
-    (also one in an .oczip), an .oczip, or an archive folder (the folder holding model folders). ValueError if the
-    path is none of these."""
-    single, inner = split_oczip(path)
-    if single and not inner:
-        return single, None
-    if single or os.path.isfile(os.path.join(path, "manifest.json")):
-        root, repo = model_at(path)
-        return root, [repo]
-    if os.path.isdir(path):
-        return path, None
-    raise ValueError(f"{path} is not a folder or a pack file ({OCZIP})")
+def close_pack_files():
+    """Close the pack files opened for reading, so that another program may replace them."""
+    while _OPEN:
+        _OPEN.popitem()[1].close()
 
 
-def model_folder_of(path):
-    """(archive_root, folder) of the model folder `path` is or is inside: the nearest folder on the way up that holds
-    the manifest.json of the model named after it (a file of that name that is no model's manifest, e.g. a file a
-    model stores, is passed over). None if there is none."""
-    folder = os.path.abspath(path)
+def all_manifests(p, problems=None):
+    """{name: manifest} of every model of a pack. A manifest that cannot be read or trusted (manifest_problem; its
+    file must also be named after its model) goes to `problems` as (its path, the problem) if given; otherwise the
+    program stops, since the blobs that model needs would look unused."""
+    manifests, keys = {}, {}
+    for n in p.manifest_files():
+        rel = f"{MODELS}/{n}"
+        try:
+            manifest = strict_json(p.read(rel))
+            problem = manifest_problem(manifest)
+            if not problem and repo_dir_name(manifest["name"]) + ".json" != n:
+                problem = f"it is the manifest of {manifest['name']!r}, whose file is {manifest_rel(manifest['name'])}"
+            if not problem and name_key(manifest["name"]) in keys:  # e.g. in a pack file, names differing in case only
+                problem = f"{keys[name_key(manifest['name'])]} is the manifest of a model of that name already"
+        except (OSError, ValueError) as e:
+            problem = f"cannot read it ({e})"
+        if problem:
+            if problems is None:
+                sys.exit(f"{rel} in {p.root}: {problem}\nfix it, or move it out of the pack, before changing the pack")
+            problems.append((rel, problem))
+            continue
+        manifests[manifest["name"]] = manifest
+        keys[name_key(manifest["name"])] = rel
+    return manifests
+
+
+def model_named(manifests, given, p):
+    """The name of the model `given` names: its name (Org/Name), or its manifest's file name (Org__Name, with or
+    without .json), ignoring case if that leaves only one; stops if no model is named so."""
+    if given in manifests:
+        return given
+    stem = given[:-5] if given.lower().endswith(".json") else given
+    for same in (lambda n: repo_dir_name(n) == stem, lambda n: name_key(n) == name_key(stem)):
+        found = [n for n in manifests if same(n)]
+        if len(found) == 1:
+            return found[0]
+    sys.exit(f"no model named {given!r} in {p.root}" + (f" (it holds {', '.join(sorted(manifests)[:6])}"
+                                                         f"{', ...' if len(manifests) > 6 else ''})" if manifests else ""))
+
+
+def pack_folder_of(path):
+    """The pack folder `path` is or is inside (the nearest folder on the way up holding ocpack.json), or None."""
+    folder = os.path.realpath(path)
     while True:
-        if os.path.isfile(os.path.join(folder, "manifest.json")):
-            root, name = os.path.dirname(folder), os.path.basename(folder)
-            try:
-                model_manifest(root, name)
-                return root, name
-            except (OSError, ValueError):
-                pass
+        if os.path.isfile(os.path.join(folder, MARKER)):
+            return folder
         up = os.path.dirname(folder)
         if up == folder:
             return None
         folder = up
 
 
-def place_problem(path, archive_root):
-    """Why restore must not write into `path`, nor pack read from it, or None: it holds model folders (files written
-    there would lie among them), is inside a model folder (of any archive), or inside this archive's _kit."""
-    real = os.path.realpath(path)
-    if os.path.isdir(real) and model_folders(real):
-        return f"{path} holds model folders"
-    inside = model_folder_of(real)
-    if inside:
-        return f"{path} is inside the model folder {os.path.join(*inside)}"
-    if not is_oczip(archive_root) and holds(os.path.join(archive_root, "_kit"), real):
-        return f"{path} is inside the pack folder's _kit"
+def place_problem(path):
+    """Why restore must not write into `path`, pack read from it, nor a pack file be written there: it is a pack
+    folder or inside one (what is written there would lie among the pack's own files, or be read as the pack's).
+    None if it is neither."""
+    inside = pack_folder_of(path)
+    if inside is None:
+        return None
+    if os.path.normcase(inside) == os.path.normcase(os.path.realpath(path)):
+        return f"{path} is a pack folder"
+    return f"{path} is inside the pack folder {inside}"
+
+
+# ----------------------------------------------------------------------------------------------- reading blobs
+
+MAX_REFERENCE_DEPTH = 32  # longer chains of bases are treated as a cycle
+FRAME_CACHE_BYTES = 384 << 20
+_HEADERS = {}  # span -> (header, frames, region offsets)
+_FRAMES = {}  # (span, region index) -> decoded region, least recently used first
+_INTACT = set()  # (pack root, sha) of blobs found intact in this run, with every blob they are coded against
+_BASE_CACHE = {}  # (pack root, sha) -> restored base file that pack keeps until it has checked the delta
+
+
+def forget_cached_reads():
+    """Drop what was read and checked; needed once a blob of the pack has changed."""
+    _HEADERS.clear()
+    _FRAMES.clear()
+    _INTACT.clear()
+
+
+def container_index(span):
+    """(header, frames, region offsets) of the container at span (path, start, size), checked (read_container)."""
+    if span not in _HEADERS:
+        path, start, size = span
+        with open(path, "rb") as f:
+            header, frames = read_container(f, start, size)
+        _HEADERS[span] = header, frames, [r["offset"] for r in header["regions"]]
+    return _HEADERS[span]
+
+
+def blob_header(p, sha):
+    header = container_index(p.blob_span(sha))[0]
+    if header["sha256"] != sha:
+        raise ValueError(f"{blob_rel(sha)} is the blob of another file")
+    return header
+
+
+def base_text(base):
+    """A base as its blob's header names it: the model and file it was packed from, else its SHA-256."""
+    return f"{base['model']}:{base['path']}" if base.get("model") and base.get("path") else f"blob {base['sha256'][:12]}..."
+
+
+def blob_problem(p, sha, span=None, trail=()):
+    """None if the blob of the file `sha` (at `span`, default where the pack has it) and every blob it is coded
+    against are there and intact (blob_damage), without a cycle, checked before any decoder sees their bytes; else
+    what is wrong."""
+    if sha in trail:
+        return "cyclic reference between blobs"
+    if len(trail) > MAX_REFERENCE_DEPTH:
+        return "reference chain too deep"
+    placed = span is None
+    if placed:
+        if (p.root, sha) in _INTACT:
+            return None
+        try:
+            span = p.blob_span(sha)
+        except FileNotFoundError:
+            return "its blob is missing from the pack"
+        except (OSError, ValueError) as e:
+            return f"its blob cannot be read ({e})"
+    problem = blob_damage(span, sha)
+    if problem:
+        return f"its blob is {problem}"
+    for base in container_index(span)[0]["bases"]:
+        problem = blob_problem(p, base["sha256"], trail=trail + (sha,))
+        if problem:
+            return f"{base_text(base)}, which it is coded against: {problem}"
+    if placed:
+        _INTACT.add((p.root, sha))
     return None
-
-
-def model_name(value, archive_root):
-    """A model given by name or by its folder (which must then be in archive_root), as its name."""
-    if not os.path.isfile(os.path.join(value, "manifest.json")):
-        return value
-    try:
-        root, repo = model_at(value)
-    except ValueError as e:
-        sys.exit(str(e))
-    if os.path.normcase(os.path.realpath(root)) != os.path.normcase(os.path.realpath(archive_root)):
-        sys.exit(f"{value} is a model of {root}, not of {archive_root}")
-    return repo
-
-
-def close_single_files():
-    """Close the .oczip files opened for reading, so that another program may replace them."""
-    while _ZIPS:
-        _ZIPS.popitem()[1].close()
-
-
-def open_single_file(archive_root):
-    """Open an .oczip for reading, or stop saying why it cannot be."""
-    try:
-        oczip(archive_root)
-    except (OSError, ValueError) as e:
-        sys.exit(f"cannot open {archive_root}: {e.strerror if isinstance(e, OSError) and e.strerror else e}")
-
-
-def find_entry(archive_root, repo, path):
-    entry = next((e for e in load_manifest(archive_root, repo)["files"] if e["path"] == path), None)
-    if entry is None:
-        raise ValueError(f"{repo}:{path} is not in the pack")
-    return entry
-
-
-MAX_REFERENCE_DEPTH = 32  # deeper chains of deltas / same-as references are treated as a cycle
-
-
-def iter_entry_bytes(archive_root, repo, entry, depth=0):
-    """Yield the original bytes of a manifest entry, following same-as references and deltas."""
-    if depth > MAX_REFERENCE_DEPTH:
-        raise ValueError("reference chain too deep (cyclic references?)")
-    if entry["method"] == "same":
-        ref = entry["same_as"]
-        yield from iter_entry_bytes(archive_root, ref["repo"], find_entry(archive_root, ref["repo"], ref["path"]), depth + 1)
-        return
-    stored = f"{repo_dir_name(repo)}/{entry['stored']}"
-    if entry["method"] == "raw":
-        with archive_file(archive_root, stored) as f:
-            while block := f.read(16 << 20):
-                yield block
-    else:
-        yield from iter_original_chunks(archive_root, container_span(archive_root, stored), depth, entry["size"])
-
-
-def materialize_file(archive_root, repo, path, sha256, depth=0):
-    """Restore an archived file into a temporary file (OC_TMP or the system temp folder) and return its path."""
-    entry = find_entry(archive_root, repo, path)
-    if entry["sha256"] != sha256:
-        raise ValueError(f"{repo}:{path} has a different sha256 than recorded")
-    fd, tmp = tempfile.mkstemp(prefix="oc-base-", suffix=".bin", dir=os.environ.get("OC_TMP") or None)
-    h = hashlib.sha256()
-    try:
-        with os.fdopen(fd, "wb") as out:
-            for chunk in iter_entry_bytes(archive_root, repo, entry, depth + 1):
-                out.write(chunk)
-                h.update(chunk)
-        if h.hexdigest() != sha256:
-            raise ValueError(f"{repo}:{path} restored with the wrong sha256")
-    except BaseException:
-        os.remove(tmp)
-        raise
-    return tmp
-
-
-_BASE_CACHE = {}  # (repo, path, sha256) -> restored base file that pack keeps until it has verified the delta
-
-
-def release_cached_bases():
-    for path in _BASE_CACHE.values():
-        os.remove(path)
-    _BASE_CACHE.clear()
-
-
-def base_paths_for(archive_root, delta, depth=0):
-    """Restored base files for a delta header, as (paths, paths this call created and must delete)."""
-    paths, owned = [], []
-    try:
-        for f in delta["files"]:
-            key = (delta["repo"], f["path"], f["sha256"])
-            path = _BASE_CACHE.get(key)
-            if path is None:
-                path = materialize_file(archive_root, delta["repo"], f["path"], f["sha256"], depth)
-                owned.append(path)
-            paths.append(path)
-    except BaseException:
-        for path in owned:
-            os.remove(path)
-        raise
-    return paths, owned
 
 
 STANDALONE = 0x80  # frame codec flag: this region of a delta was stored without using the base
 
 
-def iter_original_chunks(archive_root, container, depth=0, expected_size=None):
-    """Yield the original file's bytes region by region, resolving deltas against base archives recursively.
-    container: its path, or (path, start, size) of one inside an .oczip (container_span). ans16 regions are decoded
-    in parallel worker processes."""
-    container_path, start, size = container if isinstance(container, tuple) else (container, 0, None)
-    with open(container_path, "rb") as f:
+def iter_blob_bytes(p, sha, span=None, depth=0):
+    """Yield the original bytes of the file blob `sha` stores (at `span`, default where the pack has it), region by
+    region; the blobs it is coded against are restored into temporary files first. ans16 regions are decoded in
+    parallel worker processes."""
+    if depth > MAX_REFERENCE_DEPTH:
+        raise ValueError("reference chain too deep (cyclic references?)")
+    path, start, size = span or p.blob_span(sha)
+    with open(path, "rb") as f:
         header, frames = read_container(f, start, size)
-        if expected_size is not None and header["original_size"] != expected_size:
-            raise ValueError(f"{container_path}: the container restores {header['original_size']} bytes, not {expected_size}")
+        if header["sha256"] != sha:
+            raise ValueError(f"{path}: the blob of another file")
         regions = header["regions"]
-        delta = header.get("delta")
-        base_paths, owned = base_paths_for(archive_root, delta, depth) if delta else ([], [])
+        base_paths, owned = base_paths_for(p, header["bases"], depth)
         jobs = [
-            (container_path, start + off, plen, base_paths[r["base"][0]], r["base"][1], r.get("base_dtype"), r["length"], r["dtype"])
-            for r, (codec, _, off, plen, _) in zip(regions, frames) if codec == CODEC_ANS16
+            (path, start + off, plen, base_paths[r["base"][0]], r["base"][1], r.get("base_dtype"), r["length"], r["dtype"])
+            for r, (codec, _, off, plen, _) in ((r, fr) for r, fr in zip(regions, frames) if fr) if codec == CODEC_ANS16
         ]
         pool = ProcessPoolExecutor(ans16_workers()) if jobs else None
-        bases = [open(p, "rb") for p in base_paths]
+        bases = [open(b, "rb") for b in base_paths]
         plain = None
         try:
             decoded = pool.map(_ans16_decode_job, jobs) if pool else iter(())
 
             def to_decode():  # read here, in order; decoded on the threads
-                for region, (codec, raw_len, off, plen, _) in zip(regions, frames):
+                for region, (codec, raw_len, off, plen, _) in ((r, fr) for r, fr in zip(regions, frames) if fr):
                     if codec != CODEC_ANS16:
                         f.seek(start + off)
                         payload = f.read(plen)
@@ -1387,10 +1628,15 @@ def iter_original_chunks(archive_root, container, depth=0, expected_size=None):
                 return chunk if base is None else xor_bytes(chunk, base)
 
             plain = ordered_map(decode, to_decode(), frame_workers())
-            for region, (codec, raw_len, off, plen, crc) in zip(regions, frames):
+            for region, frame in zip(regions, frames):
+                if frame is None:  # dropped by a partial blob: no file reads it, its place is kept with zeros
+                    for at in range(0, region["length"], 16 << 20):
+                        yield bytes(min(16 << 20, region["length"] - at))
+                    continue
+                codec, raw_len, off, plen, crc = frame
                 chunk = next(decoded) if codec == CODEC_ANS16 else next(plain)
                 if len(chunk) != raw_len or zlib.crc32(chunk) != crc:
-                    raise ValueError(f"{container_path}: region at {region['offset']} failed its CRC check")
+                    raise ValueError(f"{path}: region at {region['offset']} failed its CRC check")
                 yield chunk
         finally:
             if plain is not None:
@@ -1399,18 +1645,190 @@ def iter_original_chunks(archive_root, container, depth=0, expected_size=None):
                 b.close()
             if pool:
                 pool.shutdown()
-            for path in owned:
-                os.remove(path)
+            for b in owned:
+                os.remove(b)
 
 
-def write_container(src_path, dst_path, regions, levels, delta=None, base_paths=(), workers=1, tree=None, replace=True):
-    """One frame per region. Standalone regions are coded by kind. Regions with a "base" reference are coded
-    against it (ans16 in parallel worker processes, or the original XOR base by byte planes/zstd) unless storing
-    them standalone is smaller, in which case the frame's codec carries the STANDALONE flag. Other regions are coded
-    on threads (frame_workers), read and written here in order. The container is written through tree.placing
-    (dst_path is then relative to the tree; without a tree, a path whose folder is the tree), replacing an existing
-    file only if `replace`. Returns (frame codecs used, container size, its SHA-256), counted as it is written."""
-    header = {"original_size": os.path.getsize(src_path), "regions": regions, "delta": delta}
+class BaseFailed(ValueError):
+    """A blob that another is coded against does not restore its file (materialize_blob): the fault is its own."""
+
+    def __init__(self, sha, problem):
+        super().__init__(f"blob {sha[:12]}... does not restore its file: {problem}")
+        self.sha, self.problem = sha, problem
+
+
+def materialize_blob(p, sha, depth=0):
+    """Restore the file of the blob `sha` into a temporary file (OC_TMP or the system temp folder) and return its
+    path; BaseFailed if its bytes do not restore that file (an error of the system, OSError, is passed on as it is)."""
+    fd, tmp = tempfile.mkstemp(prefix="oc-base-", suffix=".bin", dir=os.environ.get("OC_TMP") or None)
+    h = hashlib.sha256()
+    try:
+        with os.fdopen(fd, "wb") as out:
+            for chunk in iter_blob_bytes(p, sha, depth=depth + 1):
+                out.write(chunk)
+                h.update(chunk)
+        if h.hexdigest() != sha and not container_index(p.blob_span(sha))[0].get("partial"):  # (each region has its CRC)
+            raise ValueError("restored with the wrong sha256")
+    except BaseFailed:
+        os.remove(tmp)
+        raise
+    except ValueError as e:
+        os.remove(tmp)
+        raise BaseFailed(sha, str(e)) from e
+    except BaseException:
+        os.remove(tmp)
+        raise
+    return tmp
+
+
+def cached_base(p, sha):
+    """A restored file of the blob `sha`, kept (for the check that follows) until release_cached_bases()."""
+    key = (p.root, sha)
+    if key not in _BASE_CACHE:
+        _BASE_CACHE[key] = materialize_blob(p, sha)
+    return _BASE_CACHE[key]
+
+
+def release_cached_bases():
+    for path in _BASE_CACHE.values():
+        os.remove(path)
+    _BASE_CACHE.clear()
+
+
+def base_paths_for(p, bases, depth=0):
+    """Restored files of a blob's bases, as (paths, paths this call made and must delete)."""
+    paths, owned = [], []
+    try:
+        for base in bases:
+            path = _BASE_CACHE.get((p.root, base["sha256"]))
+            if path is None:
+                path = materialize_blob(p, base["sha256"], depth)
+                owned.append(path)
+            paths.append(path)
+    except BaseException:
+        for path in owned:
+            os.remove(path)
+        raise
+    return paths, owned
+
+
+def blob_restores(p, sha, size, span=None, counted=False):
+    """None if the blob of the file `sha` (at `span`, default where the pack has it) is intact with every blob it is
+    coded against (blob_problem) and restores exactly `size` bytes with that SHA-256; else what is wrong. counted:
+    the bytes go to the progress report."""
+    problem = blob_problem(p, sha, span)
+    if problem:
+        return problem
+    h, n = hashlib.sha256(), 0
+    try:
+        for chunk in iter_blob_bytes(p, sha, span):
+            h.update(chunk)
+            n += len(chunk)
+            if counted:
+                PROGRESS.add(len(chunk))
+    except Exception as e:
+        return f"decode failed: {e}"
+    if n != size or h.hexdigest() != sha:
+        return "restored bytes differ from the original SHA-256"
+    return None
+
+
+def read_range(p, sha, start, length, depth=0):
+    """Bytes [start, start + length) of the file blob `sha` stores, without restoring the rest of it."""
+    if depth > MAX_REFERENCE_DEPTH:
+        raise ValueError("reference chain too deep (cyclic references?)")
+    span = p.blob_span(sha)
+    header, _, offsets = container_index(span)
+    if header["sha256"] != sha:
+        raise ValueError(f"{blob_rel(sha)} is the blob of another file")
+    parts, end = [], start + length
+    for i in range(max(0, bisect.bisect_right(offsets, start) - 1), len(offsets)):
+        region = header["regions"][i]
+        if region["offset"] >= end:
+            break
+        a, b = max(start - region["offset"], 0), min(end - region["offset"], region["length"])
+        if b > a:
+            parts.append(region_bytes(p, span, i, a, b, depth))
+    return b"".join(parts)
+
+
+def region_base(p, header, region, depth):
+    """The base bytes (before any dtype conversion) a delta region was coded against."""
+    index, offset = region["base"]
+    scale = FLOAT_BYTES[region["base_dtype"]] // FLOAT_BYTES[region["dtype"]] if "base_dtype" in region else 1
+    return read_range(p, header["bases"][index]["sha256"], offset, region["length"] * scale, depth + 1)
+
+
+def region_bytes(p, span, i, a, b, depth):
+    """Bytes a..b (counted from the region's start) of region i of the container at span."""
+    header, frames, _ = container_index(span)
+    if frames[i] is None:
+        raise ValueError(f"{span[0]}: region at {header['regions'][i]['offset']} is not kept (a partial blob)")
+    region, (codec, raw_len, off, plen, crc) = header["regions"][i], frames[i]
+    key = (span, i)
+    if key in _FRAMES:
+        _FRAMES[key] = chunk = _FRAMES.pop(key)  # now the most recently used
+        return chunk[a:b]
+    with open(span[0], "rb") as f:
+        f.seek(span[1] + off)
+        payload = f.read(plen)
+    if codec == CODEC_ANS16:
+        base = prediction_from_bytes(region_base(p, header, region, depth), region.get("base_dtype"), region["dtype"])
+        stop = -(-b // 2)
+        chunk = ans16_decode(base, payload, region["dtype"], stop if stop < raw_len // 2 else None).tobytes()
+        if len(chunk) < raw_len:  # a prefix only: nothing to check it against, so it is not cached either
+            return chunk[a:b]
+    else:
+        chunk = decode_payload(codec & ~STANDALONE, payload, raw_len, region_planes_dtype(region))
+        if "base" in region and not codec & STANDALONE:
+            base = region_base(p, header, region, depth)
+            if "base_dtype" in region:
+                base = prediction_from_bytes(base, region["base_dtype"], region["dtype"]).tobytes()
+            chunk = xor_bytes(chunk, base)
+    if len(chunk) != raw_len or zlib.crc32(chunk) != crc:
+        raise ValueError(f"{span[0]}: region at {region['offset']} failed its CRC check")
+    _FRAMES[key] = chunk
+    total = sum(len(c) for c in _FRAMES.values())
+    while total > FRAME_CACHE_BYTES and len(_FRAMES) > 1:
+        total -= len(_FRAMES.pop(next(iter(_FRAMES))))
+    return chunk[a:b]
+
+
+def blob_info(p, sha):
+    """How the blob `sha` stores its file: {"stored": the blob's size, "method", "bases" (as its header lists them),
+    "matched": the bytes coded against them}."""
+    span = p.blob_span(sha)
+    header = container_index(span)[0]
+    matched = sum(r["length"] for r in header["regions"] if "base" in r)
+    return {"stored": span[2], "method": header.get("method") or "?", "bases": header["bases"], "matched": matched}
+
+
+# ----------------------------------------------------------------------------------------------- writing blobs
+
+
+class BlobFailed(Exception):
+    """A blob just written does not restore its file exactly: it is not put in place."""
+
+
+class NotSmaller(Exception):
+    """rebase: the blob just written is not smaller than the one it would replace: it is not put in place."""
+
+
+def method_of(fmt, regions):
+    """How a file is stored, for people: its format (safetensors, gguf, zstd for text, auto for other bytes), with
+    +ans16 or +xor for a delta."""
+    if not any("base" in r for r in regions):
+        return fmt
+    return f"{fmt}+{'ans16' if any(r['kind'] == 'ans16' for r in regions) else 'xor'}"
+
+
+def write_container(src_path, out, header, base_paths=(), levels=(19, 9), workers=1):
+    """Write the container of the file at src_path to `out`: `header` (its regions and bases), then one frame per
+    region. Standalone regions are coded by kind. Regions with a "base" reference are coded against it (ans16 in
+    parallel worker processes, or the original XOR base by byte planes/zstd) unless storing them standalone is
+    smaller, in which case the frame's codec carries the STANDALONE flag. Other regions are coded on threads
+    (frame_workers), read and written here in order. Returns {frame codec: how many frames use it}."""
+    regions = header["regions"]
     hb = json.dumps(header).encode()
     codecs_used = {}
     jobs = [
@@ -1418,7 +1836,7 @@ def write_container(src_path, dst_path, regions, levels, delta=None, base_paths=
         for r in regions if r["kind"] == "ans16"
     ]
     pool = ProcessPoolExecutor(workers) if jobs else None
-    bases = [open(p, "rb") for p in base_paths]
+    bases = [open(b, "rb") for b in base_paths]
 
     def code(region, data, base):
         """(length, crc32, codec options) of a region; base: its base bytes, for a delta region."""
@@ -1428,13 +1846,10 @@ def write_container(src_path, dst_path, regions, levels, delta=None, base_paths=
         codec, payload = encode_chunk(data, dtype, level)
         return len(data), zlib.crc32(data), [encode_chunk(xor_bytes(data, base), dtype, level), (codec | STANDALONE, payload)]
 
-    if tree is None:
-        tree, dst_path = SafeTree(os.path.dirname(os.path.abspath(dst_path))), os.path.basename(dst_path)
     coded = None
     try:
-        with open(src_path, "rb") as src, open(src_path, "rb") as ahead, tree.placing(dst_path, replace) as out:
-            dst = HashingWriter(out)
-            dst.write(MAGIC + struct.pack("<I", len(hb)) + hb)
+        with open(src_path, "rb") as src, open(src_path, "rb") as ahead:
+            out.write(MAGIC + struct.pack("<I", len(hb)) + hb)
             encoded = pool.map(_ans16_encode_job, jobs) if pool else iter(())
 
             def to_code():  # read here, in order (from a handle of its own); coded on the threads
@@ -1461,122 +1876,69 @@ def write_container(src_path, dst_path, regions, levels, delta=None, base_paths=
                             options.append((codec | STANDALONE, alone))
                 codec, payload = min(options, key=lambda o: len(o[1]))
                 codecs_used[codec] = codecs_used.get(codec, 0) + 1
-                dst.write(FRAME_HEAD.pack(codec, length, len(payload), crc))
-                dst.write(payload)
-    finally:  # placing() synced the file to disk before putting it in place (rebase then deletes the old one)
+                out.write(FRAME_HEAD.pack(codec, length, len(payload), crc))
+                out.write(payload)
+                PROGRESS.add(length)
+    finally:
         if coded is not None:
             coded.close()
         for b in bases:
             b.close()
         if pool:
             pool.shutdown()
-    return codecs_used, dst.size, dst.hash.hexdigest()
+    return codecs_used
 
 
-# ----------------------------------------------------------------------------------------------- partial reads
-#
-# Choosing a base samples a few windows of every candidate model. read_range() decodes only the regions that hold a
-# window (an ans16 region only up to the window's end) and, for delta regions, only the base bytes those need.
-
-_ENTRIES = {}  # (archive_root, repo) -> {path: manifest entry}
-_CONTAINERS = {}  # container path -> (header, frames, region offsets)
-_FRAMES = {}  # (container path, region index) -> decoded region, least recently used first
-FRAME_CACHE_BYTES = 384 << 20
-
-
-def forget_cached_reads():
-    """Drop what read_range() has cached; needed once a manifest or a stored file in the archive has changed."""
-    _ENTRIES.clear()
-    _CONTAINERS.clear()
-    _FRAMES.clear()
-
-
-def cached_entry(archive_root, repo, path, sha256):
-    key = (archive_root, repo)
-    if key not in _ENTRIES:
-        _ENTRIES[key] = {e["path"]: e for e in load_manifest(archive_root, repo)["files"]}
-    entry = _ENTRIES[key].get(path)
-    if entry is None or entry["sha256"] != sha256:
-        raise ValueError(f"{repo}:{path} is missing from the pack or has a different sha256 than recorded")
-    return entry
-
-
-def container_index(path):
-    """(header, [(codec, raw_len, payload offset, payload_len, crc)], region offsets) of a container."""
-    if path not in _CONTAINERS:
-        with open(path, "rb") as f:
-            header, frames = read_container(f)
-        _CONTAINERS[path] = header, frames, [r["offset"] for r in header["regions"]]
-    return _CONTAINERS[path]
+def store_blob(p, sha, size, fill, replace=False, keep=None):
+    """Write the blob of the file `sha` (`size` bytes) with fill(out), end it with its SHA-256, and decode it back
+    from disk (blob_restores) before it takes its place, so a blob that does not restore its file exactly is never
+    used (BlobFailed). In a pack folder it goes over an existing blob only if `replace`, and with keep(its size)
+    false not at all (NotSmaller). Returns its size."""
+    if isinstance(p, NewFilePack):
+        info = zipfile.ZipInfo(blob_rel(sha), time.localtime()[:6])
+        info.compress_type = zipfile.ZIP_STORED
+        with p.zip.open(info, "w", force_zip64=True) as dst:
+            out = HashingWriter(dst)
+            fill(out)
+            dst.write(out.hash.digest())
+        p.f.flush()
+        span = member_span(p.temp_path, info)
+        problem = blob_restores(p, sha, size, span, counted=True)
+        if problem:
+            raise BlobFailed(problem)
+        p.spans[sha] = span[1:]
+        return span[2]
+    with SafeTree(p.root).placing(blob_rel(sha), replace) as f:
+        out = HashingWriter(f)
+        fill(out)
+        f.write(out.hash.digest())
+        f.flush()
+        stored = out.size + TRAILER
+        if keep is not None and not keep(stored):
+            raise NotSmaller
+        problem = blob_restores(p, sha, size, (f.temp_path, 0, stored), counted=True)
+        if problem:
+            raise BlobFailed(problem)
+    forget_cached_reads()
+    return stored
 
 
-def read_range(archive_root, repo, entry, start, length, depth=0):
-    """Bytes [start, start + length) of an archived file, without restoring the rest of it."""
-    if depth > MAX_REFERENCE_DEPTH:
-        raise ValueError("reference chain too deep (cyclic references?)")
-    if entry["method"] == "same":
-        ref = entry["same_as"]
-        target = cached_entry(archive_root, ref["repo"], ref["path"], entry["sha256"])
-        return read_range(archive_root, ref["repo"], target, start, length, depth + 1)
-    stored = os.path.join(archive_root, repo_dir_name(repo), entry["stored"])
-    if entry["method"] == "raw":
-        with open(stored, "rb") as f:
-            f.seek(start)
-            return f.read(length)
-    header, _, offsets = container_index(stored)
-    if header["original_size"] != entry["size"]:
-        raise ValueError(f"{stored}: the container restores {header['original_size']} bytes, not {entry['size']}")
-    parts, end = [], start + length
-    for i in range(max(0, bisect.bisect_right(offsets, start) - 1), len(offsets)):
-        region = header["regions"][i]
-        if region["offset"] >= end:
-            break
-        a, b = max(start - region["offset"], 0), min(end - region["offset"], region["length"])
-        if b > a:
-            parts.append(region_bytes(archive_root, stored, i, a, b, depth))
-    return b"".join(parts)
+def touch_marker(p):
+    """Record in ocpack.json when the pack folder last changed. It is the last step of every change, so whatever
+    watches that one file (the window does) sees each change once, when it is complete."""
+    with contextlib.suppress(OSError, ValueError):
+        with SafeTree(p.root).placing(MARKER, replace=True) as f:
+            f.write(json.dumps({**MARKER_JSON, "changed": now()}).encode())
 
 
-def region_base(archive_root, delta, region, depth):
-    """The base bytes (before any dtype conversion) a delta region was coded against."""
-    index, offset = region["base"]
-    scale = FLOAT_BYTES[region["base_dtype"]] // FLOAT_BYTES[region["dtype"]] if "base_dtype" in region else 1
-    f = delta["files"][index]
-    entry = cached_entry(archive_root, delta["repo"], f["path"], f["sha256"])
-    return read_range(archive_root, delta["repo"], entry, offset, region["length"] * scale, depth + 1)
-
-
-def region_bytes(archive_root, stored, i, a, b, depth):
-    """Bytes a..b (counted from the region's start) of region i of a container."""
-    header, frames, _ = container_index(stored)
-    region, (codec, raw_len, off, plen, crc) = header["regions"][i], frames[i]
-    key = (stored, i)
-    if key in _FRAMES:
-        _FRAMES[key] = chunk = _FRAMES.pop(key)  # now the most recently used
-        return chunk[a:b]
-    with open(stored, "rb") as f:
-        f.seek(off)
-        payload = f.read(plen)
-    if codec == CODEC_ANS16:
-        base = prediction_from_bytes(region_base(archive_root, header["delta"], region, depth), region.get("base_dtype"), region["dtype"])
-        stop = -(-b // 2)
-        chunk = ans16_decode(base, payload, region["dtype"], stop if stop < raw_len // 2 else None).tobytes()
-        if len(chunk) < raw_len:  # a prefix only: nothing to check it against, so it is not cached either
-            return chunk[a:b]
-    else:
-        chunk = decode_payload(codec & ~STANDALONE, payload, raw_len, region_planes_dtype(region))
-        if "base" in region and not codec & STANDALONE:
-            base = region_base(archive_root, header["delta"], region, depth)
-            if "base_dtype" in region:
-                base = prediction_from_bytes(base, region["base_dtype"], region["dtype"]).tobytes()
-            chunk = xor_bytes(chunk, base)
-    if len(chunk) != raw_len or zlib.crc32(chunk) != crc:
-        raise ValueError(f"{stored}: region at {region['offset']} failed its CRC check")
-    _FRAMES[key] = chunk
-    total = sum(len(c) for c in _FRAMES.values())
-    while total > FRAME_CACHE_BYTES and len(_FRAMES) > 1:
-        total -= len(_FRAMES.pop(next(iter(_FRAMES))))
-    return chunk[a:b]
+def write_manifest(p, manifest):
+    """Put a model's manifest in place in one step: a crash leaves the old manifest or the new one."""
+    data = json.dumps(manifest, indent=1).encode("utf-8")
+    if isinstance(p, NewFilePack):
+        p.put(manifest_rel(manifest["name"]), data)
+        return
+    with SafeTree(p.root).placing(manifest_rel(manifest["name"]), replace=True) as f:
+        f.write(data)
 
 
 # ----------------------------------------------------------------------------------------------- base selection
@@ -1591,6 +1953,7 @@ SAMPLE_BYTES = 512 << 10
 FIRST_ROUND = 4  # every candidate is scored on this many windows first ...
 FINALISTS = 4  # ... and only this many of the best on all of them
 MIN_BASE_GAIN = 0.01  # share of the standalone estimate a base must save
+RELEASE_GAIN = 0.1  # share of a kept base's room that letting it go must be estimated to save (rebase)
 
 
 def entropy_bytes(context, symbol):
@@ -1656,29 +2019,30 @@ def file_reader(path):
     return read
 
 
-def choose_base(archive_root, fmt, tensors, read, manifests, blocked, delta_codec):
-    """(best repo or None, [(repo, estimated share)] of the finalists, standalone share, candidate count) for one file
-    of format `fmt` with these tensors, whose bytes read(start, length) returns (from disk, or from the archive).
-    Shares are estimated stored size / original size of the file's tensor data."""
+def choose_base(p, fmt, tensors, read, manifests, blocked, delta_codec):
+    """(best model or None, [(model, estimated share)] of the finalists, standalone share, candidate count) for one
+    file of format `fmt` with these tensors, whose bytes read(start, length) returns (from disk, or from the pack),
+    among `manifests` (the other models of the pack); files whose blobs are in `blocked` are not used (they would make
+    a cycle). Shares are estimated stored size / original size of the file's tensor data."""
     if not tensors:
         return None, [], None, 0
     candidates = []
-    for repo, manifest in manifests.items():
-        files = [e for e in manifest["files"] if e.get("format") == fmt and e.get("tensors")]
-        if repo not in blocked and files:
+    for name, manifest in sorted(manifests.items()):
+        files = [e for e in manifest["files"] if e.get("format") == fmt and e.get("tensors") and e["sha256"] not in blocked]
+        if files:
             match = match_against_base(tensors, files, delta_codec)
             if any(match(t) for t in tensors):
-                candidates.append((repo, files, match))
+                candidates.append((name, files, match))
     windows = sample_windows(tensors) if candidates else []
     if not windows:
         return None, [], None, len(candidates)
     data = [read(t[2] + rel, length) for t, rel, length, _ in windows]
-    alone =[standalone_estimate(d, w[0][1]) / len(d) for w, d in zip(windows, data)]  # stored bytes per byte
+    alone = [standalone_estimate(d, w[0][1]) / len(d) for w, d in zip(windows, data)]  # stored bytes per byte
     weight = sum(w[3] for w in windows)
     score = {c[0]: 0.0 for c in candidates}
 
     def window_cost(candidate, k):
-        repo, files, match = candidate
+        name, files, match = candidate
         t, rel, length, w = windows[k]
         m = match(t)
         covered = min(m[4] - rel, length) if m else 0
@@ -1686,7 +2050,7 @@ def choose_base(archive_root, fmt, tensors, read, manifests, blocked, delta_code
             return alone[k] * w
         index, base_start, kind, base_dtype, _ = m
         scale = FLOAT_BYTES[base_dtype] // FLOAT_BYTES[t[1]] if base_dtype else 1
-        base_raw = read_range(archive_root, repo, files[index], base_start + rel * scale, covered * scale)
+        base_raw = read_range(p, files[index]["sha256"], base_start + rel * scale, covered * scale)
         coded = min(delta_estimate(data[k][:covered], base_raw, t[1], kind, base_dtype), alone[k] * covered)
         return (coded + alone[k] * (length - covered)) / length * w
 
@@ -1697,146 +2061,229 @@ def choose_base(archive_root, fmt, tensors, read, manifests, blocked, delta_code
                     try:
                         score[c[0]] += window_cost(c, k)
                     except (OSError, ValueError, KeyError) as e:
-                        print(f"    candidate {c[0]} skipped: {e}")
+                        say(f"    candidate {c[0]} skipped: {e}")
                         score[c[0]] = None
 
     first = list(range(0, len(windows), -(-len(windows) // FIRST_ROUND)))
     run(first, candidates)
     finalists = sorted((c for c in candidates if score[c[0]] is not None), key=lambda c: score[c[0]])[:FINALISTS]
     run([k for k in range(len(windows)) if k not in first], finalists)
-    depth = chain_depths(manifests)  # on a tie, the base that is quicker to restore
-    ranking = sorted(((c[0], score[c[0]] / weight) for c in finalists if score[c[0]] is not None),
-                     key=lambda r: (r[1], depth[r[0]]))
+    ranking = sorted(((c[0], score[c[0]] / weight) for c in finalists if score[c[0]] is not None), key=lambda r: r[1])
     standalone = sum(a * w[3] for a, w in zip(alone, windows)) / weight
     best = ranking[0][0] if ranking and ranking[0][1] <= standalone * (1 - MIN_BASE_GAIN) else None
     return best, ranking, standalone, len(candidates)
 
 
-def pick_base(args, rec, fmt, tensors, read, manifests, blocked):
+def pick_base(args, p, rec, fmt, tensors, read, manifests, blocked=frozenset()):
     t0 = time.perf_counter()
-    best, ranking, standalone, n = choose_base(args.archive_root, fmt, tensors, read, manifests, blocked, args.delta_codec)
+    PROGRESS.at(f"{rec['path']}: choosing a base")
+    best, ranking, standalone, n = choose_base(p, fmt, tensors, read, manifests, blocked, args.delta_codec)
+    PROGRESS.at(rec["path"])
     if standalone is not None:
         shown = [f"{r} {share:.1%}" for r, share in ranking if r != best][:2] + [f"standalone {standalone:.1%}"]
         head = f"{best} (est. {dict(ranking)[best]:.1%}; " if best else "none ("
-        print(f"  base for {rec['path']}: {head}{'; '.join(shown)}; {n} candidate(s), {time.perf_counter() - t0:.0f}s)")
+        say(f"  base for {rec['path']}: {head}{'; '.join(shown)}; {n} candidate(s), {time.perf_counter() - t0:.0f}s)",
+            event="base", path=rec["path"], base=best)
     return best
 
 
-def repo_needs(manifests):
-    """{repo: the other repos its files refer to}."""
-    return {r: {ref[0] for e in m["files"] for ref in references(e)} - {r} for r, m in manifests.items()}
+# ----------------------------------------------------------------------------------------------- the graph of a pack
 
 
-def chain_depths(manifests):
-    """{repo: how many repos deep its references go} (0: it needs no other repo)."""
-    needs, depth = repo_needs(manifests), {}
+class Graph:
+    """What the blobs of a pack are coded against, read from their headers when first needed (only blobs that models
+    need are ever read). strict: a blob that cannot be read stops the walk (OSError / ValueError); otherwise it is
+    taken as coded against nothing and noted in `unreadable`."""
 
-    def walk(repo, trail):
-        if repo in trail:
-            return MAX_REFERENCE_DEPTH
-        if repo not in depth:
-            depth[repo] = max((1 + walk(r, trail | {repo}) for r in needs[repo] if r in needs), default=0)
-        return depth[repo]
+    def __init__(self, p, manifests, strict=True):
+        self.p, self.manifests, self.strict = p, manifests, strict
+        self.edges, self.unreadable = {}, set()
+        self.owners = {}  # sha -> names of the models that list it, sorted
+        for name in sorted(manifests):
+            for e in manifests[name]["files"]:
+                users = self.owners.setdefault(e["sha256"], [])
+                if name not in users:
+                    users.append(name)
+        self.reverse, self.depths, self.heights = None, {}, {}
 
-    for repo in needs:
-        walk(repo, frozenset())
-    return depth
+    def bases(self, sha):
+        if sha not in self.edges:
+            try:
+                self.edges[sha] = [b["sha256"] for b in blob_header(self.p, sha)["bases"]]
+            except (OSError, ValueError):
+                if self.strict:
+                    raise
+                self.edges[sha] = []
+                self.unreadable.add(sha)
+        return self.edges[sha]
+
+    def changed(self, sha, bases):
+        """The blob `sha` is coded against `bases` now (rebase)."""
+        self.edges[sha] = list(bases)
+        self.reverse, self.depths, self.heights = None, {}, {}
+
+    def needed(self, names=None):
+        """Every blob the models `names` (default: all) need: their files' blobs and, down the chain, every blob
+        those are coded against."""
+        names = self.manifests if names is None else names
+        seen, stack = set(), [e["sha256"] for n in names for e in self.manifests[n]["files"]]
+        while stack:
+            sha = stack.pop()
+            if sha not in seen:
+                seen.add(sha)
+                stack.extend(self.bases(sha))
+        return seen
+
+    def above(self, sha):
+        """sha and every blob coded against it, directly or through others."""
+        if self.reverse is None:
+            self.reverse = {}
+            for s in self.needed():
+                for b in self.bases(s):
+                    self.reverse.setdefault(b, set()).add(s)
+        found, stack = {sha}, [sha]
+        while stack:
+            for s in self.reverse.get(stack.pop(), ()):
+                if s not in found:
+                    found.add(s)
+                    stack.append(s)
+        return found
+
+    def depth(self, sha, trail=frozenset()):
+        """How many blobs deep the chain below `sha` goes (0: coded against nothing)."""
+        if sha not in self.depths:
+            if sha in trail:
+                return MAX_REFERENCE_DEPTH + 1
+            self.depths[sha] = max((1 + self.depth(b, trail | {sha}) for b in self.bases(sha)), default=0)
+        return self.depths[sha]
+
+    def height(self, sha):
+        """How many blobs deep the longest chain coded (directly or not) against `sha` goes down to it."""
+        if sha not in self.heights:
+            self.above(sha)  # builds self.reverse
+            self.heights[sha] = max((1 + self.height(s) for s in self.reverse.get(sha, ())), default=0)
+        return self.heights[sha]
+
+    def model_depth(self, name):
+        return max((self.depth(e["sha256"]) for e in self.manifests[name]["files"]), default=0)
 
 
-def dependents(manifests, repo):
-    """Every repo in the archive that needs `repo` to be restored, directly or through other repos."""
-    needs = repo_needs(manifests)
-    found, frontier = set(), {repo}
-    while frontier:
-        frontier = {r for r, refs in needs.items() if refs & frontier} - found - {repo}
-        found |= frontier
+def base_reads(header, frames):
+    """[(base index, start, end)]: the bytes of its bases' files a blob reads, region by region (a region stored
+    without its base, or dropped, reads none)."""
+    reads = []
+    for r, frame in zip(header["regions"], frames):
+        if frame is None or "base" not in r or frame[0] & STANDALONE:
+            continue
+        i, offset = r["base"]
+        scale = FLOAT_BYTES[r["base_dtype"]] // FLOAT_BYTES[r["dtype"]] if "base_dtype" in r else 1
+        reads.append((i, offset, offset + r["length"] * scale))
+    return reads
+
+
+def regions_read(header, ranges):
+    """The indices of the regions of a blob that any of these (start, end) byte ranges of its file overlaps."""
+    starts = [r["offset"] for r in header["regions"]]
+    found = set()
+    for a, b in ranges:
+        i = max(bisect.bisect_right(starts, a) - 1, 0)
+        while i < len(starts) and starts[i] < b:
+            if starts[i] + header["regions"][i]["length"] > a:
+                found.add(i)
+            i += 1
     return found
 
 
-# ----------------------------------------------------------------------------------------------- pack / verify / restore
-
-
-def load_manifest(archive_root, repo_id):
-    """The manifest of a model, checked (manifest_problem) and confirmed to be that model's: ValueError otherwise."""
-    problem = name_problem(repo_id)
-    if problem:
-        raise ValueError(problem)
-    path = os.path.join(archive_root, repo_dir_name(repo_id), "manifest.json")
-    manifest = read_manifest(archive_root, repo_dir_name(repo_id))
-    problem = manifest_problem(manifest)
-    if not problem and manifest["repo"] != repo_id:
-        problem = f"this folder holds the model {manifest['repo']!r}, not {repo_id!r}"
-    if problem:
-        raise ValueError(f"{path}: {problem}")
-    return manifest
-
-
-def references(entry):
-    """(repo, path, sha256) of every archived file this entry needs in order to be restored."""
-    if entry["method"] == "same":
-        return [(entry["same_as"]["repo"], entry["same_as"]["path"], entry["sha256"])]
-    return [(entry["delta_base"], f["path"], f["sha256"]) for f in entry.get("delta_files", [])]
-
-
-def chain_problem(archive_root, repo, entry, trail=()):
-    """Check stored hashes of this entry and of every file it depends on, before any decoder sees the bytes."""
-    here = f"{repo}:{entry['path']}"
-    if here in trail:
-        return "cyclic reference: " + " -> ".join(trail[trail.index(here):] + (here,))
-    if len(trail) > MAX_REFERENCE_DEPTH:
-        return "reference chain too deep"
-    trail += (here,)
-    if entry.get("stored"):
-        try:
-            with archive_file(archive_root, f"{repo_dir_name(repo)}/{entry['stored']}") as f:
-                digest = sha256_stream(f)
-        except OSError as e:
-            return f"stored file {entry['stored']} missing or unreadable ({e.strerror or e})"
-        except (ValueError, zipfile.BadZipFile) as e:  # in an .oczip: unreadable, or its CRC does not match
-            return f"stored file {entry['stored']} unreadable or corrupted ({e})"
-        if digest != entry["stored_sha256"]:
-            return "stored file corrupted (stored_sha256 mismatch)"
-    for ref_repo, ref_path, ref_sha in references(entry):
-        try:
-            ref_entry = find_entry(archive_root, ref_repo, ref_path)
-        except (OSError, ValueError):
-            return f"{ref_repo}:{ref_path}, which it depends on, is missing from the pack"
-        if ref_entry["sha256"] != ref_sha:
-            return f"{ref_repo}:{ref_path}, which it depends on, has a different sha256 than recorded"
-        problem = chain_problem(archive_root, ref_repo, ref_entry, trail)
+def write_trimmed(p, sha, keep):
+    """Rewrite the blob `sha` of a pack folder as a partial blob that keeps only the regions `keep` (their frames
+    copied as they are) and replace it in one step, after checking the new one; 0 if the old one is damaged (left for
+    verify to report). Returns the bytes it saves."""
+    span = p.blob_span(sha)
+    if blob_damage(span, sha):
+        return 0
+    header, frames, _ = container_index(span)
+    regions = [r if i in keep and frames[i] else {**r, "dropped": True} for i, r in enumerate(header["regions"])]
+    head = json.dumps({**header, "partial": True, "regions": regions}).encode()
+    with SafeTree(p.root).placing(blob_rel(sha), replace=True) as f, open(span[0], "rb") as src:
+        out = HashingWriter(f)
+        out.write(MAGIC + struct.pack("<I", len(head)) + head)
+        for i, frame in enumerate(frames):
+            if frame is None or i not in keep:
+                continue
+            codec, raw_len, pos, plen, crc = frame
+            out.write(FRAME_HEAD.pack(codec, raw_len, plen, crc))
+            src.seek(span[1] + pos)
+            for at in range(0, plen, 16 << 20):
+                out.write(src.read(min(16 << 20, plen - at)))
+        f.write(out.hash.digest())
+        f.flush()
+        size = out.size + TRAILER
+        problem = blob_damage((f.temp_path, 0, size), sha)
         if problem:
-            return problem if problem.startswith("cyclic") else f"{ref_repo}:{ref_path}: {problem}"
-    return None
+            raise ValueError(f"the trimmed blob of {sha[:12]}... is {problem}")
+    forget_cached_reads()
+    return span[2] - size
 
 
-def verify_entry(archive_root, repo, entry):
+def trim_kept(p, manifests):
+    """Trim the blobs a pack folder keeps only as bases (needed, but no model lists them): each keeps just the
+    regions other blobs are coded against, down the chain (a trimmed blob reads less of its own bases), until
+    nothing more can go. Returns (blobs trimmed, bytes saved)."""
+    listed = {e["sha256"] for m in manifests.values() for e in m["files"]}
+    trimmed = saved = 0
+    while True:
+        needed = Graph(p, manifests).needed()
+        reads = {}
+        for sha in needed:
+            header, frames, _ = container_index(p.blob_span(sha))
+            for i, a, b in base_reads(header, frames):
+                reads.setdefault(header["bases"][i]["sha256"], []).append((a, b))
+        done = 0
+        for sha in sorted(needed - listed):
+            header, frames, _ = container_index(p.blob_span(sha))
+            keep = regions_read(header, reads.get(sha, []))
+            if all(frame is None or i in keep for i, frame in enumerate(frames)):
+                continue
+            gain = write_trimmed(p, sha, keep)
+            if gain:
+                trimmed, saved, done = trimmed + 1, saved + gain, done + 1
+        if not done:
+            return trimmed, saved
+
+
+def sweep(p):
+    """Delete the blobs of a pack folder that no model needs, and the temporary files of runs that stopped (the pack
+    is locked for this run alone). Nothing is deleted when a manifest, or a blob that models need, cannot be read:
+    what it needs would be unknown. Returns (blobs deleted, their bytes), or None if it could not tell."""
+    problems = []
+    manifests = all_manifests(p, problems)
+    if problems:
+        say(f"  not cleaning up the pack: {problems[0][0]} cannot be used ({problems[0][1]}); run verify")
+        return None
     try:
-        problem = chain_problem(archive_root, repo, entry)
-    except Exception as e:  # a malformed entry: report it like any other problem
-        return f"cannot check it: {e!r}"
-    if problem:
-        return problem
-    h, size = hashlib.sha256(), 0
+        needed = Graph(p, manifests).needed()
+    except (OSError, ValueError) as e:
+        say(f"  not cleaning up the pack: a blob that models need cannot be read ({e}); run verify")
+        return None
+    tree, count, freed = SafeTree(p.root), 0, 0
+    for sha in sorted(p.blob_ids() - needed):
+        rel = blob_rel(sha)
+        size = os.path.getsize(p.full(rel))
+        if tree.remove(rel):
+            tree.prune(rel)
+            count, freed = count + 1, freed + size
+    for rel in p.leftovers():
+        tree.remove(rel)
+    forget_cached_reads()
     try:
-        for chunk in iter_entry_bytes(archive_root, repo, entry):
-            h.update(chunk)
-            size += len(chunk)
-    except Exception as e:
-        return f"decode failed: {e}"
-    if size != entry.get("size") or h.hexdigest() != entry.get("sha256"):
-        return "restored bytes differ from original sha256"
-    return None
-
-
-def physical_index(manifests, blocked):
-    """sha256 -> (repo, path) of every file stored in the archive (raw or container), except in blocked repos."""
-    index = {}
-    for repo, manifest in manifests.items():
-        if repo not in blocked:
-            for e in manifest["files"]:
-                if e["method"] != "same":
-                    index.setdefault(e["sha256"], (repo, e["path"]))
-    return index
+        trimmed, saved = trim_kept(p, manifests)
+    except (OSError, ValueError) as e:
+        say(f"  bases kept for other models not trimmed: {e}")
+        trimmed = saved = 0
+    if trimmed:
+        say(f"  trimmed {human(saved)} from {trimmed} blob(s) kept as bases: only what other files are coded against "
+            "stays", event="trimmed", blobs=trimmed, size=saved)
+    return count, freed + saved
 
 
 def delta_layout(tensors, fmt, size, chunk_size, base_files, delta_codec):
@@ -1854,82 +2301,325 @@ def delta_layout(tensors, fmt, size, chunk_size, base_files, delta_codec):
     return regions, [candidates[i] for i in used]
 
 
-def pack_file(args, src, rec, repo_path, base, base_files, delta_codec, chunk_size, same_index, stored=None, raw_stored=None):
-    """Store one file and return its manifest entry, not yet verified. A file already stored elsewhere in the
-    archive becomes a same-as reference; a parsed file whose tensors appear in the base repo (by name, in any of its
-    files: base_files) becomes a delta against those tensors; anything else is stored standalone. A container is
-    written to `stored` (default: <path>.ocz), a small file stored as-is to `raw_stored` (default: <path>)."""
-    entry = dict(rec)
-    levels = (args.zstd_level, args.zstd_tensor_level)
-    fmt, tensors, regions = file_regions(src, rec["size"], chunk_size)
-    if tensors is not None:
-        entry.update(format=fmt, tensors=tensors)
-    if rec["sha256"] in same_index and rec["size"] > RAW_COPY_LIMIT:  # tiny files: a reference is not worth the dependency
-        ref_repo, ref_path = same_index[rec["sha256"]]
-        entry.update(method="same", same_as={"repo": ref_repo, "path": ref_path}, stored=None, stored_size=0, stored_sha256=None)
-        return entry
-    tree = SafeTree(repo_path)  # stored files are new names: placed only where nothing is (replace=False)
-    if rec["size"] <= RAW_COPY_LIMIT and fmt in ("auto", "zstd"):
-        entry.update(stored=raw_stored or portable_path(rec["path"]), method="raw")
-        with open(src, "rb") as f, tree.placing(entry["stored"], replace=False) as out:
-            dst = HashingWriter(out)
-            while block := f.read(16 << 20):
-                dst.write(block)
-        entry.update(stored_size=dst.size, stored_sha256=dst.hash.hexdigest())
+# ----------------------------------------------------------------------------------------------- pack
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+
+
+def base_choice(args):
+    """How bases were chosen, kept in a manifest for its model, or for a file of it (pack --add, rebase --file):
+    rebase --all re-chooses only those chosen "auto", and naming a model rebases its files but those set by hand."""
+    return "forced" if args.base else "none" if args.no_base else "auto"
+
+
+def with_choice(e, choice):
+    """A manifest entry with this choice of its own ("auto": none of its own, the model's)."""
+    e = {k: v for k, v in e.items() if k != "base_choice"}
+    return e if choice == "auto" else {**e, "base_choice": choice}
+
+
+def ratio(part, whole):
+    return f"{part / whole * 100:.2f}%" if whole else "-"
+
+
+def print_entry(rec, info, t0, new=True):
+    """The line for one file packed (new: its blob was written now) or found stored already. It shows what the file
+    adds to the pack (nothing, if stored already); `stored` in the event is the size of its blob either way."""
+    note = "verified" if new else "stored already"
+    if new and info["bases"]:
+        models = sorted({b.get("model") or "?" for b in info["bases"]})
+        note += f", {info['matched'] / max(rec['size'], 1) * 100:.0f}% matched in {', '.join(models)}"
+    added = info["stored"] if new else 0
+    say(f"  {rec['path']:<34} {info['method']:<18} {human(rec['size']):>12} -> {human(added):>12}"
+        f"  {added / max(rec['size'], 1) * 100:6.2f}%  {note}  ({time.perf_counter() - t0:.0f}s)",
+        event="file", path=rec["path"], size=rec["size"], stored=info["stored"], added=added, method=info["method"],
+        new=new, bases=[{k: b.get(k) for k in ("model", "path", "sha256")} for b in info["bases"]])
+
+
+def pack_blob(args, p, src, rec, fmt, tensors, regions, base, manifests, blocked=frozenset(), replace=False, keep=None):
+    """Store the file at src (its record rec) as its blob: a delta against the model `base` if its tensors are found
+    there (by name, in any of its files whose blobs are not `blocked`), else standalone (`regions`). It is decoded
+    back before it takes its place; an ans16 delta that fails is redone as an XOR delta. Returns blob_info of it."""
+    levels, chunk_size = (args.zstd_level, args.zstd_tensor_level), args.chunk_mib << 20
+    files = [f for f in manifests[base]["files"] if f["sha256"] not in blocked] if base else []
+    for codec in dict.fromkeys([args.delta_codec, "xor"]):
+        layout, used = delta_layout(tensors, fmt, rec["size"], chunk_size, files, codec)
+        bases = [{"sha256": f["sha256"], "size": f["size"], "model": base, "path": f["path"]} for f in used]
+        header = {"original_size": rec["size"], "sha256": rec["sha256"], "method": method_of(fmt, layout or regions),
+                  "regions": layout or regions, "bases": bases}
+        try:
+            base_paths = []
+            for b in bases:
+                PROGRESS.at(f"{rec['path']}: restoring its base {b['path']}")
+                base_paths.append(cached_base(p, b["sha256"]))
+            PROGRESS.at(rec["path"])
+            fill = lambda out: write_container(src, out, header, base_paths, levels, args.workers)  # noqa: E731
+            store_blob(p, rec["sha256"], rec["size"], fill, replace, keep)
+            return blob_info(p, rec["sha256"])
+        except BlobFailed as e:
+            if not bases or codec == "xor" or isinstance(p, NewFilePack):
+                hint = "; nothing written: pack again with --delta-codec xor" if bases and codec != "xor" else ""
+                sys.exit(f"  VERIFY FAILED {rec['path']}: {e}{hint}")
+            say(f"    ans16 failed verification ({e}); redoing this file as an XOR delta")
+        finally:
+            release_cached_bases()
+
+
+def pack_model(args, p, source, name, paths, manifests, base):
+    """Pack the files `paths` of the folder `source` as the model `name` and put its manifest in `manifests`: a new
+    model, or with --replace in place of the model of that name, or with --add into it (files of the same path
+    replaced, the others kept). A file already stored in the pack (by its SHA-256) is not stored again."""
+    clash = next((n for n in manifests if n != name and name_key(n) == name_key(name)), None)
+    if clash:
+        sys.exit(f"the name {name} is taken: the model {clash} has the same manifest file ({manifest_rel(clash)}) "
+                 "where case is ignored")
+    if base and base not in manifests:
+        sys.exit(f"--base {base}: no model of that name in {p.root}")
+    say(f"hashing {len(paths)} files in {source}")
+    full = {rel: os.path.join(source, *rel.split("/")) for rel in paths}
+    PROGRESS.begin(f"hashing {name}", sum(os.path.getsize(f) for f in full.values()))
+    records = []
+    for rel in paths:
+        PROGRESS.at(rel)
+        records.append({"path": rel, "size": os.path.getsize(full[rel]), "sha256": sha256_file(full[rel], counted=True)})
+    have = p.blob_ids()
+    how = f"delta base: {base}" if base else "no delta base" if args.no_base else "delta base chosen per file"
+    say(f"packing {name} -> {p.root}  ({how})")
+    PROGRESS.begin(f"packing {name}", 2 * sum(r["size"] for r in records if r["sha256"] not in have))
+    others = {n: m for n, m in manifests.items() if n != name}
+    known = {e["sha256"]: e for m in manifests.values() for e in m["files"]}  # files the pack has already
+    entries, added = [], 0
+    for rec in records:
+        src, t0 = full[rec["path"]], time.perf_counter()
+        PROGRESS.at(rec["path"])
+        damaged = partial = None
+        if rec["sha256"] in have:
+            damaged = blob_problem(p, rec["sha256"])
+            partial = not damaged and blob_header(p, rec["sha256"]).get("partial")
+            if not damaged and not partial:  # stored already: nothing is read from the source again (it may have changed since)
+                same = known.get(rec["sha256"], {})
+                entries.append(dict(rec, **{k: same[k] for k in ("format", "tensors") if k in same}))
+                print_entry(rec, blob_info(p, rec["sha256"]), t0, new=False)
+                continue
+            say(f"    the stored copy of {rec['path']} " + (f"is damaged ({damaged})" if damaged else "keeps only the part of it "
+                "other files are coded against") + "; storing it again")
+        fmt, tensors, regions = file_regions(src, rec["size"], args.chunk_mib << 20)
+        entries.append(dict(rec, **({"format": fmt, "tensors": tensors} if tensors is not None else {})))
+        chosen = base
+        # stored again over a blob others may be coded against: never against those (a cycle)
+        blocked = Graph(p, manifests, strict=False).above(rec["sha256"]) if damaged or partial else frozenset()
+        if not chosen and not args.no_base and tensors:
+            chosen = pick_base(args, p, rec, fmt, tensors, file_reader(src), others, blocked)
+        info = pack_blob(args, p, src, rec, fmt, tensors, regions, chosen, others, blocked, replace=bool(damaged or partial))
+        have.add(rec["sha256"])
+        known[rec["sha256"]] = entries[-1]
+        added += info["stored"]
+        print_entry(rec, info, t0)
+    choice = "forced" if base else "none" if args.no_base else "auto"
+    if args.add:  # into the model as it is: same paths replaced, the rest kept, in their order
+        old = manifests[name]
+        new = {e["path"]: with_choice(e, choice) for e in entries}  # a choice made for these files is theirs
+        entries = [new.pop(e["path"], e) for e in old["files"]] + list(new.values())
+        manifest = {**old, "tool": tool_version(), "files": entries, "revision": args.revision or old.get("revision")}
     else:
-        entry["stored"] = stored or portable_path(rec["path"]) + ".ocz"
-        delta_regions, used = delta_layout(tensors, fmt, rec["size"], chunk_size, base_files, delta_codec)
-        if used:
-            files = [{"path": f["path"], "sha256": f["sha256"]} for f in used]
-            delta = {"repo": base, "files": files, "op": delta_codec}
-            for f in files:  # kept for the verification that follows; cmd_pack releases them
-                key = (base, f["path"], f["sha256"])
-                if key not in _BASE_CACHE:
-                    _BASE_CACHE[key] = materialize_file(args.archive_root, base, f["path"], f["sha256"])
-            base_paths = [_BASE_CACHE[(base, f["path"], f["sha256"])] for f in files]
-            codecs_used, size, sha = write_container(src, entry["stored"], delta_regions, levels, delta, base_paths,
-                                                     args.workers, tree, replace=False)
-            matched = sum(r["length"] for r in delta_regions if "base" in r)
-            kind = "ans16" if any(r["kind"] == "ans16" for r in delta_regions) else "xor"
-            entry.update(method=f"{fmt}+{kind}", delta_base=base, delta_files=files, matched_bytes=matched)
-        else:
-            codecs_used, size, sha = write_container(src, entry["stored"], regions, levels, tree=tree, replace=False)
-            entry["method"] = fmt
-        entry["frame_codecs"] = {
-            CODEC_NAMES[c & ~STANDALONE] + ("/standalone" if c & STANDALONE else ""): n for c, n in sorted(codecs_used.items())
+        manifest = {
+            "format": MANIFEST_FORMAT,
+            "format_version": FORMAT_VERSION,
+            "name": name,
+            "revision": args.revision,
+            "tool": tool_version(),
+            "created": now(),
+            "base_choice": choice,
+            "files": entries,
         }
-        entry.update(stored_size=size, stored_sha256=sha)  # of the bytes written, not of whatever the path holds now
-    return entry
+    write_manifest(p, manifest)
+    manifests[name] = manifest
+    total = sum(e["size"] for e in entries)
+    stored = sum(p.blob_span(sha)[2] for sha in {e["sha256"] for e in entries})
+    say(f"  total {human(total)} -> {human(stored)} = {ratio(stored, total)}; new in the pack: {human(added)}",
+        event="model", name=name, size=total, stored=stored, added=added)
 
 
-def remove_orphans(repo_path, old_entries, entries):
-    """After a re-pack, delete the files the previous manifest stored that the new one no longer uses (the old
-    containers, which were stored again under the other name, or turned into same-as references). Nothing else in
-    the directory is touched, so files added by other tools (recovery data, notes) stay, though they may now describe
-    outdated contents."""
-    keep = {name_key(e["stored"]) for e in entries if e.get("stored")}
-    tree = SafeTree(repo_path)
-    for e in old_entries:
-        rel = e.get("stored")
-        if rel and name_key(rel) not in keep and tree.remove(rel):
-            tree.prune(rel)
-            print(f"  removed {rel} (no longer used by the manifest)")
+def folder_pack_for_writing(root):
+    """The pack folder `root`, locked for this run alone. A folder that does not exist, is empty or holds only _kit
+    becomes one; any other folder that is no pack stops the program, as does one inside a pack folder."""
+    root = os.path.abspath(root)
+    inside = pack_folder_of(root)
+    if inside and os.path.normcase(inside) != os.path.normcase(os.path.realpath(root)):
+        sys.exit(f"{root} is inside the pack folder {inside}: pack into that pack folder, or one of its own")
+    if not inside:
+        if os.path.exists(root):
+            if not os.path.isdir(root):
+                sys.exit(f"{root} is not a folder")
+            others = sorted(set(os.listdir(root)) - {KIT, LOCK_NAME})
+            if others:
+                sys.exit(f"{root} is not a pack folder (no {MARKER} in it) and holds other files, e.g. {others[0]}: "
+                         "give a new or empty folder")
+        os.makedirs(root, exist_ok=True)
+    lock_archive(root, exclusive=True)
+    p = FolderPack(root)
+    if not os.path.exists(p.full(MARKER)):
+        with contextlib.suppress(FileExistsError), SafeTree(root).placing(MARKER, replace=False) as f:
+            f.write(json.dumps({**MARKER_JSON, "changed": now()}).encode())
+    problem = marker_problem(p)
+    if problem:
+        sys.exit(f"{root}: {problem}")
+    return p
 
 
-def remove_unreferenced(archive_root, repo, names):
-    """For a pack or rebase that stopped early: delete these new stored files (names inside the model folder),
-    unless the manifest on disk already uses them."""
+def pack_into_folder(args, root, plans):
+    p = folder_pack_for_writing(root)
+    manifests = all_manifests(p)
+    planned = {name for _, name, _ in plans}
+    base = args.base if not args.base or args.base in planned else model_named(manifests, args.base, p)
+    for _, name, _ in plans:  # before anything is packed
+        if name in manifests and not (args.replace or args.add):
+            sys.exit(f"{p.root} holds a model named {name} already: add --replace to replace it with these files, or "
+                     "--add to add them to it (files of the same path replaced)")
+        if args.add and name not in manifests:
+            sys.exit(f"--add: no model named {name} in {p.root} to add the files to")
     try:
-        in_use = {name_key(e["stored"]) for e in load_manifest(archive_root, repo)["files"] if e.get("stored")}
-    except FileNotFoundError:
-        in_use = set()  # a first pack: no manifest refers to anything yet
-    except (OSError, ValueError):
-        return  # cannot tell: leave them
-    tree = SafeTree(os.path.join(archive_root, repo_dir_name(repo)))
-    for name in names:
-        if name_key(name) not in in_use:
-            tree.remove(name)
-            tree.prune(name)
+        for source, name, paths in plans:
+            if name in manifests:
+                say(f"adding the files of {source} to {name}" if args.add else
+                    f"{name} is in the pack already: it is replaced by the files of {source}")
+            pack_model(args, p, source, name, paths, manifests, base if base != name else None)
+    finally:  # what no model needs now: an earlier version's blobs, or this run's if it stopped early
+        result = sweep(p)
+        touch_marker(p)
+        PROGRESS.end()
+    if result and result[0]:
+        say(f"deleted {result[0]} blob(s) ({human(result[1])}) no model needs any more")
+    with contextlib.suppress(OSError, ValueError):  # a hint only
+        rebase_hint(args, p, all_manifests(p), planned)
+
+
+def rebase_hint(args, p, manifests, new):
+    """Name the models (bases chosen automatically) that may store smaller against the models just packed: those with
+    tensor files of which these hold, by name and size, at least half the bytes, and more than they are coded against
+    now. Their manifests alone tell it; rebase finds out."""
+    graph = Graph(p, manifests, strict=False)
+    found = []
+    for name in sorted(set(manifests) - set(new)):
+        if manifests[name].get("base_choice", "auto") != "auto":
+            continue
+        for e in manifests[name]["files"]:
+            if not e.get("tensors"):
+                continue
+            above = graph.above(e["sha256"])
+            offered = [f for n in new for f in manifests[n]["files"]
+                       if f.get("format") == e["format"] and f.get("tensors") and f["sha256"] not in above]
+            if not offered:
+                continue
+            match = match_against_base(e["tensors"], offered, args.delta_codec)
+            could = sum(m[4] for m in map(match, e["tensors"]) if m)
+            now = blob_info(p, e["sha256"])["matched"]
+            if could >= e["size"] / 2 and could > now + e["size"] / 4:
+                found.append(name)
+                break
+    if found:
+        say(f"  may store smaller against {', '.join(sorted(new))}: {', '.join(found)} (rebase them to find out)",
+            event="hint", models=found)
+
+
+def pack_into_new_file(args, target, plans):
+    """pack into a new pack file, written as it goes (no folder in between): each blob is read back from the
+    unfinished file to check it, and the file gets its name only once it is complete."""
+    target = os.path.abspath(target)
+    folder = os.path.dirname(target)
+    problem = place_problem(folder)
+    if problem:
+        sys.exit(f"a pack file is not written into a pack folder: {problem}")
+    os.makedirs(folder, exist_ok=True)
+    say(f"packing into a new pack file: {target}")
+    with SafeTree(folder).placing(os.path.basename(target), replace=False) as f:
+        p, manifests = NewFilePack(f, target), {}
+        for source, name, paths in plans:
+            pack_model(args, p, source, name, paths, manifests, args.base if args.base != name else None)
+        p.zip.close()
+    PROGRESS.end()
+    say(f"wrote {target}: {human(os.path.getsize(target))}", event="summary", path=target, size=os.path.getsize(target))
+
+
+def cmd_pack(args):
+    if len(args.paths) < 2:
+        sys.exit("give the folder(s) to pack, then the pack folder or the new pack file to pack into")
+    *sources, target = args.paths
+    sources = [os.path.abspath(s) for s in sources]
+    if len(sources) > 1 and (args.name or args.files):
+        sys.exit("--name and --file are for one folder at a time")
+    if args.files and args.exclude:
+        sys.exit("use --file or --exclude, not both")
+    new_file = is_oczip(target)
+    if new_file and os.path.lexists(target):
+        sys.exit(f"{target} exists already: a pack file is written whole, never added to. To add a model to it, "
+                 "extract it into a pack folder (it is a ZIP), pack into that folder, then export it")
+    plans, keys = [], set()
+    for source in sources:
+        if not os.path.isdir(source):
+            sys.exit(f"{source} is not a folder")
+        problem = place_problem(source)
+        if problem:
+            sys.exit(f"cannot pack {problem}: pack the original files, from a folder of their own")
+        if holds(source, target) and not args.files:  # with --file, only the files named are read
+            sys.exit(f"{source} holds {target}: pack a folder that does not, or put the pack somewhere else")
+        name = args.name or os.path.basename(source)
+        problem = name_problem(name)
+        if problem:
+            sys.exit(problem + ("" if args.name else f" (taken from the folder name of {source}: choose one with --name)"))
+        if name_key(name) in keys:
+            sys.exit(f"two of the folders would be the model {name}: pack them one at a time, each with --name")
+        keys.add(name_key(name))
+        if args.files:
+            paths, problems = listed_files(source, args.files)
+            problems += [f"{rel} is inside {target}" for rel in paths if holds(target, os.path.join(source, *rel.split("/")))]
+            if problems:
+                sys.exit(f"cannot pack these files of {source}:\n  " + "\n  ".join(problems))
+        else:
+            paths, problems = source_files(source, args.exclude)
+        if problems:
+            sys.exit(f"cannot pack {source} as it is:\n  " + "\n  ".join(problems)
+                     + "\nskip these with --exclude (e.g. --exclude \"" + problems[0].split(" ")[0].rstrip("/")
+                     + "\"), or pack what a folder link points to as a folder of its own")
+        if not paths:
+            sys.exit(f"no files to pack in {source}")
+        plans.append((source, name, paths))
+    plans.sort(key=lambda plan: plan[1] != args.base)  # a base given with --base and packed now goes first
+    if new_file and args.add:
+        sys.exit("--add adds files to a model of a pack folder: a new pack file holds none yet")
+    if new_file:
+        if args.base and plans[0][1] != args.base:
+            sys.exit(f"--base {args.base}: a new pack file holds only the models packed into it now")
+        pack_into_new_file(args, target, plans)
+    else:
+        pack_into_folder(args, target, plans)
+
+
+def pack_for_reading(path, no_lock=False):
+    """The pack at `path`, for list, verify, restore and export: a pack folder locked against changes meanwhile
+    (shared: other readers may run), or a pack file, which nothing changes."""
+    try:
+        p = open_pack(path)
+    except (OSError, ValueError) as e:
+        sys.exit(f"cannot open {path}: {e.strerror if isinstance(e, OSError) and e.strerror else e}")
+    if isinstance(p, FolderPack):
+        lock_archive(p.root, exclusive=False, skip=no_lock)
+    return p
+
+
+def folder_for_change(path, exclusive=True):
+    """The pack folder at `path`, locked (exclusive: for this run alone), for remove, rename and rebase."""
+    if is_oczip(path):
+        sys.exit(f"{path} is a pack file: it is read-only. Extract it into a pack folder (it is a ZIP), change it "
+                 "there, then export it again")
+    try:
+        p = open_pack(path)
+    except (OSError, ValueError) as e:
+        sys.exit(f"cannot open {path}: {e.strerror if isinstance(e, OSError) and e.strerror else e}")
+    lock_archive(p.root, exclusive=exclusive)
+    return p
 
 
 def excluded(rel, patterns):
@@ -2102,7 +2792,7 @@ def lock_archive(archive_root, exclusive, skip=False):
     lock at all goes on only if the system reports the archive's volume read-only (nothing can change it then), or
     with --no-lock (skip): its user's word that nothing changes the archive meanwhile."""
     if skip:
-        print("not locking the pack folder (--no-lock): nothing may change it while this runs")
+        say("not locking the pack folder (--no-lock): nothing may change it while this runs")
         return
     path = os.path.join(archive_root, LOCK_NAME)
     fd = None
@@ -2124,8 +2814,8 @@ def lock_archive(archive_root, exclusive, skip=False):
                  "; if you are sure nothing changes the archive while this runs, add --no-lock"))
     if not locked:
         os.close(fd)
-        sys.exit("the pack folder is in use by another pack, rebase, verify or restore: run this when it has finished"
-                 if exclusive else "the pack folder is being changed by another pack or rebase: run this when it has finished")
+        sys.exit("the pack folder is in use by another command: run this when it has finished" if exclusive else
+                 "the pack folder is being changed by another pack, remove, rename or rebase: run this when it has finished")
     _HELD_LOCK.append(fd)
 
 
@@ -2136,322 +2826,6 @@ def holds(folder, path):
         return os.path.commonpath([folder, path]) == folder
     except ValueError:  # another drive
         return False
-
-
-def refuse_single_file(archive_root):
-    if is_oczip(archive_root):
-        sys.exit(f"{archive_root} is a pack file ({OCZIP}): it is read-only. To rebase it, extract it into a pack "
-                 "folder (it is a ZIP), rebase there, then bundle it again")
-
-
-def pack_into_new_file(args):
-    """pack into a new pack file: into a folder of its own beside it first, then bundled into it (verified) and that
-    folder deleted. A pack file is written whole, so there is never one to add to."""
-    target = os.path.abspath(args.archive_root)
-    if os.path.lexists(target):
-        sys.exit(f"{args.archive_root} exists already: a pack file is written whole, never added to. To add a model to "
-                 "it, extract it into a pack folder (it is a ZIP), pack into that folder, then bundle it again")
-    if args.base:
-        sys.exit("--base: a new pack file holds no other model to be a base")
-    source = os.path.abspath(args.source_dir)
-    if holds(source, target) and not args.files:
-        sys.exit(f"{args.archive_root} would be inside {source}, the folder packed: write it somewhere else")
-    folder = os.path.join(os.path.dirname(target), f".oc-{secrets.token_hex(6)}.pack")
-    print(f"packing into a new pack file: first into {folder}, then bundled into {target}")
-    os.makedirs(folder)
-    try:
-        cmd_pack(argparse.Namespace(**{**vars(args), "archive_root": folder}))
-        unlock_archive(folder)  # bundle locks it again
-        cmd_bundle(argparse.Namespace(archive_root=folder, oczip=target, verify=None, delete=True, overwrite=False))
-    finally:
-        unlock_archive(folder)
-        shutil.rmtree(folder, ignore_errors=True)  # only what was packed into it, if it was not bundled
-
-
-def cmd_pack(args):
-    if is_oczip(args.archive_root):
-        return pack_into_new_file(args)
-    source = os.path.abspath(args.source_dir)
-    if not os.path.isdir(source):
-        sys.exit(f"{source} is not a folder")
-    if holds(source, args.archive_root) and not args.files:  # with --file, only the files named are read
-        sys.exit(f"{source} holds the pack folder {args.archive_root}: pack a folder that does not")
-    problem = place_problem(source, args.archive_root)
-    if problem:
-        sys.exit(f"cannot pack {problem}: pack the original files, from a folder of their own")
-    if args.base:
-        args.base = model_name(args.base, args.archive_root)
-    name = args.name or os.path.basename(source)
-    problem = name_problem(name)
-    if problem:
-        sys.exit(problem + ("" if args.name else " (taken from the folder name: choose one with --name)"))
-    if args.files and args.exclude:
-        sys.exit("use --file or --exclude, not both")
-    if args.files:
-        paths, problems = listed_files(source, args.files)
-        problems += [f"{rel} is inside the pack folder {args.archive_root}" for rel in paths
-                     if holds(args.archive_root, os.path.join(source, *rel.split("/")))]
-        if problems:
-            sys.exit(f"cannot pack these files of {source}:\n  " + "\n  ".join(problems))
-    else:
-        paths, problems = source_files(source, args.exclude)
-    if problems:
-        sys.exit(f"cannot pack {source} as it is:\n  " + "\n  ".join(problems)
-                 + "\nskip these with --exclude (e.g. --exclude \"" + problems[0].split(" ")[0].rstrip("/")
-                 + "\"), or pack what a folder link points to as a folder of its own")
-    if not paths:
-        sys.exit(f"no files to pack in {source}")
-    print(f"hashing {len(paths)} files in {source}")
-    records = []
-    for rel in paths:
-        full = os.path.join(source, *rel.split("/"))
-        records.append({"path": rel, "size": os.path.getsize(full), "sha256": sha256_file(full)})
-    staged = {"repo": name, "revision": args.revision, "files": records}
-    repo_path = os.path.join(args.archive_root, repo_dir_name(staged["repo"]))
-    os.makedirs(args.archive_root, exist_ok=True)
-    lock_archive(args.archive_root, exclusive=True)  # from reading the manifests to the last cleanup
-    manifests = all_manifests(args.archive_root)
-    if name not in manifests and os.path.isdir(repo_path) and any(files for _, _, files in os.walk(repo_path)):
-        sys.exit(f"{repo_path} already holds files but is not the folder of a model named {name!r}: choose another --name")
-    lost = files_others_need(manifests, name, records)
-    if lost:
-        users = sorted({u for _, us in lost for u in us})
-        listed = "\n".join(f"  {path}  (needed by {', '.join(us)})" for path, us in lost)
-        sys.exit(f"re-packing {name} would change or drop files other models need to be restored:\n{listed}\n"
-                 f"pack it under another name, or first store those models without it, e.g.\n"
-                 f"  python -I llm_archive.py rebase {quoted(args.archive_root)} {' '.join(map(quoted, users))} "
-                 f"--no-base --no-dedupe")
-    os.makedirs(repo_path, exist_ok=True)
-    old_entries = manifests[name]["files"] if name in manifests else []
-    # As in rebase, a re-pack stores every file under a name the current manifest does not use, so the archive stays
-    # complete until the new manifest replaces it. Only a file stored as-is may be written over its old copy, and only
-    # when the bytes are the same.
-    kept_raw = {e["path"]: e for e in old_entries if e["method"] == "raw" and e.get("stored")}
-    names = StoredNames([e["stored"] for e in old_entries if e.get("stored")], on_disk=repo_path)
-    chunk_size = args.chunk_mib << 20
-    blocked = {name} | dependents(manifests, name)  # using any of these as a base or reference would make a cycle
-    if args.base and args.base not in manifests:
-        sys.exit(f"--base {args.base}: no model of that name in {args.archive_root}")
-    if args.base in blocked:
-        sys.exit(f"--base {args.base}: it needs {name} to be restored, so it cannot be its base")
-    same_index = physical_index(manifests, blocked) if args.dedupe else {}
-    entries = []
-    how = f"delta base: {args.base}" if args.base else "no delta base" if args.no_base else "delta base chosen per file"
-    print(f"packing {name} -> {repo_path}  ({how})")
-    pending = []  # names this run may have written that no manifest refers to yet
-    try:
-        for rec in staged["files"]:
-            src = os.path.join(source, *rec["path"].split("/"))
-            t0 = time.perf_counter()
-            old = kept_raw.get(rec["path"])
-            if old and old["sha256"] == rec["sha256"] and old["size"] == rec["size"]:
-                # stored as-is before, with the same bytes: keep that stored file instead of copying the source over
-                # it (the source may have changed since it was hashed); a damaged copy is stored again below
-                entry = {**rec, **{k: old[k] for k in ("method", "stored", "stored_size", "stored_sha256")}}
-                problem = verify_entry(args.archive_root, name, entry)
-                if not problem:
-                    print_entry(rec, entry, t0)
-                    entries.append(entry)
-                    continue
-                print(f"    the stored copy of {rec['path']} is damaged ({problem}); storing it again")
-            base = args.base
-            if not base and not args.no_base and not (rec["size"] > RAW_COPY_LIMIT and rec["sha256"] in same_index):
-                fmt, tensors = file_tensors(src, rec["size"])
-                base = pick_base(args, rec, fmt, tensors, file_reader(src), manifests, blocked)
-            base_files = manifests[base]["files"] if base else []
-            # new files only ever go under names nothing in the folder uses yet
-            container = names.fresh(rec["path"])
-            raw = names.fresh(rec["path"], "") if rec["size"] <= RAW_COPY_LIMIT else None
-            pending += [n for n in (container, raw) if n]
-            entry, problem = pack_verified(args, src, rec, repo_path, name, base, base_files, chunk_size, same_index, container, raw)
-            if problem:
-                sys.exit(f"  VERIFY FAILED {rec['path']}: {problem}")
-            print_entry(rec, entry, t0)
-            entries.append(entry)
-            if entry["stored"]:
-                names.add(entry["stored"])  # not for another file of this folder
-        manifest = {
-            "format": "overcompressing-archive",
-            "format_version": FORMAT_VERSION,
-            "tool": TOOL_VERSION,
-            "created": now(),
-            "repo": staged["repo"],
-            "revision": staged["revision"],
-            "base_choice": base_choice(args),
-            "files": entries,
-        }
-        write_manifest(repo_path, manifest)
-        pending.clear()
-        remove_orphans(repo_path, old_entries, entries)
-    finally:
-        if pending:  # stopped early: delete the new files, unless the manifest on disk already uses them
-            remove_unreferenced(args.archive_root, name, pending)
-    total, stored = sum(e["size"] for e in entries), sum(e["stored_size"] for e in entries)
-    print(f"  total {human(total)} -> {human(stored)}" + (f" = {stored / total * 100:.2f}%" if total else ""))
-
-
-def files_others_need(manifests, repo, records):
-    """[(path, [models])] of the files of `repo` that other models refer to (same-as or delta) and that `records`
-    (the files about to be packed) would change or drop."""
-    have = {(r["path"], r["sha256"]) for r in records}
-    lost = {}
-    for other, manifest in manifests.items():
-        for e in manifest["files"] if other != repo else ():
-            for ref_repo, path, sha in references(e):
-                if ref_repo == repo and (path, sha) not in have:
-                    lost.setdefault(path, set()).add(other)
-    return sorted((path, sorted(users)) for path, users in lost.items())
-
-
-def quoted(text):
-    return f'"{text}"' if any(ch in text for ch in " ()[]&;") else text
-
-
-def now():
-    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
-
-
-def base_choice(args):
-    """How a model's bases were chosen, kept in its manifest: rebase --all re-chooses only those chosen "auto"."""
-    return "forced" if args.base else "none" if args.no_base else "auto"
-
-
-def pack_verified(args, src, rec, repo_path, repo, base, base_files, chunk_size, same_index, stored=None, raw_stored=None):
-    """pack_file, then decode the stored file back from disk and compare it with the original SHA-256; an ans16
-    delta that fails is redone as an XOR delta. Returns (entry, problem or None)."""
-    try:
-        entry = pack_file(args, src, rec, repo_path, base, base_files, args.delta_codec, chunk_size, same_index, stored, raw_stored)
-        if entry["method"] == "same":
-            # refer to an identical file only if it is intact: the stored hashes along its chain are checked (decoding
-            # it again would take as long as packing); if it is damaged, this file is stored itself instead
-            problem = chain_problem(args.archive_root, repo, entry)
-            if problem:
-                print(f"    {entry['same_as']['repo']}:{entry['same_as']['path']} is damaged ({problem}); storing "
-                      f"{rec['path']} itself instead (run verify)")
-                entry = pack_file(args, src, rec, repo_path, base, base_files, args.delta_codec, chunk_size, {}, stored, raw_stored)
-        problem = verify_entry(args.archive_root, repo, entry) if entry["method"] != "same" else None
-        if problem and entry.get("delta_base") and args.delta_codec == "ans16":
-            print(f"    ans16 failed verification ({problem}); redoing this file as an XOR delta")
-            SafeTree(repo_path).remove(entry["stored"])
-            entry = pack_file(args, src, rec, repo_path, base, base_files, "xor", chunk_size, same_index, stored, raw_stored)
-            problem = verify_entry(args.archive_root, repo, entry)
-    finally:
-        release_cached_bases()
-    return entry, problem
-
-
-def print_entry(rec, entry, t0):
-    if entry["method"] == "same":
-        note = f"same as {entry['same_as']['repo']}:{entry['same_as']['path']}"
-    else:
-        note = "verified"
-        if entry.get("matched_bytes") is not None:
-            note += f", {entry['matched_bytes'] / rec['size'] * 100:.0f}% matched in {entry['delta_base']}"
-    print(
-        f"  {rec['path']:<34} {entry['method']:<18} {human(rec['size']):>12} -> {human(entry['stored_size']):>12}"
-        f"  {entry['stored_size'] / max(rec['size'], 1) * 100:6.2f}%  {note}  ({time.perf_counter() - t0:.0f}s)"
-    )
-
-
-def write_manifest(repo_path, manifest):
-    """Replace manifest.json in one step: a crash leaves either the old manifest or the new one. The new one is
-    written to a temporary file of its own (SafeTree.placing), so no stored file can be in the way."""
-    with SafeTree(repo_path).placing("manifest.json", replace=True) as f:
-        f.write(json.dumps(manifest, indent=1).encode("utf-8"))
-
-
-# ----------------------------------------------------------------------------------------------- rebase
-#
-# rebase re-chooses the base of every file of a model already in the archive, as if it were packed again now. The base
-# is chosen from the archived bytes (read_range), so a file is restored (into OC_TMP) only if its base changes. The
-# new container is written beside the old one under another name, and the old one is deleted only after the new
-# manifest has replaced the old manifest, so the archive is complete at every moment. Models that refer to the rebased
-# one are unaffected: they name its files by path and original SHA-256, which do not change.
-
-
-def name_key(name):
-    """Two stored file names with the same key would be one file on Windows, which ignores case, so a model folder
-    never holds both, whatever system wrote it."""
-    return name.replace("\\", "/").casefold()
-
-
-RESERVED_NAMES = {name_key("manifest.json")}  # the model folder's own file
-
-
-class StoredNames:
-    """Plans the names of the stored files of one model folder as a tree that follows the original paths, so that
-    the folder can be copied to any system: every name valid on Windows and POSIX (windows_part); no two names that
-    differ only in case; never a file where a folder of that name is, or the other way round; never manifest.json at
-    the top; no name ending in .part, and no file whose <name>.part is used (it is written through that). A file or
-    folder name that cannot be used gets .1, .2, ... It starts from the names the current manifest uses, which stay
-    on disk until the new manifest replaces it."""
-
-    def __init__(self, held=(), on_disk=None):
-        """held: stored names of the current manifest; on_disk: the model folder, whose other files, links and
-        folders (e.g. your own notes or recovery data) are never written over either."""
-        self.files = set()  # name_key of every stored file
-        self.folders = {}  # name_key of every stored folder -> its spelling
-        self.folder_of = {}  # original folder path -> stored folder path
-        for name in held:
-            self.add(name)
-        if on_disk and os.path.isdir(on_disk):
-            for dirpath, dirnames, filenames in os.walk(on_disk):
-                rel = os.path.relpath(dirpath, on_disk).replace(os.sep, "/")
-                prefix = "" if rel == "." else rel + "/"
-                for d in dirnames:
-                    if os.path.islink(os.path.join(dirpath, d)):
-                        self.add(prefix + d)  # a link to a folder: occupied like a file
-                    else:
-                        self.folders.setdefault(name_key(prefix + d), prefix + d)
-                for f in filenames:
-                    self.add(prefix + f)
-
-    def add(self, name):
-        """Reserve a stored file name and its folders."""
-        parts = name.split("/")
-        for i in range(1, len(parts)):
-            folder = "/".join(parts[:i])
-            self.folders.setdefault(name_key(folder), folder)
-        self.files.add(name_key(name))
-
-    def free(self, name, in_place=False):
-        """Whether a file may be stored as `name` (in_place: it may already be one, being rewritten)."""
-        key, temp = name_key(name), name_key(name + ".part")
-        return (key not in RESERVED_NAMES and not key.endswith(".part") and key not in self.folders
-                and temp not in self.files and temp not in self.folders and (in_place or key not in self.files))
-
-    def folder(self, path):
-        """The stored folder, ending in "/" (or ""), for the folders of the file at original `path`."""
-        parts, stored = path.split("/")[:-1], ""
-        for i, part in enumerate(parts):
-            original = "/".join(parts[:i + 1])
-            if original not in self.folder_of:
-                base = stored + windows_part(part)
-                for n in itertools.count():
-                    name = f"{base}.{n}" if n else base
-                    key = name_key(name)
-                    if key in self.folders:  # that folder exists already: share it, spelled as it is
-                        name = self.folders[key]
-                        break
-                    if key not in self.files and key not in RESERVED_NAMES and not key.endswith(".part"):
-                        self.folders[key] = name
-                        break
-                self.folder_of[original] = name
-            stored = self.folder_of[original] + "/"
-        return stored
-
-    def stem(self, path):
-        """Where the file at original `path` is stored under its own (portable) name."""
-        return self.folder(path) + windows_part(path.split("/")[-1])
-
-    def fresh(self, path, suffix=".ocz"):
-        """A name for the file at original `path` that no stored file or folder uses: <stem><suffix> or
-        <stem>.<n><suffix> (suffix "" for a file stored as-is)."""
-        stem = self.stem(path)
-        for n in itertools.count():
-            name = f"{stem}.{n}{suffix}" if n else f"{stem}{suffix}"
-            if self.free(name):
-                return name
 
 
 class UnsafePath(OSError):
@@ -2551,6 +2925,7 @@ class SafeTree:
         try:
             fd = os.open(path(temp), flags, 0o644, **where)
             with os.fdopen(fd, "wb") as f:
+                f.temp_path = os.path.join(self.root, *folder, temp)  # to read it back before it is put in place
                 yield f
                 f.flush()
                 os.fsync(f.fileno())
@@ -2667,35 +3042,6 @@ def space_problem(needs):
 class _Mismatch(Exception):
     pass
 
-
-def restore_entry(archive_root, repo, entry, tree, rel, replace):
-    """Write the original bytes of an archived file to rel in tree (SafeTree.placing): into a new temporary file
-    that is put in place only once its size and SHA-256 are right, so on a problem rel is left as it was; over a
-    file already there only if `replace` (else the placing fails, in one step, if a file of that name has appeared).
-    Returns a problem, or None."""
-    problem = chain_problem(archive_root, repo, entry)
-    if problem:
-        return problem
-    try:
-        with tree.placing(rel, replace) as f:
-            out = HashingWriter(f)
-            for chunk in iter_entry_bytes(archive_root, repo, entry):
-                out.write(chunk)
-            if out.size != entry["size"] or out.hash.hexdigest() != entry["sha256"]:
-                raise _Mismatch
-    except _Mismatch:
-        return "restored bytes differ from original sha256"
-    except FileExistsError:
-        return "a file of that name appeared in the destination while restoring: not overwritten (--overwrite replaces it)"
-    except NoReplaceUnsupported as e:
-        return f"{e}; restore into an empty folder with --overwrite instead"
-    except UnsafePath as e:
-        return str(e)
-    except Exception as e:
-        return f"restore failed: {e}"
-    return None
-
-
 def restore_target(dest_dir, parts):
     """Where restore writes the file with these path parts: inside dest_dir, with no link (symlink or junction) on
     the way below dest_dir, since restore never writes through one (SafeTree); ValueError otherwise."""
@@ -2758,282 +3104,54 @@ def restore_plan(dest_dir, entries, flat=False):
     return plan
 
 
-def stored_description(entry):
-    if entry["method"] == "same":
-        return f"the same-as reference to {entry['same_as']['repo']}:{entry['same_as']['path']}"
-    against = f" against {entry['delta_base']}" if entry.get("delta_base") else ""
-    return f"{entry['stored']} ({human(entry['stored_size'])} as {entry['method']}{against})"
-
-
-def rebase_model(args, repo):
-    """Store every file of one model again as pack would now (re-choosing its delta base, and turning it into a
-    same-as reference if an identical file is stored elsewhere), from the archive. Returns its stored size before and
-    after."""
-    forget_cached_reads()  # an earlier model of this run may have been rewritten
-    manifests = all_manifests(args.archive_root)
-    manifest = manifests[repo]
-    old_entries = manifest["files"]
-    blocked = {repo} | dependents(manifests, repo)  # using any of these as a base or reference would make a cycle
-    if args.base in blocked:
-        sys.exit(f"--base {args.base}: it needs {repo} to be restored, so it cannot be its base")
-    repo_path = os.path.join(args.archive_root, repo_dir_name(repo))
-    chunk_size = args.chunk_mib << 20
-    forced = bool(args.base or args.no_base)
-    same_index = physical_index(manifests, blocked) if args.dedupe else {}
-    names = StoredNames([e["stored"] for e in old_entries if e.get("stored")], on_disk=repo_path)
-    how =f"delta base: {args.base}" if args.base else "no delta base" if args.no_base else "delta base chosen per file"
-    how += ("" if args.dedupe else ", no same-as references") + (", dry run" if args.dry_run else "")
-    print(f"rebasing {repo}  ({how})")
-    entries, pending, tmp, plain = [], [], None, 0  # pending: new stored files that no manifest refers to yet
+def restore_entry(p, entry, tree, rel, replace):
+    """Write the original bytes of a model's file to rel in tree (SafeTree.placing): into a new temporary file that
+    is put in place only once its size and SHA-256 are right, so on a problem rel is left as it was; over a file
+    already there only if `replace` (else the placing fails, in one step, if a file of that name has appeared).
+    Returns a problem, or None."""
+    problem = blob_problem(p, entry["sha256"])
+    if problem:
+        return problem
     try:
-        for old in old_entries:
-            rec = {k: old[k] for k in ("path", "size", "sha256")}
-            entries.append(old)
-            same = old["method"] == "same"
-            if same and args.dedupe:
-                print(f"  {rec['path']:<34} unchanged (same-as reference)")
-                continue
-            if not same and rec["size"] > RAW_COPY_LIMIT and rec["sha256"] in same_index:
-                ref_repo, ref_path = same_index[rec["sha256"]]
-                if args.dry_run:
-                    print(f"  {rec['path']:<34} would become a same-as reference to {ref_repo}:{ref_path}")
-                    continue
-                entry = {k: old[k] for k in ("path", "size", "sha256", "format", "tensors") if k in old}
-                entry.update(method="same", same_as={"repo": ref_repo, "path": ref_path}, stored=None, stored_size=0, stored_sha256=None)
-                t0 = time.perf_counter()
-                problem = verify_entry(args.archive_root, repo, entry)  # its stored copy is about to be deleted
-                if problem:
-                    sys.exit(f"  VERIFY FAILED {rec['path']}: {problem}")
-                print_entry(rec, entry, t0)
-                print(f"    replaces {stored_description(old)}")
-                entries[-1] = entry
-                continue
-            if not same and not old.get("tensors"):
-                plain += 1  # no base can hold it: nothing to re-choose
-                continue
-            if forced or not old.get("tensors"):
-                base = args.base
-            else:
-                read = lambda start, length, old=old: read_range(args.archive_root, repo, old, start, length)  # noqa: E731
-                base = pick_base(args, rec, old["format"], old["tensors"], read, manifests, blocked)
-            if not same and base == old.get("delta_base"):
-                print(f"  {rec['path']:<34} unchanged ({'base is still ' + base if base else 'still no base'})")
-                continue
-            if args.dry_run:
-                print(f"  {rec['path']:<34} would be {'stored again' if same else 're-packed'} "
-                      f"{'against ' + base if base else 'without a base'}")
-                continue
-            base_files = manifests[base]["files"] if base else []
-            old_base = {f["path"]: f["size"] for f in manifests.get(old.get("delta_base"), {"files": []})["files"]}
-            reads_now = sum(old_base.get(f["path"], 0) for f in old.get("delta_files", []))
-            reads_new = sum(f["size"] for f in delta_layout(old.get("tensors"), old.get("format"), rec["size"], chunk_size,
-                                                            base_files, args.delta_codec)[1])
-            tmp = tmp or tempfile.mkdtemp(prefix="oc-rebase-", dir=os.environ.get("OC_TMP") or None)
-            # OC_TMP holds the restored file plus the base files its old or new delta reads; the new container is
-            # at most about as big as the file
-            problem = space_problem({tmp: rec["size"] + max(reads_now, reads_new), repo_path: rec["size"] + (1 << 20)})
-            if problem:
-                sys.exit(f"  not enough room to rebase {rec['path']}: {problem} (OC_TMP picks the temporary folder)")
-            t0 = time.perf_counter()
-            name = local_parts(rec["path"])[-1]  # keeps the extension file_regions looks at
-            src = os.path.join(tmp, name)
-            try:
-                problem = restore_entry(args.archive_root, repo, old, SafeTree(tmp), name, replace=False)
-                if problem:
-                    sys.exit(f"  cannot restore {rec['path']}: {problem}")
-                # as in pack: a new container, or for a small file a copy as-is, each under a name nothing uses yet
-                container = names.fresh(rec["path"])
-                raw = names.fresh(rec["path"], "") if rec["size"] <= RAW_COPY_LIMIT else None
-                planned = [n for n in (container, raw) if n]
-                pending += planned
-                entry, problem = pack_verified(args, src, rec, repo_path, repo, base, base_files, chunk_size, {}, container, raw)
-            finally:
-                SafeTree(tmp).remove(name)
-            if problem:
-                sys.exit(f"  VERIFY FAILED {rec['path']}: {problem}")
-            names.add(entry["stored"])
-            print_entry(rec, entry, t0)
-            if forced or same or entry["stored_size"] < old["stored_size"]:
-                entries[-1] = entry
-                print(f"    replaces {stored_description(old)}")
-            else:
-                SafeTree(repo_path).remove(entry["stored"])
-                SafeTree(repo_path).prune(entry["stored"])
-                pending = [n for n in pending if n not in planned]
-                print(f"    not smaller than {stored_description(old)}: kept that")
-        if any(e is not o for e, o in zip(entries, old_entries)):
-            write_manifest(repo_path, {**manifest, "tool": TOOL_VERSION, "base_choice": base_choice(args),
-                                       "rebased": now(), "files": entries})
-            pending.clear()
-            remove_orphans(repo_path, old_entries, entries)
-        elif not args.dry_run and manifest.get("base_choice", "auto") != base_choice(args):
-            write_manifest(repo_path, {**manifest, "base_choice": base_choice(args)})  # so that --all respects it
-    finally:
-        if pending:  # stopped early: delete the new files, unless the manifest on disk already uses them
-            remove_unreferenced(args.archive_root, repo, pending)
-        if tmp:
-            shutil.rmtree(tmp, ignore_errors=True)
-    if plain:
-        print(f"  {plain} file(s) without tensors unchanged")
-    before, after = sum(e["stored_size"] for e in old_entries), sum(e["stored_size"] for e in entries)
-    if args.dry_run:
-        print(f"  stored {human(before)} (dry run: nothing changed)")
-    else:
-        change = f"{(after - before) / max(before, 1):+.1%}" if after != before else "unchanged"
-        print(f"  stored {human(before)} -> {human(after)}  ({change})")
-    return before, after
-
-
-def cmd_rebase(args):
-    if args.all:
-        if len(args.targets) != 1:
-            sys.exit("--all takes one pack folder (the folder holding the model folders)")
-        args.archive_root, args.repos = args.targets[0], []
-        if os.path.isfile(os.path.join(args.archive_root, "manifest.json")):
-            sys.exit(f"{args.archive_root} is a model folder: with --all, give the pack folder that holds it")
-    else:
-        if not args.targets:
-            sys.exit("give the folders of the models to rebase, or a pack folder with --all")
-        models = []
-        for path in args.targets:
-            try:
-                models.append(model_at(path))
-            except ValueError as e:
-                sys.exit(f"cannot rebase {path}: {e}")
-        if len({os.path.normcase(os.path.realpath(root)) for root, _ in models}) > 1:
-            sys.exit("the models to rebase must be in one pack folder")
-        args.archive_root, args.repos = models[0][0], [repo for _, repo in models]
-    refuse_single_file(args.archive_root)
-    if args.all and args.base:
-        sys.exit("--base needs the models named, not --all")
-    if args.base:
-        args.base = model_name(args.base, args.archive_root)
-    if not os.path.isdir(args.archive_root):
-        sys.exit(f"{args.archive_root} is not a folder")
-    lock_archive(args.archive_root, exclusive=not args.dry_run)
-    manifests = all_manifests(args.archive_root)
-    if not manifests:
-        sys.exit(f"no models found in {args.archive_root}")
-    for repo in args.repos + ([args.base] if args.base else []):
-        if repo not in manifests:
-            sys.exit(f"no model named {repo} in {args.archive_root}")
-    depth = chain_depths(manifests)
-    repos = sorted(args.repos or manifests, key=lambda r: (depth[r], r))  # bases before the models that use them
-    before = after = 0
-    for repo in repos:
-        choice = manifests[repo].get("base_choice", "auto")  # manifests older than rebase do not say: "auto"
-        if args.all and not args.no_base and choice != "auto":
-            option = "--no-base" if choice == "none" else "--base"
-            print(f"skipping {repo}: its bases were set with {option} (name it to rebase it anyway)")
-            continue
-        b, a = rebase_model(args, repo)
-        before, after = before + b, after + a
-    if len(repos) > 1:
-        print(f"total stored {human(before)}" + (" (dry run: nothing changed)" if args.dry_run else f" -> {human(after)}"))
-
-
-def all_manifests(archive_root, problems=None):
-    """{repo: manifest} of every model in the archive. A folder whose manifest cannot be read or trusted (see
-    manifest_problem; its folder must also be named after its model) is added to `problems` as (folder, problem) if
-    given; otherwise the program stops, since a model it cannot see may depend on the others."""
-    manifests = {}
-    for d in model_folders(archive_root):
-        path = os.path.join(archive_root, d, "manifest.json")
-        try:
-            manifest = read_manifest(archive_root, d)
-            problem = manifest_problem(manifest)
-            if not problem and os.path.normcase(repo_dir_name(manifest["repo"])) != os.path.normcase(d):
-                problem = f"it holds the model {manifest['repo']!r}, whose folder is {repo_dir_name(manifest['repo'])}"
-            if not problem and manifest["repo"] in manifests:  # e.g. in an .oczip, folders differing only in case
-                problem = f"another folder holds the model {manifest['repo']!r} already"
-        except (OSError, ValueError) as e:
-            problem = f"cannot read it ({e})"
-        if problem:
-            if problems is None:
-                sys.exit(f"{path}: {problem}\nfix it, or move that folder out of the pack folder, before changing the pack")
-            problems.append((d, problem))
-            continue
-        manifests[manifest["repo"]] = manifest
-    return manifests
-
-
-def verify_models(archive_root, repos):
-    """Decode every file of these models (none: of every model) and check it, printing a line for each; returns
-    (failures, files checked)."""
-    failures, problems, checked = 0, [], 0
-    repos = repos or list(all_manifests(archive_root, problems))
-    if not repos and not problems:
-        sys.exit(f"no models found in {archive_root}: nothing verified")
-    for folder, problem in problems:
-        failures += 1
-        print(f"  FAIL  {folder}/manifest.json  -- {problem}")
-    for repo in repos:
-        try:
-            entries = load_manifest(archive_root, repo)["files"]
-        except (OSError, ValueError) as e:
-            failures += 1
-            print(f"  FAIL  {repo}  -- cannot read its manifest: {e}")
-            continue
-        for entry in entries:
-            problem = verify_entry(archive_root, repo, entry)
-            failures += bool(problem)
-            checked += 1
-            print(f"  {'FAIL' if problem else 'ok  '}  {repo}:{entry['path']}" + (f"  -- {problem}" if problem else ""))
-    return failures, checked
-
-
-def cmd_verify(args):
-    targets = {}  # archive -> its models to verify, or None for all of them
-    for path in args.targets:
-        try:
-            root, repos = archive_target(path)
-        except ValueError as e:
-            sys.exit(f"{e}: nothing verified")
-        targets[root] = None if repos is None or targets.get(root, ()) is None else targets.get(root, []) + repos
-    failures = checked = 0
-    for root, repos in targets.items():
-        if len(targets) > 1:
-            print(f"verifying {root}")
-        if is_oczip(root):
-            open_single_file(root)  # one file, only ever written whole: nothing to lock
-        else:
-            lock_archive(root, exclusive=False, skip=args.no_lock)
-        found, done = verify_models(root, repos or [])
-        failures, checked = failures + found, checked + done
-    if failures:
-        sys.exit(f"{failures} FAILURE(S): replace the damaged files from another copy or repair them (see docs/protection.md)")
-    if not checked:
-        sys.exit("no files found: nothing verified")
-    print(f"ALL VERIFIED ({checked} files)")
+        with tree.placing(rel, replace) as f:
+            out = HashingWriter(f)
+            for chunk in iter_blob_bytes(p, entry["sha256"]):
+                out.write(chunk)
+                PROGRESS.add(len(chunk))
+            if out.size != entry["size"] or out.hash.hexdigest() != entry["sha256"]:
+                raise _Mismatch
+    except _Mismatch:
+        return "restored bytes differ from the original SHA-256"
+    except FileExistsError:
+        return "a file of that name appeared in the destination while restoring: not overwritten (--overwrite replaces it)"
+    except NoReplaceUnsupported as e:
+        return f"{e}; restore into an empty folder with --overwrite instead"
+    except UnsafePath as e:
+        return str(e)
+    except Exception as e:
+        return f"restore failed: {e}"
+    return None
 
 
 def cmd_restore(args):
     """Every path is placed (restore_plan) and checked before anything is written. A destination file that already
     holds the right bytes is kept; one with other contents is replaced only with --overwrite."""
-    try:
-        args.archive_root, args.repo = model_at(args.model)
-    except ValueError as e:
-        sys.exit(f"cannot restore {args.model}: {e}")
-    if is_oczip(args.archive_root):
-        open_single_file(args.archive_root)
-    elif os.path.isdir(args.archive_root):
-        lock_archive(args.archive_root, exclusive=False, skip=args.no_lock)
-    try:
-        manifest = load_manifest(args.archive_root, args.repo)
-    except (OSError, ValueError) as e:
-        sys.exit(f"cannot restore {args.repo}: {e}")
+    p = pack_for_reading(args.pack, args.no_lock)
+    manifests = all_manifests(p, [])  # only this model's manifest has to be sound
+    name = model_named(manifests, args.model, p)
+    manifest = manifests[name]
     unknown = sorted(set(args.files) - {e["path"] for e in manifest["files"]})
     if unknown:
-        sys.exit(f"{args.repo} has no file {unknown[0]!r} (paths as the pack lists them, with \"/\")")
+        sys.exit(f"{name} has no file {unknown[0]!r} (paths as the pack lists them, with \"/\")")
     chosen = [e for e in manifest["files"] if not args.files or e["path"] in set(args.files)]
     try:  # placed among all the model's files, so that each lands where it always does; with --flat, among those chosen
         plan = restore_plan(args.dest_dir, chosen if args.flat else manifest["files"], flat=args.flat)
     except ValueError as e:
-        sys.exit(f"cannot restore {args.repo}: {e}")
+        sys.exit(f"cannot restore {name}: {e}")
     wanted = {e["path"] for e in chosen}
-    plan = [p for p in plan if p[0]["path"] in wanted]
+    plan = [p_ for p_ in plan if p_[0]["path"] in wanted]
     for folder in dict.fromkeys([args.dest_dir, *(os.path.dirname(dst) for _, dst, _, _ in plan)]):
-        problem = place_problem(folder, args.archive_root)
+        problem = place_problem(folder)
         if problem:
             sys.exit(f"refusing to restore there: {problem}. Choose another folder (--overwrite does not change this)")
     targets, conflicts = [], []
@@ -3053,34 +3171,804 @@ def cmd_restore(args):
                  "restore into an empty folder, or add --overwrite to replace them")
     os.makedirs(args.dest_dir, exist_ok=True)
     tree = SafeTree(args.dest_dir)
+    PROGRESS.begin(f"restoring {name}", sum(e["size"] for e, _, _, present in targets if not present))
     for entry, rel, shown, present in targets:
         if present:
-            print(f"  ok    {shown}  (already there)")
+            say(f"  ok    {shown}  (already there)", event="file", path=entry["path"], dest=rel, written=False)
             continue
-        problem = restore_entry(args.archive_root, args.repo, entry, tree, rel, replace=args.overwrite)
+        PROGRESS.at(entry["path"])
+        problem = restore_entry(p, entry, tree, rel, replace=args.overwrite)
         if problem:
             sys.exit(f"  cannot restore {shown}: {problem}")
-        print(f"  ok    {shown}")
+        say(f"  ok    {shown}", event="file", path=entry["path"], dest=rel, written=True)
+    PROGRESS.end()
     renamed = sum(1 for e, _, rel, r in plan if r and (not args.flat or rel != e["path"].rsplit("/", 1)[-1]))
     if renamed:
-        print(f"  {renamed} file(s) restored under another name: a character this system does not allow in names "
-              "became \"_\", or a \" (n)\" keeps two files apart")
-    what = f"{len(plan)} of {len(manifest['files'])} files of {args.repo}" if args.files else args.repo
-    print(f"restored {what}" + (f" @ {manifest['revision']}" if manifest.get("revision") else "") + f" into {args.dest_dir}")
+        say(f"  {renamed} file(s) restored under another name: a character this system does not allow in names "
+            "became \"_\", or a \" (n)\" keeps two files apart")
+    what = f"{len(plan)} of {len(manifest['files'])} files of {name}" if args.files else name
+    say(f"restored {what}" + (f" @ {manifest['revision']}" if manifest.get("revision") else "") + f" into {args.dest_dir}",
+        event="summary", model=name, files=len(plan), dest=args.dest_dir)
 
 
-STORED_SUFFIXES = (".ocz", OCZIP, ".zip", ".whl", ".gz", ".tgz", ".xz", ".zst", ".bz2", ".7z", ".rar", ".exe", ".msi",
-                   ".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp3", ".mp4", ".mkv", ".par2")  # compressed already
+# ----------------------------------------------------------------------------------------------- verify
 
 
-def bundle_files(archive_root):
-    """(files, problems) of an archive folder for bundle: every file in it (relative "/" paths, sorted) but the lock
-    file and unfinished temporary files (.oc-*.part); problems: links (never followed) and anything that is not a
-    regular file."""
-    found, problems = [], []
-    is_junction = getattr(os.path, "isjunction", lambda p: False)
-    for dirpath, dirnames, names in os.walk(archive_root):
-        rel = lambda n: os.path.relpath(os.path.join(dirpath, n), archive_root).replace(os.sep, "/")  # noqa: E731
+def scan(p, manifests, names, paths=(), passed=None):
+    """Verify the files of the models `names` (only those of `paths`, with one model) in three passes, so that a file
+    that fails only because of what it is coded against is told apart from one whose own blob is at fault:
+    1. structure, from the headers alone: every blob these files need (their own and, down the chain, every base) is
+       there, readable and naming its file; each base is named with the size it holds; no chain goes round or deeper
+       than MAX_REFERENCE_DEPTH;
+    2. content: every blob found sound is read whole against its SHA-256 (blob_damage), then every file whose chain is
+       sound is restored and compared with its own (once per blob; passed(name, entry) is called for each that is);
+    3. structure again: a file is lost if its blob, or any blob down its chain, was found at fault.
+    Returns (faults {blob: what is wrong with it, as "its blob ..." goes on}, lost [{model, path, size, sha256,
+    weights, causes, own, problem}], files checked, graph, headers {blob: its header})."""
+    graph = Graph(p, manifests, strict=False)
+    chosen = [(n, e) for n in names for e in manifests[n]["files"] if not paths or e["path"] in paths]
+    faults, headers, stack = {}, {}, [e["sha256"] for _, e in chosen]
+    while stack:  # 1
+        sha = stack.pop()
+        if sha in graph.edges:
+            continue
+        graph.edges[sha] = []
+        try:
+            headers[sha] = blob_header(p, sha)
+        except FileNotFoundError:
+            faults[sha] = "is missing from the pack"
+            continue
+        except (OSError, ValueError) as e:
+            faults[sha] = f"cannot be read ({e})"
+            continue
+        graph.edges[sha] = [b["sha256"] for b in headers[sha]["bases"]]
+        stack.extend(graph.edges[sha])
+    for sha, header in headers.items():
+        for b in header["bases"]:
+            held = headers.get(b["sha256"], {}).get("original_size")
+            if held is not None and held != b["size"] and sha not in faults:
+                faults[sha] = f"names blob {b['sha256'][:12]}... as a base of {b['size']} bytes, but that holds {held}"
+        if sha not in faults and graph.depth(sha) > MAX_REFERENCE_DEPTH:
+            faults[sha] = f"is in a chain of bases that goes round, or is deeper than {MAX_REFERENCE_DEPTH}"
+        frames = container_index(p.blob_span(sha))[1]
+        for i, a, b in base_reads(header, frames) if sha not in faults else ():
+            base = headers.get(header["bases"][i]["sha256"])
+            if base and base.get("partial") and any(r.get("dropped") for j, r in enumerate(base["regions"])
+                                                    if j in regions_read(base, [(a, b)])):
+                faults[sha] = f"is coded against a part of {blob_name(manifests, headers, base['sha256'])} that is not kept"
+                break
+    for _, e in chosen:
+        if headers.get(e["sha256"], {}).get("partial") and e["sha256"] not in faults:
+            faults[e["sha256"]] = "keeps only the part of its file other files are coded against"
+
+    def chain(sha):
+        found, todo = set(), [sha]
+        while todo:
+            s = todo.pop()
+            if s not in found:
+                found.add(s)
+                todo.extend(graph.edges.get(s, ()))
+        return found
+
+    for sha in sorted(headers):  # 2
+        if sha not in faults:
+            problem = blob_damage(p.blob_span(sha), sha)
+            if problem:
+                faults[sha] = f"is {problem}"
+    for sha in headers:
+        if not chain(sha) & faults.keys():
+            _INTACT.add((p.root, sha))  # checked: decoding it reads it once more, not twice
+    sound = {e["sha256"]: e["size"] for _, e in chosen if not chain(e["sha256"]) & faults.keys()}
+    PROGRESS.begin("verifying", sum(sound.values()))
+    restored, wrong = {}, {}
+    for name, e in chosen:
+        sha = e["sha256"]
+        PROGRESS.at(f"{name}:{e['path']}")
+        if sha not in restored and not chain(sha) & faults.keys():
+            h, n = hashlib.sha256(), 0
+            try:
+                for chunk in iter_blob_bytes(p, sha):
+                    h.update(chunk)
+                    n += len(chunk)
+                    PROGRESS.add(len(chunk))
+            except BaseFailed as err:
+                faults.setdefault(err.sha, f"does not restore its file ({err.problem})")
+            except Exception as err:
+                faults[sha] = f"does not restore its file ({err})"
+            else:
+                if h.hexdigest() != sha:
+                    faults[sha] = "restores other bytes than its file's (their SHA-256 differs)"
+            restored[sha] = n
+        if sha not in faults and not chain(sha) & faults.keys():
+            if restored.get(sha) != e["size"]:
+                wrong[(name, e["path"])] = f"the pack lists it with {e['size']} bytes, its blob holds {restored.get(sha)}"
+            elif passed:
+                passed(name, e)
+    PROGRESS.end()
+    lost = []
+    for name, e in chosen:  # 3
+        sha = e["sha256"]
+        causes = sorted(chain(sha) & faults.keys(), key=lambda s: (s != sha, s))
+        if not causes and (name, e["path"]) not in wrong:
+            continue
+        if not causes:
+            problem = wrong[(name, e["path"])]
+        elif causes[0] == sha:
+            problem = f"its blob {faults[sha]}"
+        else:
+            problem = f"through {blob_name(manifests, headers, causes[0])}: its blob {faults[causes[0]]}"
+        lost.append({"model": name, "path": e["path"], "size": e["size"], "sha256": sha, "weights": bool(e.get("tensors")),
+                     "causes": causes, "own": not causes or causes[0] == sha, "problem": problem})
+    return faults, lost, len(chosen), graph, headers
+
+
+def blob_name(manifests, headers, sha):
+    """A blob for people: the file (model: path) it is, else the one a blob coded against it names, else its hash."""
+    users = [(n, e["path"]) for n in sorted(manifests) for e in manifests[n]["files"] if e["sha256"] == sha]
+    if users:
+        return f"{users[0][0]}: {users[0][1]}" + (f" (and {len(users) - 1} more)" if len(users) > 1 else "")
+    named = next((b for h in headers.values() for b in h["bases"] if b["sha256"] == sha and b.get("path")), None)
+    if named:
+        return f"{named.get('model') or '?'}: {named['path']} (no model lists it now)"
+    return f"blob {sha[:12]}..."
+
+
+def verify_models(p, manifests, names, paths=()):
+    """Verify every file of these models (or only the files of these paths: scan), printing a line for each; returns
+    (failures, files checked, what scan found)."""
+    def passed(name, e):
+        say(f"  ok    {name}:{e['path']}", event="ok", model=name, path=e["path"], problem=None)
+
+    found = scan(p, manifests, names, paths, passed)
+    for item in found[1]:
+        say(f"  FAIL  {item['model']}:{item['path']}  -- {item['problem']}", event="fail", model=item["model"],
+            path=item["path"], problem=item["problem"])
+    return len(found[1]), found[2], found
+
+
+def damage_report(p, manifests, names, found, problems):
+    """What verify found wrong, as (lines for people, data for programs): the blobs at fault and the files lost (their
+    own blob at fault, or one down their chain); the models with lost files, and the models that need data of these
+    (down the chain); what re-supplying each original would heal, and how."""
+    faults, lost, _, graph, headers = found
+    name_of = lambda sha: blob_name(manifests, headers, sha)  # noqa: E731
+    damaged = {}
+    for item in lost:
+        damaged.setdefault(item["model"], []).append(item)
+    gone, affected = set(damaged), []
+    while True:  # the models that need, directly or through others, a blob only removed models list
+        listed = {e["sha256"] for n in gone for e in manifests[n]["files"]}
+        more = sorted(n for n in manifests if n not in gone
+                      and (graph.needed([n]) - {e["sha256"] for e in manifests[n]["files"]}) & listed)
+        if not more:
+            break
+        affected += more
+        gone |= set(more)
+    plural = lambda n, word: f"{n} {word}{'' if n == 1 else 's'}"  # noqa: E731
+    lines = ["DAMAGE REPORT", f"  pack: {p.root}"]
+    if problems:
+        lines.append(f"  manifests that cannot be read ({len(problems)}): their models' files are not known")
+        lines += [f"    {rel}: {problem}" for rel, problem in problems]
+    if faults:
+        lines.append(f"  at fault ({plural(len(faults), 'blob')}):")
+        lines += [f"    {name_of(sha)}: its blob {faults[sha]}" for sha in sorted(faults, key=name_of)]
+    if lost:
+        lines.append(f"  lost ({plural(len(lost), 'file')}):")
+        for item in lost:
+            how = "its own blob" if item["own"] else "through " + ", ".join(name_of(s) for s in item["causes"])
+            lines.append(f"    {item['model']}: {item['path']}  {human(item['size']).strip()}"
+                         f"{'  weights' if item['weights'] else ''}  ({how})")
+    models = []
+    if damaged:
+        lines.append(f"  models with lost files ({len(damaged)}):")
+        for name in sorted(damaged):
+            files = manifests[name]["files"]
+            weights = sum(1 for e in files if e.get("tensors"))
+            hit = sum(1 for item in damaged[name] if item["weights"])
+            models.append({"name": name, "files": len(files), "lost": len(damaged[name]), "weights": weights,
+                           "lost_weights": hit})
+            lines.append(f"    {name}  {len(damaged[name])} of {plural(len(files), 'file')} lost"
+                         + (f" (weight files: {hit} of {weights})" if hit else ""))
+    if affected:
+        lines.append(f"  models that need data of those ({len(affected)}): {', '.join(affected)}")
+    intact = [n for n in names if n not in damaged]
+    lines.append(f"  intact: {plural(len(intact), 'model')} verified")
+    heal = [{"sha256": sha, "file": name_of(sha), "heals": sum(1 for item in lost if item["causes"] == [sha])}
+            for sha in sorted(faults, key=name_of)]
+    if heal:
+        lines.append("  to heal, store the original file again: pack <folder holding it> <pack> --name MODEL --add --file "
+                     "PATH")
+        lines.append("    (what is coded against it heals with it; a file no model lists now can be added to any model)")
+        lines += [f"    {h['file']}  sha256 {h['sha256']}  heals {plural(h['heals'], 'lost file')}" for h in heal]
+    if lost:
+        lines.append("  to give a lost file up: remove <pack> MODEL --file PATH (or the whole model: remove <pack> MODEL)")
+    data = {"pack": p.root, "faults": [{"sha256": sha, "problem": faults[sha], "file": name_of(sha)} for sha in faults],
+            "lost": lost, "models": models, "affected": affected, "heal": heal,
+            "manifests": [{"path": rel, "problem": problem} for rel, problem in problems]}
+    return lines, data
+
+
+def unused_blobs(p, manifests):
+    """(count, bytes) of the blobs in a pack that no model needs, or None if that cannot be told."""
+    graph = Graph(p, manifests, strict=False)
+    unused = p.blob_ids() - graph.needed()
+    if graph.unreadable:
+        return None
+    return len(unused), sum(p.blob_span(sha)[2] for sha in unused)
+
+
+def cmd_verify(args):
+    p = pack_for_reading(args.pack, args.no_lock)
+    problems = []
+    manifests = all_manifests(p, problems)
+    names = list(dict.fromkeys(model_named(manifests, n, p) for n in args.models)) or sorted(manifests)
+    if not names and not problems:
+        sys.exit(f"no models in {p.root}: nothing verified")
+    if args.files:
+        if len(args.models) != 1:
+            sys.exit("--file: name the one model these files are of")
+        unknown = sorted(set(args.files) - {e["path"] for e in manifests[names[0]]["files"]})
+        if unknown:
+            sys.exit(f"{names[0]} has no file {unknown[0]!r} (paths as the pack lists them, with \"/\")")
+    failures = 0
+    for rel, problem in problems:
+        failures += 1
+        say(f"  FAIL  {rel}  -- {problem}", event="fail", path=rel, problem=problem)
+    found, checked, findings = verify_models(p, manifests, names, set(args.files))
+    failures += found
+    if not args.models:
+        unused = unused_blobs(p, manifests)
+        if unused and unused[0]:
+            later = ": the next pack, remove or rebase deletes them" if isinstance(p, FolderPack) else ""
+            say(f"  {unused[0]} blob(s) ({human(unused[1])}) that no model needs{later}", event="unused",
+                blobs=unused[0], size=unused[1])
+    if failures:
+        lines, data = damage_report(p, manifests, names, findings, problems)
+        say("\n".join(lines), event="damage", **data)
+        sys.exit(f"{failures} FAILURE(S): what is lost, why, and what to do are in the damage report above")
+    if not checked:
+        sys.exit("no files found: nothing verified")
+    say(f"ALL VERIFIED ({checked} files)", event="summary", checked=checked)
+
+
+# ----------------------------------------------------------------------------------------------- list
+
+
+def owner_of(graph, base):
+    """The model a base blob belongs to, for people: the one its header names if that model still lists it, else the
+    first model that does; None if no model lists it (a removed model's file, kept for the models that need it)."""
+    owners = graph.owners.get(base["sha256"], [])
+    return base.get("model") if base.get("model") in owners else owners[0] if owners else None
+
+
+def covered(ranges):
+    """How many bytes (start, end) ranges cover, overlaps counted once."""
+    total, end = 0, -1
+    for a, b in sorted(ranges):
+        if b > end:
+            total += b - max(a, end)
+            end = b
+    return total
+
+
+def model_summary(p, graph, name):
+    """What list shows of one model: its files with how each is stored and what it is coded against, and the models
+    it needs: {"name", "revision", "created", "base_choice", "files": [...], "size", "stored", "needs",
+    "needs_removed", "base", "usage"}. "base" is the model most of its coded bytes refer to, its place in the tree of
+    the pack; "usage" says how much of each model it needs it reads ({model: share of that model's bytes})."""
+    manifest = graph.manifests[name]
+    files, weight, removed, sizes, reads = [], {}, set(), {}, {}
+    for e in manifest["files"]:
+        row = {"path": e["path"], "size": e["size"], "sha256": e["sha256"], "base_choice": e.get("base_choice", "auto"),
+               "stored": None, "method": None, "bases": [],
+               "shared_with": [n for n in graph.owners.get(e["sha256"], []) if n != name]}
+        try:
+            span = p.blob_span(e["sha256"])
+            header, frames, _ = container_index(span)
+        except (OSError, ValueError) as error:
+            row["problem"] = f"its blob cannot be read ({error})"
+            files.append(row)
+            continue
+        mine = {}  # this file's: base file -> the byte ranges it reads of it
+        for i, a, b in base_reads(header, frames):
+            mine.setdefault(header["bases"][i]["sha256"], []).append((a, b))
+            reads.setdefault(header["bases"][i]["sha256"], []).append((a, b))
+        row.update(stored=span[2], method=header.get("method"))
+        sizes[e["sha256"]] = span[2]
+        owners = [owner_of(graph, b) for b in header["bases"]]
+        for b, owner in zip(header["bases"], owners):
+            row["bases"].append({"model": owner or b.get("model"), "path": b.get("path"), "sha256": b["sha256"],
+                                 "removed": owner is None, "size": b["size"], "used": covered(mine.get(b["sha256"], []))})
+            if owner is None:
+                removed.add(b.get("model") or f"blob {b['sha256'][:12]}...")
+        for r in header["regions"]:
+            if "base" in r and owners[r["base"][0]] not in (None, name):
+                weight[owners[r["base"][0]]] = weight.get(owners[r["base"][0]], 0) + r["length"]
+        files.append(row)
+    complete = all(f["stored"] is not None for f in files)
+    usage = {}
+    for model in weight:
+        their = {e["sha256"]: e["size"] for e in graph.manifests[model]["files"]}
+        usage[model] = round(sum(covered(reads.get(sha, [])) for sha in their) / max(sum(their.values()), 1), 4)
+    return {"name": name, "revision": manifest.get("revision"), "created": manifest.get("created"),
+            "base_choice": manifest.get("base_choice", "auto"), "files": files,
+            "size": sum(e["size"] for e in manifest["files"]), "stored": sum(sizes.values()) if complete else None,
+            "needs": sorted(weight), "needs_removed": sorted(removed), "base": max(weight, key=weight.get) if weight else None,
+            "usage": usage}
+
+
+def pack_summary(p, manifests):
+    """What list shows of a pack: every model (model_summary, without its files) with the models that need it; the
+    blobs kept for the models that need them though no model lists them (files of removed models); and the blobs no
+    model needs."""
+    graph = Graph(p, manifests, strict=False)
+    models = {}
+    for name in sorted(manifests):
+        summary = model_summary(p, graph, name)
+        summary["files"] = len(summary["files"])
+        models[name] = summary
+    for m in models.values():
+        m["needed_by"] = sorted(n for n, other in models.items() if m["name"] in other["needs"])
+    needed, ids = graph.needed(), p.blob_ids()
+    kept = sorted(needed - set(graph.owners) - graph.unreadable)
+    users = {sha: [] for sha in kept}
+    for name in sorted(manifests):
+        for sha in graph.needed([name]) & set(kept):
+            users[sha].append(name)
+    names = {}
+    for sha in needed:
+        for b in blob_header(p, sha)["bases"] if sha not in graph.unreadable else ():
+            names.setdefault(b["sha256"], (b.get("model"), b.get("path")))
+    unused = ids - needed
+
+    def size(sha):
+        try:
+            return p.blob_span(sha)[2]
+        except (OSError, ValueError):
+            return 0
+
+    return {"pack": p.root, "kind": p.kind, "models": list(models.values()),
+            "kept": [{"sha256": sha, "size": size(sha), "model": names.get(sha, (None, None))[0],
+                      "path": names.get(sha, (None, None))[1], "needed_by": users[sha]} for sha in kept],
+            "unused": {"blobs": len(unused), "size": sum(size(sha) for sha in unused)},
+            "blobs": len(ids), "stored": sum(size(sha) for sha in ids), "unreadable": sorted(graph.unreadable)}
+
+
+def stored_text(size, stored):
+    return f"{human(size):>12} -> {human(stored) if stored is not None else '?':>12}  " + (
+        f"{stored / size * 100:6.2f}%" if stored is not None and size else " " * 7)
+
+
+def cmd_list(args):
+    p = pack_for_reading(args.pack, args.no_lock)
+    problems = []
+    manifests = all_manifests(p, problems)
+    for rel, problem in problems:
+        say(f"  ! {rel} cannot be used: {problem}", event="fail", path=rel, problem=problem)
+    if args.model:
+        name = model_named(manifests, args.model, p)
+        m = model_summary(p, Graph(p, manifests, strict=False), name)
+        head = f"{name}: {len(m['files'])} file{'' if len(m['files']) == 1 else 's'}, {stored_text(m['size'], m['stored']).strip()}" + (
+            f", packed {m['created']}" if m.get("created") else "") + (f" @ {m['revision']}" if m.get("revision") else "")
+        if JSON_OUT:
+            return say(head, event="model", **m)
+        say(head)
+        for f in m["files"]:
+            against = ", ".join(sorted({f"{b['model'] or b['sha256'][:12]}{' (removed)' if b['removed'] else ''}"
+                                        for b in f["bases"]}))
+            note = f.get("problem") or (f"against {against}" if against else "") + (
+                f"  = also in {', '.join(f['shared_with'])}" if f["shared_with"] else "")
+            say(f"  {f['path']:<40} {stored_text(f['size'], f['stored'])}  {f['method'] or '?':<18} {note}".rstrip())
+        return
+    s = pack_summary(p, manifests)
+    head = (f"{s['kind']} {s['pack']}: {len(s['models'])} model(s), {s['blobs']} blob(s), {human(s['stored'])} stored")
+    if JSON_OUT:
+        return say(head, event="pack", **s)
+    say(head)
+    models = {m["name"]: m for m in s["models"]}
+    children, shown = {}, set()
+    for m in models.values():
+        if m["base"] in models:
+            children.setdefault(m["base"], []).append(m["name"])
+
+    def show(name, level):
+        if name in shown:
+            return
+        shown.add(name)
+        m = models[name]
+        needs = [n for n in m["needs"] if n != m["base"] or level == 0] + [f"{n} (removed)" for n in m["needs_removed"]]
+        say(f"  {stored_text(m['size'], m['stored'])}  {'  ' * level}{name}"  # the numbers first: they line up
+            + (f"  needs {', '.join(needs)}" if needs else ""))
+        for child in sorted(children.get(name, ())):
+            show(child, level + 1)
+
+    for name in sorted(n for n, m in models.items() if m["base"] not in models):
+        show(name, 0)
+    for name in sorted(models):  # models whose bases go round in a circle (each needs a file of the other)
+        show(name, 0)
+    if s["kept"]:
+        by = sorted({n for k in s["kept"] for n in k["needed_by"]})
+        of = sorted({k["model"] for k in s["kept"] if k["model"]})
+        say(f"  kept: {len(s['kept'])} blob(s), {human(sum(k['size'] for k in s['kept']))}, of removed model(s) "
+            f"{', '.join(of) or '?'}, for {', '.join(by)} (rebase those to free them)")
+    if s["unused"]["blobs"]:
+        say(f"  {s['unused']['blobs']} blob(s) ({human(s['unused']['size'])}) that no model needs"
+            + (": the next pack, remove or rebase deletes them" if isinstance(p, FolderPack) else ""))
+    if s["unreadable"]:
+        say(f"  ! {len(s['unreadable'])} blob(s) cannot be read: run verify")
+
+
+# ----------------------------------------------------------------------------------------------- remove / rename
+
+
+def removal(p, manifests, changed):
+    """What changing manifests as `changed` says ({name: its new manifest, or None to remove the model}) frees and
+    keeps: (blobs freed, blobs of the removed files kept, {kept blob: the models that need it}). Blobs that cannot be
+    read are taken as coded against nothing, so that what was lost can be removed; sweep deletes nothing while a blob
+    that models still need cannot be read."""
+    graph = Graph(p, manifests, strict=False)
+    before = graph.needed()
+    after_manifests = {n: changed.get(n, m) for n, m in manifests.items() if changed.get(n, m) is not None}
+    after_graph = Graph(p, after_manifests, strict=False)
+    after_graph.edges = graph.edges  # the blobs have not changed: what was read stays true
+    after = after_graph.needed()
+    gone = {e["sha256"] for n, m in changed.items() for e in manifests[n]["files"]}
+    gone -= {e["sha256"] for m in after_manifests.values() for e in m["files"]}  # still listed: nothing removed
+    kept = gone & after
+    users = {sha: [] for sha in kept}
+    for name in sorted(after_manifests):
+        for sha in after_graph.needed([name]) & kept:
+            users[sha].append(name)
+    return before - after, kept, users
+
+
+def blobs_size(p, shas):
+    total = 0
+    for sha in shas:
+        with contextlib.suppress(OSError, ValueError):  # (a blob that is missing takes no room)
+            total += p.blob_span(sha)[2]
+    return total
+
+
+def cmd_remove(args):
+    p = folder_for_change(args.pack, exclusive=not args.dry_run)
+    if not args.models:
+        sys.exit("name the models to remove (or the one model whose files to remove)")
+    if args.files and len(args.models) != 1:
+        sys.exit("--file removes files of one model: name exactly one")
+    manifests = all_manifests(p)
+    names = list(dict.fromkeys(model_named(manifests, n, p) for n in args.models))
+    if args.files:
+        manifest = manifests[names[0]]
+        unknown = sorted(set(args.files) - {e["path"] for e in manifest["files"]})
+        if unknown:
+            sys.exit(f"{names[0]} has no file {unknown[0]!r} (paths as the pack lists them, with \"/\")")
+        left = [e for e in manifest["files"] if e["path"] not in set(args.files)]
+        changed = {names[0]: {**manifest, "files": left} if left else None}
+        what = f"{len(args.files)} of the {len(manifest['files'])} files of {names[0]}" + (
+            "" if left else " (all of them: the model goes)")
+    else:
+        changed = dict.fromkeys(names)
+        what = ", ".join(names)
+    try:
+        freed, kept, users = removal(p, manifests, changed)
+    except (OSError, ValueError) as e:
+        sys.exit(f"cannot tell what the models of {p.root} need ({e}): nothing removed; run verify")
+    freed_size, kept_size = blobs_size(p, freed), blobs_size(p, kept)
+    say(f"{'would remove' if args.dry_run else 'removing'} {what}")
+    say(f"  {'would free' if args.dry_run else 'frees'} {human(freed_size)} ({len(freed)} blob(s))", event="freed",
+        blobs=len(freed), size=freed_size)
+    if kept:
+        by = sorted({n for us in users.values() for n in us})
+        say(f"  keeps {human(kept_size)} ({len(kept)} blob(s)) that other models still need: {', '.join(by)}"
+            f"{' (as their base: rebase lets it go when that makes the pack smaller)' if any(users.values()) else ''}",
+            event="kept", blobs=len(kept), size=kept_size,
+            needed_by=by)
+    if args.dry_run:
+        say("dry run: nothing changed")
+        return
+    tree = SafeTree(p.root)
+    for name, manifest in changed.items():
+        if manifest is None:
+            tree.remove(manifest_rel(name))
+        else:
+            write_manifest(p, manifest)
+    result = sweep(p)
+    touch_marker(p)
+    if result is not None:
+        say(f"removed {what}: {human(result[1])} freed", event="summary", blobs=result[0], size=result[1])
+
+
+def rename_file(p, manifests, name, old, new):
+    """Give a file of a model another path: only the manifest changes (the blob is named by the file's content)."""
+    manifest = manifests[name]
+    paths = [e["path"] for e in manifest["files"]]
+    if old not in paths:
+        sys.exit(f"{name} has no file {old!r} (paths as the pack lists them, with \"/\")")
+    problem = path_problem(new)
+    if problem:
+        sys.exit(problem)
+    if new in paths:
+        sys.exit(f"{name} has a file {new!r} already")
+    files = [{**e, "path": new} if e["path"] == old else e for e in manifest["files"]]
+    write_manifest(p, {**manifest, "files": files})
+    touch_marker(p)
+    say(f"renamed {name}:{old} to {new}", event="summary", model=name, old=old, new=new)
+
+
+def cmd_rename(args):
+    p = folder_for_change(args.pack)
+    manifests = all_manifests(p)
+    if args.file is not None:
+        return rename_file(p, manifests, model_named(manifests, args.model, p), args.file, args.new_name)
+    old, new = model_named(manifests, args.model, p), args.new_name
+    problem = name_problem(new)
+    if problem:
+        sys.exit(problem)
+    if new == old:
+        sys.exit(f"{old} has that name already")
+    clash = next((n for n in manifests if n != old and name_key(n) == name_key(new)), None)
+    if clash:
+        sys.exit(f"the name {new} is taken: the model {clash} has the same manifest file ({manifest_rel(clash)})"
+                 + (" where case is ignored" if clash != new else ""))
+    manifest = {**manifests[old], "name": new}
+    tree = SafeTree(p.root)
+    if name_key(old) == name_key(new):  # only the case changes: the file is renamed, then rewritten
+        os.rename(p.full(manifest_rel(old)), p.full(manifest_rel(new)))
+        write_manifest(p, manifest)
+    else:
+        with tree.placing(manifest_rel(new), replace=False) as f:
+            f.write(json.dumps(manifest, indent=1).encode("utf-8"))
+        tree.remove(manifest_rel(old))
+    touch_marker(p)
+    say(f"renamed {old} to {new}", event="summary", old=old, new=new)
+
+
+# ----------------------------------------------------------------------------------------------- rebase
+#
+# rebase re-chooses the base of every file of a model already in the pack, as if it were packed again now. The base is
+# chosen from the stored bytes (read_range), so a file is restored (into OC_TMP) only if its base changes. Its new blob
+# restores the same file, so it replaces the old one under the same name once it is checked, and every model that
+# needs that blob (as a file of its own, or as a base) is unaffected. A base never makes a cycle (no blob coded,
+# directly or not, against the one being re-packed is used) or a chain longer than MAX_REFERENCE_DEPTH.
+
+
+def file_share(p, e, others, blocked, delta_codec):
+    """The share of its size a file (an entry whose blob is in the pack) is estimated to be stored in, coded against
+    the best of `others` (models) not in `blocked`, or standalone."""
+    read = lambda start, length: read_range(p, e["sha256"], start, length)  # noqa: E731
+    best, ranking, standalone, _ = choose_base(p, e["format"], e["tensors"], read, others, blocked, delta_codec)
+    if best:
+        return dict(ranking)[best]
+    if standalone is not None:
+        return standalone
+    windows = sample_windows(e["tensors"])  # (no candidate: choose_base did not sample)
+    if not windows:
+        return 1.0
+    alone = [standalone_estimate(read(t[2] + rel, length), t[1]) / length for t, rel, length, _ in windows]
+    return sum(a * w[3] for a, w in zip(alone, windows)) / sum(w[3] for w in windows)
+
+
+def weigh_kept(args, p, graph, todo):
+    """The blobs kept only as bases (no model lists them) that rebasing the files of `todo` ({model: entries}) lets
+    go: those whose every user (a blob coded against it) is one of these files, and whose room (with what only they
+    need) is estimated to be worth more than what those files grow by against another model, or standalone, by
+    RELEASE_GAIN of it at least. Says each decision; returns the set."""
+    manifests = graph.manifests
+    listed = {e["sha256"] for m in manifests.values() for e in m["files"]}
+    files = {e["sha256"]: (n, e) for n, entries in todo.items() for e in entries}
+    needed = graph.needed()
+    users = {}
+    for sha in needed:
+        for b in graph.bases(sha):
+            users.setdefault(b, set()).add(sha)
+    release = set()
+    for kept in sorted(needed - listed):
+        coded = users.get(kept, set())
+        if not coded or not coded <= files.keys():
+            continue
+        edges = {sha: [b for b in graph.bases(sha) if b != kept] if sha in coded else graph.bases(sha) for sha in needed}
+        left, todo = set(), list(listed)
+        while todo:
+            sha = todo.pop()
+            if sha not in left:
+                left.add(sha)
+                todo.extend(edges.get(sha, ()))
+        room = blobs_size(p, needed - left)
+        growth = 0
+        for sha in coded:
+            name, e = files[sha]
+            others = {n: m for n, m in manifests.items() if n != name}
+            share = file_share(p, e, others, graph.above(sha) | {kept}, args.delta_codec)
+            growth += share * e["size"] - p.blob_span(sha)[2]
+        gain = room - growth
+        what = f"{blob_name(manifests, {s: blob_header(p, s) for s in coded}, kept)}, kept as a base of {', '.join(sorted({files[s][0] for s in coded}))}"
+        if gain > room * RELEASE_GAIN:
+            release.add(kept)
+            say(f"letting go of {what}: storing what is coded against it otherwise is estimated to save {human(gain)}",
+                event="release", sha256=kept, gain=round(gain))
+        else:
+            say(f"keeping {what}: it saves more than it takes ({human(room)})", event="keep", sha256=kept)
+    return release
+
+
+def rebase_model(args, p, graph, name, base, release=frozenset(), entries=None):
+    """Store the files `entries` of one model (default: all of them) again as pack would now (re-choosing their
+    bases, or with `base`), and keep the choice in its manifest: the model's, or with --file the files'. A file coded
+    against a blob in `release` (weigh_kept) is stored again however it comes out, never against that blob. Returns
+    its stored size before and after."""
+    manifest = graph.manifests[name]
+    chosen_paths = {e["path"] for e in (manifest["files"] if entries is None else entries)}
+    forced = bool(args.base or args.no_base)
+    others = {n: m for n, m in graph.manifests.items() if n != name}
+    chunk_size = args.chunk_mib << 20
+    how = f"delta base: {base}" if base else "no delta base" if args.no_base else "delta base chosen per file"
+    named = [e for e in manifest["files"] if e["path"] in chosen_paths] if args.files else manifest["files"]
+    what = (f"{named[0]['path']} of {name}" if len(named) == 1 else f"{len(named)} files of {name}") if args.files else name
+    say(f"rebasing {what}  ({how}{', dry run' if args.dry_run else ''})")
+    own = list(dict.fromkeys(e["sha256"] for e in named))  # what is said to be stored: the files named, or the model
+    before = blobs_size(p, own)
+    tmp, plain, seen = None, 0, set()
+    try:
+        for e in manifest["files"]:
+            sha = e["sha256"]
+            if e["path"] not in chosen_paths:
+                if e.get("tensors") and e.get("base_choice", "auto") != "auto" and not args.files:
+                    say(f"  {e['path']:<34} unchanged: its base was set by hand (name it with --file to rebase it anyway)")
+                continue
+            if sha in seen:
+                continue
+            seen.add(sha)
+            if not e.get("tensors"):
+                plain += 1  # no base can hold it: nothing to re-choose
+                continue
+            now_bases = sorted(b["sha256"] for b in blob_header(p, sha)["bases"])
+            above = graph.above(sha)  # using any of these as a base would make a cycle
+            letting_go = bool(release & set(now_bases))
+            PROGRESS.begin(f"rebasing {name}", None, e["path"])
+            if forced:
+                chosen = base
+            else:
+                read = lambda start, length, sha=sha: read_range(p, sha, start, length)  # noqa: E731
+                chosen = pick_base(args, p, e, e["format"], e["tensors"], read, others, above)
+            files = [f for f in others[chosen]["files"] if f["sha256"] not in above] if chosen else []
+            used = delta_layout(e["tensors"], e["format"], e["size"], chunk_size, files, args.delta_codec)[1]
+            if chosen and not used and any(f["sha256"] in above for f in others[chosen]["files"]):
+                say(f"  {e['path']:<34} unchanged: {chosen} needs this file (directly or through others), so it "
+                    "cannot be its base")
+                continue
+            if sorted(f["sha256"] for f in used) == now_bases:
+                say(f"  {e['path']:<34} unchanged ({'base is still ' + chosen if used else 'still no base'})")
+                continue
+            if graph.height(sha) + 1 + max((graph.depth(f["sha256"]) for f in used), default=-1) > MAX_REFERENCE_DEPTH:
+                say(f"  {e['path']:<34} unchanged: against {chosen} its chain of bases would be too long")
+                continue
+            if args.dry_run:
+                say(f"  {e['path']:<34} would be re-packed {'against ' + chosen if used else 'without a base'}")
+                continue
+            old = p.blob_span(sha)[2]
+            reads = sum(f["size"] for f in used) + sum(b["size"] for b in blob_header(p, sha)["bases"])
+            tmp = tmp or tempfile.mkdtemp(prefix="oc-rebase-", dir=os.environ.get("OC_TMP") or None)
+            # OC_TMP holds the restored file plus the base files its old or new delta reads; the new blob is at most
+            # about as big as the file
+            problem = space_problem({tmp: e["size"] + reads, p.root: e["size"] + (1 << 20)})
+            if problem:
+                sys.exit(f"  not enough room to rebase {e['path']}: {problem} (OC_TMP picks the temporary folder)")
+            t0 = time.perf_counter()
+            PROGRESS.begin(f"rebasing {name}", 3 * e["size"], e["path"])
+            local = local_parts(e["path"])[-1]  # keeps the extension file_regions looks at
+            try:
+                problem = restore_entry(p, e, SafeTree(tmp), local, replace=False)
+                if problem:
+                    sys.exit(f"  cannot restore {e['path']}: {problem}")
+                src = os.path.join(tmp, local)
+                regions = file_regions(src, e["size"], chunk_size)[2]
+                info = pack_blob(args, p, src, e, e["format"], e["tensors"], regions, chosen if used else None, others,
+                                 above, replace=True, keep=None if forced or letting_go else lambda size, old=old: size < old)
+            except NotSmaller:
+                say(f"  {e['path']:<34} not smaller than it is now ({human(old)}): kept that")
+                continue
+            finally:
+                SafeTree(tmp).remove(local)
+            graph.changed(sha, [b["sha256"] for b in info["bases"]])
+            print_entry(e, info, t0)
+            say(f"    replaces its blob of {human(old)}")
+        if not args.dry_run:  # the choice is kept, so that --all respects it: the files' with --file, else the model's
+            choice = base_choice(args)
+            if args.files:
+                new = {**manifest, "files": [with_choice(e, choice) if e["path"] in chosen_paths else e for e in manifest["files"]]}
+            else:  # a file's own choice stays, unless one is forced on them all
+                new = {**manifest, "base_choice": choice,
+                       "files": [with_choice(e, "auto") for e in manifest["files"]] if choice != "auto" else manifest["files"]}
+            if new != manifest:
+                write_manifest(p, new)
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+    if plain:
+        say(f"  {plain} file(s) without tensors unchanged")
+    after = blobs_size(p, own)
+    if args.dry_run:
+        say(f"  {'stored' if not args.files else what + ': stored'} {human(before)} (dry run: nothing changed)")
+    else:
+        change = f"{(after - before) / max(before, 1):+.1%}" if after != before else "unchanged"
+        say(f"  {'stored' if not args.files else what + ': stored'} {human(before)} -> {human(after)}  ({change})",
+            event="model", name=name, files=[e["path"] for e in named] if args.files else None, before=before, after=after)
+    return before, after
+
+
+def cmd_rebase(args):
+    p = folder_for_change(args.pack, exclusive=not args.dry_run)
+    manifests = all_manifests(p)
+    if args.all == bool(args.models):
+        sys.exit("give the models to rebase, or --all for every model whose bases were chosen automatically")
+    if args.all and args.base:
+        sys.exit("--base needs the models named, not --all")
+    if args.files and (args.all or len(args.models) != 1):
+        sys.exit("--file rebases files of one model: name exactly one")
+    names = list(dict.fromkeys(model_named(manifests, n, p) for n in args.models)) or sorted(manifests)
+    if args.files:
+        unknown = sorted(set(args.files) - {e["path"] for e in manifests[names[0]]["files"]})
+        if unknown:
+            sys.exit(f"{names[0]} has no file {unknown[0]!r} (paths as the pack lists them, with \"/\")")
+    base = model_named(manifests, args.base, p) if args.base else None
+    if base in names:
+        sys.exit(f"--base {base}: a model is never rebased against itself")
+    graph = Graph(p, manifests)
+    try:
+        order = sorted(names, key=lambda n: (graph.model_depth(n), n))  # bases before the models that use them
+    except (OSError, ValueError) as e:
+        sys.exit(f"cannot tell what the models of {p.root} need ({e}): run verify")
+    before = after = 0
+    pack_before = blobs_size(p, p.blob_ids())
+    skipped = {n for n in order if args.all and not args.no_base and manifests[n].get("base_choice", "auto") != "auto"}
+    for name in sorted(skipped):
+        option = "--no-base" if manifests[name]["base_choice"] == "none" else "--base"
+        say(f"skipping {name}: its bases were set with {option} (name it to rebase it anyway)")
+    forced = bool(base or args.no_base)
+    todo = {n: [e for e in manifests[n]["files"]  # named files; else all but those set by hand, unless forced
+                if (e["path"] in set(args.files) if args.files else forced or e.get("base_choice", "auto") == "auto")]
+            for n in order if n not in skipped}
+    try:
+        release = set() if forced else weigh_kept(args, p, graph, todo)
+    except (OSError, ValueError) as e:
+        sys.exit(f"cannot weigh the bases kept for other models ({e}): run verify")
+    try:
+        for name in order:
+            if name in skipped:
+                continue
+            b, a = rebase_model(args, p, graph, name, base, release, todo[name])
+            before, after = before + b, after + a
+            graph.manifests = manifests = all_manifests(p)  # its base_choice may have changed
+    finally:
+        if not args.dry_run:
+            sweep(p)  # blobs that were bases before and are not any more
+            touch_marker(p)
+        PROGRESS.end()
+    if len(order) > 1:
+        say(f"total stored {human(before)}" + (" (dry run: nothing changed)" if args.dry_run else f" -> {human(after)}"),
+            event="models", before=before, after=after)
+    if not args.dry_run:  # what counts: with the bases let go, and blobs trimmed or no longer needed
+        pack_after = blobs_size(p, p.blob_ids())
+        change = f"{(pack_after - pack_before) / max(pack_before, 1):+.1%}" if pack_after != pack_before else "unchanged"
+        say(f"the pack: {human(pack_before)} -> {human(pack_after)}  ({change})", event="summary", before=pack_before,
+            after=pack_after)
+
+
+# ----------------------------------------------------------------------------------------------- export
+
+
+def kit_files(p):
+    """(files, problems) of a pack's _kit for export: every file in it ("/" paths from the pack, sorted); problems:
+    links (never followed) and anything that is not a regular file."""
+    if isinstance(p, FilePack):
+        return sorted(n for n in p.names if n.startswith(KIT + "/") and not n.endswith("/")), []
+    found, problems, top = [], [], p.full(KIT)
+    if not os.path.isdir(top) or os.path.islink(top):
+        return [], ([f"{KIT} is a link"] if os.path.islink(top) else [])
+    is_junction = getattr(os.path, "isjunction", lambda path: False)
+    for dirpath, dirnames, names in os.walk(top):
+        rel = lambda n: os.path.relpath(os.path.join(dirpath, n), p.root).replace(os.sep, "/")  # noqa: E731
         keep = []
         for d in sorted(dirnames):
             full = os.path.join(dirpath, d)
@@ -3090,8 +3978,6 @@ def bundle_files(archive_root):
                 keep.append(d)
         dirnames[:] = keep
         for n in sorted(names):
-            if (dirpath == archive_root and n == LOCK_NAME) or (n.startswith(".oc-") and n.endswith(".part")):
-                continue
             mode = os.lstat(os.path.join(dirpath, n)).st_mode
             if stat.S_ISREG(mode):
                 found.append(rel(n))
@@ -3100,118 +3986,197 @@ def bundle_files(archive_root):
     return sorted(found), problems
 
 
-def zip_method(path, rel, size):
-    """ZIP_STORED for a file compressed already (by its name) or one Deflate barely shrinks (judged on its first
-    MiB), else ZIP_DEFLATED."""
-    if not size or rel.lower().endswith(STORED_SUFFIXES):
-        return zipfile.ZIP_STORED
-    with open(path, "rb") as f:
-        sample = f.read(1 << 20)
-    return zipfile.ZIP_DEFLATED if len(zlib.compress(sample, 6)) < 0.9 * len(sample) else zipfile.ZIP_STORED
+def copy_blob(src, dst, size):
+    """Copy a blob of `size` bytes from src to dst (file objects), checking that its last 32 bytes are the SHA-256 of
+    the rest; returns the SHA-256 of all of it (what the copy must read back as). ValueError if it is damaged."""
+    inner, whole, left = hashlib.sha256(), hashlib.sha256(), size - TRAILER
+    while left > 0:
+        block = src.read(min(left, 16 << 20))
+        if not block:
+            raise ValueError("cut short")
+        inner.update(block)
+        whole.update(block)
+        dst.write(block)
+        left -= len(block)
+        PROGRESS.add(len(block))
+    tail = src.read(TRAILER)
+    if tail != inner.digest():
+        raise ValueError("damaged (its SHA-256 does not match)")
+    whole.update(tail)
+    dst.write(tail)
+    return whole.hexdigest()
 
 
-def bundle_problems(path, digests):
-    """What differs between the .oczip at path, read back from disk, and the files put in it ({name: sha256})."""
-    _ZIPS.pop(path, None)
-    z, problems = oczip(path), []
-    names = set(z.namelist())
-    problems += [f"{n}: in the pack file but not put in" for n in sorted(names - set(digests))]
-    problems += [f"{n}: missing from the pack file" for n in sorted(set(digests) - names)]
-    for name, digest in digests.items():
-        if name in names:
-            try:
-                with z.open(name) as f:
-                    same = sha256_stream(f) == digest
-            except (OSError, ValueError, zipfile.BadZipFile) as e:
-                problems.append(f"{name}: cannot be read back ({e})")
-                continue
-            if not same:
-                problems.append(f"{name}: differs from the file put in")
+def readback_problems(path, digests):
+    """What differs between the pack file at path, read back from disk, and the members put in it ({name: sha256})."""
+    with zipfile.ZipFile(path) as z:
+        names, problems = set(z.namelist()), []
+        problems += [f"{n}: in the pack file but not put in" for n in sorted(names - set(digests))]
+        problems += [f"{n}: missing from the pack file" for n in sorted(set(digests) - names)]
+        for name, digest in sorted(digests.items()):
+            if name in names:
+                try:
+                    with z.open(name) as f:
+                        same = sha256_stream(f) == digest
+                except (OSError, ValueError, zipfile.BadZipFile) as e:
+                    problems.append(f"{name}: cannot be read back ({e})")
+                    continue
+                if not same:
+                    problems.append(f"{name}: differs from what was put in")
     return problems
 
 
-def unlock_archive(archive_root):
-    """Release the archive's lock and delete its file (bundle --delete: the folder is going)."""
+def unlock_archive(root):
+    """Release the pack folder's lock and delete its file (export --delete: the pack folder is going)."""
     while _HELD_LOCK:
         os.close(_HELD_LOCK.pop())
     with contextlib.suppress(OSError):
-        os.remove(os.path.join(archive_root, LOCK_NAME))
+        os.remove(os.path.join(root, LOCK_NAME))
 
 
-def cmd_bundle(args):
-    """Put the whole archive folder (models, _kit, anything else in it) into one .oczip file, a ZIP: containers and
-    files compressed already stored as they are (so containers can be read in place), the others Deflate-compressed
-    when that makes them smaller. --verify reads it back (every file compared with what was put in, every model
-    verified from it); --delete then deletes the files put in from the folder, and verifies first unless --no-verify."""
-    root, out = args.archive_root, os.path.abspath(args.oczip)
+def cmd_export(args):
+    """Put models of a pack (default: all) into a new pack file, with every blob they need and the _kit: the blobs
+    stored as they are, the rest Deflated where that helps. From a pack file, this makes a smaller one. --verify
+    reads it back (every member compared with what was put in, every model verified from it); --delete then removes
+    those models from the pack folder (only the blobs no remaining model needs go), verifying first unless
+    --no-verify."""
+    try:
+        p = open_pack(args.pack)
+    except (OSError, ValueError) as e:
+        sys.exit(f"cannot open {args.pack}: {e}")
+    out = os.path.abspath(args.oczip)
     verify = args.delete if args.verify is None else args.verify
-    if is_oczip(root) or not os.path.isdir(root):
-        sys.exit(f"{root} is not a pack folder")
-    if not out.lower().endswith(OCZIP):
+    if not is_oczip(out):
         sys.exit(f"{args.oczip}: the name of a pack file must end with {OCZIP}")
-    if holds(root, out):
+    if isinstance(p, FilePack):
+        if args.delete:
+            sys.exit(f"--delete: {args.pack} is a pack file, which is read-only")
+        if os.path.normcase(p.root) == os.path.normcase(out):
+            sys.exit(f"{args.oczip} is the pack file exported from: write another one")
+    elif holds(p.root, out):
         sys.exit(f"{args.oczip} would be inside the pack folder: write it somewhere else")
+    problem = place_problem(os.path.dirname(out))
+    if problem:
+        sys.exit(f"a pack file is not written into a pack folder: {problem}")
     if os.path.lexists(out) and not args.overwrite:
         sys.exit(f"{args.oczip} exists already: choose another name, or add --overwrite to replace it")
-    lock_archive(root, exclusive=args.delete)  # a reader's lock is enough unless the files are then deleted
-    manifests = all_manifests(root)
-    if not manifests:
-        sys.exit(f"no models found in {root}: nothing to bundle")
-    files, problems = bundle_files(root)
+    if isinstance(p, FolderPack):
+        lock_archive(p.root, exclusive=args.delete, skip=args.no_lock and not args.delete)
+    manifests = all_manifests(p)
+    names = list(dict.fromkeys(model_named(manifests, n, p) for n in args.models)) or sorted(manifests)
+    if not names:
+        sys.exit(f"no models in {p.root}: nothing to export")
+    try:
+        blobs = sorted(Graph(p, manifests).needed(names))
+        sizes = {sha: p.blob_span(sha)[2] for sha in blobs}
+    except (OSError, ValueError) as e:
+        sys.exit(f"cannot tell what {', '.join(names)} need ({e}): nothing written; run verify")
+    kit, problems = kit_files(p)
     if problems:
-        sys.exit(f"cannot bundle {root} as it is:\n  " + "\n  ".join(problems) + "\nmove or delete these first")
-    containers = {f"{repo_dir_name(r)}/{e['stored']}" for r, m in manifests.items() for e in m["files"]
-                  if e["method"] not in ("raw", "same")}
-    sizes = {rel: os.path.getsize(os.path.join(root, *rel.split("/"))) for rel in files}
+        sys.exit(f"cannot export {p.root} as it is:\n  " + "\n  ".join(problems) + "\nmove or delete these first")
+    kit_sizes = {rel: p.zip.getinfo(rel).file_size if isinstance(p, FilePack) else os.path.getsize(p.full(rel))
+                 for rel in kit}
+    total = sum(sizes.values()) + sum(kit_sizes.values())
     os.makedirs(os.path.dirname(out), exist_ok=True)
-    problem = space_problem({os.path.dirname(out): sum(sizes.values()) + (len(files) << 10) + (16 << 20)})
+    problem = space_problem({os.path.dirname(out): total + (len(blobs) + len(kit) << 10) + (16 << 20)})
     if problem:
         sys.exit(f"not enough room for {args.oczip}: {problem}")
-    print(f"bundling {len(files)} files ({human(sum(sizes.values()))}) of {root} into {out}")
+    which = "every model" if len(names) == len(manifests) else ", ".join(names)
+    say(f"exporting {which} of {p.root} ({len(blobs)} blobs, {human(sum(sizes.values()))}) into {out}")
+    PROGRESS.begin("exporting", total)
     digests, t0 = {}, time.perf_counter()
+    stamp = time.localtime()[:6]
+
+    def member(rel, method):
+        info = zipfile.ZipInfo(rel, stamp)
+        info.compress_type = method
+        return info
+
     with SafeTree(os.path.dirname(out)).placing(os.path.basename(out), replace=args.overwrite) as f, \
             zipfile.ZipFile(f, "w", allowZip64=True) as z:
-        for rel in files:
-            full = os.path.join(root, *rel.split("/"))
-            info = zipfile.ZipInfo.from_file(full, rel, strict_timestamps=False)
-            info.file_size = sizes[rel]
-            info.compress_type = zipfile.ZIP_STORED if rel in containers else zip_method(full, rel, sizes[rel])
+        for rel in [MARKER] + [manifest_rel(n) for n in names]:
+            data = p.read(rel)
+            z.writestr(member(rel, zipfile.ZIP_DEFLATED), data)
+            digests[rel] = hashlib.sha256(data).hexdigest()
+        for sha in blobs:
+            rel, (path, start, _) = blob_rel(sha), p.blob_span(sha)
+            PROGRESS.at(rel)
+            with open(path, "rb") as src, z.open(member(rel, zipfile.ZIP_STORED), "w", force_zip64=True) as dst:
+                src.seek(start)
+                try:
+                    digests[rel] = copy_blob(src, dst, sizes[sha])
+                except ValueError as e:
+                    sys.exit(f"{rel} is {e}: nothing written; run verify")
+        for rel in kit:
+            PROGRESS.at(rel)
+            if isinstance(p, FilePack):
+                info = zipfile.ZipInfo(rel, p.zip.getinfo(rel).date_time)
+                opened = lambda rel=rel: p.zip.open(rel)  # noqa: E731
+            else:
+                info = zipfile.ZipInfo.from_file(p.full(rel), rel, strict_timestamps=False)
+                opened = lambda rel=rel: open(p.full(rel), "rb")  # noqa: E731
+            with opened() as src:
+                info.compress_type = zip_method(rel, kit_sizes[rel], src.read(1 << 20))
             h, n = hashlib.sha256(), 0
-            with open(full, "rb") as src, z.open(info, "w") as dst:
+            with opened() as src, z.open(info, "w", force_zip64=True) as dst:
                 while block := src.read(16 << 20):
                     h.update(block)
                     dst.write(block)
                     n += len(block)
-            if n != sizes[rel]:
-                sys.exit(f"{rel} changed while it was bundled: nothing written")
+                    PROGRESS.add(len(block))
+            if n != kit_sizes[rel]:
+                sys.exit(f"{rel} changed while it was exported: nothing written")
             digests[rel] = h.hexdigest()
-            how = "stored" if info.compress_type == zipfile.ZIP_STORED else f"deflated to {info.compress_size / max(n, 1):.0%}"
-            print(f"  {rel:<60} {human(n):>12}  {how}")
-    print(f"wrote {out}: {human(os.path.getsize(out))}  ({time.perf_counter() - t0:.0f}s)")
+    PROGRESS.end()
+    say(f"wrote {out}: {human(os.path.getsize(out))}  ({time.perf_counter() - t0:.0f}s)", event="written", path=out,
+        size=os.path.getsize(out))
     if verify:
-        print(f"verifying {out}")
-        problems = bundle_problems(out, digests)
-        for p in problems:
-            print(f"  FAIL  {p}")
-        failures, checked = verify_models(out, [])
+        say(f"verifying {out}")
+        problems = readback_problems(out, digests)
+        for problem in problems:
+            say(f"  FAIL  {problem}", event="fail", problem=problem)
+        new = FilePack(out)
+        try:
+            failures, checked, _ = verify_models(new, all_manifests(new, []), names)
+        finally:
+            new.close()
         if problems or failures:
-            sys.exit(f"{len(problems) + failures} FAILURE(S) in {out}" + (": nothing deleted" if args.delete else ""))
-        print(f"VERIFIED: all {len(files)} files read back identical; {checked} model files restored exactly")
+            sys.exit(f"{len(problems) + failures} FAILURE(S) in {out}" + (": nothing removed" if args.delete else ""))
+        say(f"VERIFIED: all {len(digests)} members read back identical; {checked} model files restored exactly")
     if args.delete:
-        tree = SafeTree(root)
-        left = [rel for rel in files if not tree.remove(rel)]
-        for rel in files:
-            tree.prune(rel)
-        unlock_archive(root)
-        with contextlib.suppress(OSError):
-            os.rmdir(root)  # only if nothing else is left in it
-        print(f"deleted the {len(files) - len(left)} bundled files from {root}")
-        others = [os.path.join(d, n) for d, _, names in os.walk(root) for n in names if os.path.join(d, n) not in
-                  {os.path.join(root, *rel.split("/")) for rel in left}]
-        if others:
-            print(f"  left in {root}, not bundled: {len(others)} file(s), e.g. {others[0]}")
-        if left:
-            sys.exit(f"could not delete {len(left)} file(s), e.g. {left[0]}: they are in {out}; delete them yourself")
+        tree = SafeTree(p.root)
+        for name in names:
+            tree.remove(manifest_rel(name))
+        result = sweep(p)
+        freed = f": {human(result[1])} freed" if result else ""
+        if len(names) == len(manifests):  # the whole pack is in the file now: the folder goes
+            for rel in kit + [MARKER]:
+                tree.remove(rel)
+                tree.prune(rel)
+            for folder in (MODELS, BLOBS):
+                with contextlib.suppress(OSError):
+                    os.rmdir(p.full(folder))
+            unlock_archive(p.root)
+            with contextlib.suppress(OSError):
+                os.rmdir(p.root)  # only if nothing else is left in it
+            left = [os.path.join(d, n) for d, _, found in os.walk(p.root) for n in found]
+            say(f"removed the pack folder {p.root}{freed}" if not os.path.exists(p.root) else
+                f"emptied the pack folder {p.root}{freed}; left in it, not part of the pack: {len(left)} file(s)"
+                + (f", e.g. {left[0]}" if left else ""))
+        else:
+            touch_marker(p)
+            say(f"removed {', '.join(names)} from {p.root}{freed}")
+
+
+STORED_SUFFIXES = (".ocz", OCZIP, ".zip", ".whl", ".gz", ".tgz", ".xz", ".zst", ".bz2", ".7z", ".rar", ".exe", ".msi",
+                   ".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp3", ".mp4", ".mkv", ".par2")  # compressed already
+
+def zip_method(rel, size, sample):
+    """ZIP_STORED for a file compressed already (by its name) or one Deflate barely shrinks (judged on `sample`, its
+    first MiB), else ZIP_DEFLATED."""
+    if not size or rel.lower().endswith(STORED_SUFFIXES):
+        return zipfile.ZIP_STORED
+    return zipfile.ZIP_DEFLATED if len(zlib.compress(sample, 6)) < 0.9 * len(sample) else zipfile.ZIP_STORED
 
 
 def whole_number(lo, hi):
@@ -3239,14 +4204,108 @@ def add_codec_options(s):
                    help="zstd level 1-22 for quantized tensors and unknown binaries (default 9; 19 is ~80x slower for ~0.1%%)")
 
 
+def build_of(path):
+    """Which build a tool file is, "<date> <commit>" of the last commit that changed it (", edited" when the file
+    differs from that commit): from the BUILD file a kit puts beside the tools, else from git when the file sits in a
+    checkout; None if neither tells. Git is asked only what reads its objects (log, rev-parse): nothing that runs hooks."""
+    folder, name = os.path.split(os.path.abspath(path))
+    try:
+        with open(os.path.join(folder, "BUILD"), encoding="utf-8") as f:
+            return json.load(f).get(name)
+    except (OSError, ValueError, AttributeError):
+        pass
+
+    def git(*argv):
+        return subprocess.run(["git", "-C", folder, *argv], capture_output=True, text=True, timeout=10,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout.strip()
+
+    try:
+        stamp, committed = git("log", "-1", "--format=%cs %h", "--", name), git("rev-parse", f"HEAD:./{name}")
+        with open(path, "rb") as f:
+            data = f.read().replace(b"\r\n", b"\n")  # as git keeps it
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not stamp:
+        return None
+    return stamp + ("" if hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest() == committed else ", edited")
+
+
+def version_text(name, version, path):
+    build = build_of(path)
+    return f"{name} {version}" + (f" ({build})" if build else "")
+
+
+TOOL = []  # what goes into the manifests' "tool": worked out once, when first written
+
+
+def tool_version():
+    if not TOOL:
+        TOOL.append(version_text("llm_archive", VERSION, __file__))
+    return TOOL[0]
+
+
+class ShowVersion(argparse.Action):
+    """--version: the version and build of this tool, and the format it writes."""
+
+    def __init__(self, option_strings, dest, **kwargs):
+        super().__init__(option_strings, dest, nargs=0, **kwargs)
+
+    def __call__(self, parser, *_):
+        print(f"{version_text('OverCompressing CLI', VERSION, __file__)}, format {FORMAT_VERSION}")
+        parser.exit()
+
+
+def read_list(path):
+    """The names in a list file (--models-from, --files-from): one per line, as written; UTF-8, a BOM, CRLF and blank
+    lines do not matter. A list that names nothing stops the program (it would otherwise mean "all")."""
+    try:
+        with open(path, encoding="utf-8-sig", newline="") as f:
+            names = [line for line in (raw.removesuffix("\r") for raw in f.read().split("\n")) if line]
+    except (OSError, UnicodeDecodeError) as e:
+        sys.exit(f"cannot read the list {path} ({e})")
+    if not names:
+        sys.exit(f"the list {path} names nothing")
+    return names
+
+
+def read_lists(args):
+    """Add the names of --models-from and --files-from lists to the models and files named on the command line."""
+    for path in getattr(args, "models_from", ()):
+        args.models = [*args.models, *read_list(path)]
+    for path in getattr(args, "files_from", ()):
+        args.files = [*args.files, *read_list(path)]
+
+
 def main():
+    global JSON_OUT
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true",
+                        help="print every result line (and progress line) as a JSON object {\"event\", \"text\", ...}")
+    common.add_argument("--progress", action=argparse.BooleanOptionalAction, default=None,
+                        help="report on stderr, about once a second, how far the current step is (default: when "
+                             "stderr is a terminal)")
+    no_lock = dict(action="store_true", help="do not lock the pack folder (only when it cannot be locked and nothing "
+                                             "can change it while this runs)")
+    models_from = dict(action="append", default=[], metavar="FILE", dest="models_from",
+                       help="also the models named in FILE, one per line (UTF-8; repeatable)")
+    files_from = dict(action="append", default=[], metavar="FILE", dest="files_from",
+                      help="also the files listed in FILE, one path per line (UTF-8; repeatable), as with --file")
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action=ShowVersion, help="show the version and build of this tool, and exit")
     sub = p.add_subparsers(dest="cmd", required=True)
-    s = sub.add_parser("pack", help="compress every file of a folder into a pack folder, or a new pack file, and verify it")
-    s.add_argument("source_dir")
-    s.add_argument("archive_root", metavar="pack", help=f"the pack folder to pack into, or a new pack file (<name>{OCZIP}) "
-                                                        "to make")
-    s.add_argument("--name", help="name of this model in the pack, e.g. Qwen/Qwen2.5-7B (default: the folder name)")
+
+    s = sub.add_parser("pack", parents=[common], help="compress the files of folders into a pack folder, or into a new "
+                                                      "pack file, and verify them")
+    s.add_argument("paths", nargs="+", metavar="path", help=f"the folder(s) to pack (one model each), then the pack "
+                                                           f"folder to pack into or a new pack file (<name>{OCZIP}) to make")
+    s.add_argument("--name", help="name of the model in the pack, e.g. Qwen/Qwen2.5-7B (default: the folder's name)")
+    there = s.add_mutually_exclusive_group()
+    there.add_argument("--replace", action="store_true",
+                       help="replace a model of that name in the pack folder with these files (without it, a name the "
+                            "pack folder holds already is refused)")
+    there.add_argument("--add", action="store_true",
+                       help="add these files to the model of that name in the pack folder: files of the same path are "
+                            "replaced, the others kept")
     s.add_argument("--revision", help="free-text note stored in the manifest, e.g. the upstream commit")
     s.add_argument("--exclude", action="append", default=[], metavar="GLOB",
                    help="skip files whose path or name matches (repeatable); .git/, .cache/, __MACOSX/, Thumbs.db, "
@@ -3254,73 +4313,128 @@ def main():
     s.add_argument("--file", action="append", default=[], metavar="PATH", dest="files",
                    help="pack only this file of the folder, a path relative to it (repeatable): the model then holds "
                         "just the files named")
+    s.add_argument("--files-from", **files_from)
     base = s.add_mutually_exclusive_group()
     base.add_argument("--base", metavar="MODEL",
-                      help="store tensors as deltas against this model of the pack, by name or folder (default: "
-                           "each file picks the model that compresses it best, by sampling)")
+                      help="store tensors as deltas against this model (of the pack, or packed now before the others) "
+                           "(default: each file picks the model that compresses it best, by sampling)")
     base.add_argument("--no-base", action="store_true", help="store every file without a delta base")
-    s.add_argument("--no-dedupe", dest="dedupe", action="store_false",
-                   help="store files even if an identical file is already in the pack")
     add_codec_options(s)
     s.set_defaults(func=cmd_pack)
-    s = sub.add_parser("rebase", help="re-choose the delta bases of packed models (restores only what it re-packs)")
-    s.add_argument("targets", nargs="*", metavar="model_folder",
-                   help="the folders of the models to rebase (in one pack folder); with --all, the pack folder")
-    s.add_argument("--all", action="store_true",
-                   help="every model of the pack folder whose bases were chosen automatically, bases before the "
-                        "models that use them")
-    base = s.add_mutually_exclusive_group()
-    base.add_argument("--base", metavar="MODEL", help="re-pack every file against this model (its name or folder), "
-                                                      "even if it gets larger")
-    base.add_argument("--no-base", action="store_true", help="re-pack every file without a delta base, even if it gets larger")
-    s.add_argument("--no-dedupe", dest="dedupe", action="store_false",
-                   help="store files that are same-as references to another model as files again")
-    s.add_argument("--dry-run", action="store_true", help="show what would change; change nothing")
-    add_codec_options(s)
-    s.set_defaults(func=cmd_rebase)
-    no_lock = "do not lock the pack folder (only when it cannot be locked and nothing can change it while this runs)"
-    s = sub.add_parser("verify", help="decompress everything in memory and check sha256")
-    s.add_argument("targets", nargs="+", metavar="path",
-                   help=f"a model folder; a pack folder or a pack file (all their models); or a model folder in a pack "
-                        f"file (<file{OCZIP}>/<folder>). Several may be given")
-    s.add_argument("--no-lock", action="store_true", help=no_lock)
+
+    s = sub.add_parser("list", parents=[common], help="show the models of a pack as a tree of what needs what, or "
+                                                      "the files of one model")
+    s.add_argument("pack", help=f"a pack folder or a pack file ({OCZIP})")
+    s.add_argument("model", nargs="?", help="show this model's files, how each is stored and what it is coded against")
+    s.add_argument("--no-lock", **no_lock)
+    s.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("verify", parents=[common], help="decompress everything in memory and check sha256")
+    s.add_argument("pack", help=f"a pack folder or a pack file ({OCZIP})")
+    s.add_argument("models", nargs="*", metavar="model", help="only these models (default: all of them)")
+    s.add_argument("--file", action="append", default=[], metavar="PATH", dest="files",
+                   help="only this file of the one model named, its path as the pack lists it (repeatable)")
+    s.add_argument("--models-from", **models_from)
+    s.add_argument("--files-from", **files_from)
+    s.add_argument("--no-lock", **no_lock)
     s.set_defaults(func=cmd_verify)
-    s = sub.add_parser("restore", help="write a model back out, byte-identical to the original")
-    s.add_argument("model", help=f"the model's folder (the one holding its manifest.json), or <file{OCZIP}>/<folder> "
-                                 f"for one in a pack file")
+
+    s = sub.add_parser("restore", parents=[common], help="write a model back out, byte-identical to the original")
+    s.add_argument("pack", help=f"a pack folder or a pack file ({OCZIP})")
+    s.add_argument("model", help="the model's name (Org/Name)")
     s.add_argument("dest_dir")
     s.add_argument("--overwrite", action="store_true",
                    help="replace files in dest_dir that have other contents (files already right are always kept)")
     s.add_argument("--file", action="append", default=[], metavar="PATH", dest="files",
                    help="restore only this file of the model, its path as the pack lists it (repeatable)")
+    s.add_argument("--files-from", **files_from)
     s.add_argument("--flat", action="store_true",
                    help="put every file straight into dest_dir, without the model's folders (two files of one name: "
                         "the later one gets \" (1)\")")
-    s.add_argument("--no-lock", action="store_true", help=no_lock)
+    s.add_argument("--no-lock", **no_lock)
     s.set_defaults(func=cmd_restore)
-    s = sub.add_parser("bundle", help=f"put a whole pack folder into one pack file ({OCZIP}), which verify and "
-                                      "restore read as they read the folder")
-    s.add_argument("archive_root", metavar="pack_folder")
+
+    s = sub.add_parser("remove", parents=[common], help="remove models (or files of a model) from a pack folder: only "
+                                                        "what no remaining model needs is deleted")
+    s.add_argument("pack", metavar="pack_folder")
+    s.add_argument("models", nargs="*", metavar="model", help="the models to remove")
+    s.add_argument("--file", action="append", default=[], metavar="PATH", dest="files",
+                   help="remove only this file of the model, its path as the pack lists it (repeatable)")
+    s.add_argument("--models-from", **models_from)
+    s.add_argument("--files-from", **files_from)
+    s.add_argument("--dry-run", action="store_true", help="show what would be freed and kept; change nothing")
+    s.set_defaults(func=cmd_remove)
+
+    s = sub.add_parser("rename", parents=[common], help="give a model of a pack folder another name, or a file of a "
+                                                        "model another path")
+    s.add_argument("pack", metavar="pack_folder")
+    s.add_argument("model")
+    s.add_argument("new_name", help="the model's new name; with --file, the file's new path in the model")
+    s.add_argument("--file", metavar="PATH", help="rename this file of the model (its path as the pack lists it) instead")
+    s.set_defaults(func=cmd_rename)
+
+    s = sub.add_parser("rebase", parents=[common], help="re-choose the delta bases of packed models (restores only "
+                                                        "what it re-packs)")
+    s.add_argument("pack", metavar="pack_folder")
+    s.add_argument("models", nargs="*", metavar="model", help="the models to rebase")
+    s.add_argument("--models-from", **models_from)
+    s.add_argument("--file", action="append", default=[], metavar="PATH", dest="files",
+                   help="only this file of the one model named, its path as the pack lists it (repeatable); a choice "
+                        "made with --base or --no-base is then this file's, and --all leaves it as it is")
+    s.add_argument("--files-from", **files_from)
+    s.add_argument("--all", action="store_true",
+                   help="every model whose bases were chosen automatically, bases before the models that use them")
+    base = s.add_mutually_exclusive_group()
+    base.add_argument("--base", metavar="MODEL", help="re-pack every file against this model, even if it gets larger")
+    base.add_argument("--no-base", action="store_true", help="re-pack every file without a delta base, even if it gets larger")
+    s.add_argument("--dry-run", action="store_true", help="show what would change; change nothing")
+    add_codec_options(s)
+    s.set_defaults(func=cmd_rebase)
+
+    s = sub.add_parser("export", parents=[common], help=f"put models of a pack, with every blob they need, into a new "
+                                                        f"pack file ({OCZIP})")
+    s.add_argument("pack", help=f"a pack folder, or a pack file ({OCZIP}) to take some of its models from")
     s.add_argument("oczip", metavar="pack_file", help=f"the pack file to write, its name ending in {OCZIP} (outside the "
                                                       "pack folder)")
+    s.add_argument("models", nargs="*", metavar="model", help="only these models (default: all of them)")
+    s.add_argument("--models-from", **models_from)
     check = s.add_mutually_exclusive_group()
     check.add_argument("--verify", action="store_true", default=None,
-                       help="then read it back: every file compared with what was put in, every model verified "
+                       help="then read it back: every member compared with what was put in, every model verified "
                             "(default: only with --delete)")
     check.add_argument("--no-verify", dest="verify", action="store_false", default=None,
-                       help="with --delete: delete without verifying first")
+                       help="with --delete: remove without verifying first")
     s.add_argument("--delete", action="store_true",
-                   help="then delete the files put in from the pack folder (verified first unless --no-verify)")
+                   help="then remove those models from the pack folder (verified first unless --no-verify); "
+                        "exporting all of them removes the pack folder")
     s.add_argument("--overwrite", action="store_true", help="replace a file of that name")
-    s.set_defaults(func=cmd_bundle)
+    s.add_argument("--no-lock", **no_lock)
+    s.set_defaults(func=cmd_export)
+
     args = p.parse_args()
+    JSON_OUT = args.json
+    for stream in (sys.stdout, sys.stderr):  # a name the console's code page lacks must not stop the program
+        with contextlib.suppress(AttributeError, ValueError):
+            stream.reconfigure(errors="backslashreplace")
+    if args.progress or (args.progress is None and sys.stderr.isatty()):
+        PROGRESS.start()
     workers = ans16_workers()  # checks OC_WORKERS before any command starts
     if getattr(args, "workers", 0) is None:
         args.workers = workers
     try:
-        args.func(args)
-    except OSError as e:  # e.g. a full disk: reported plainly; a pack or rebase has already removed its new files
-        sys.exit(f"error: {e}")
+        try:
+            read_lists(args)
+            args.func(args)
+        except OSError as e:  # e.g. a full disk: reported plainly; what a command had begun to write is removed already
+            sys.exit(f"error: {e}")
+    except SystemExit as e:
+        PROGRESS.end()
+        if JSON_OUT and isinstance(e.code, str):
+            print(json.dumps({"event": "error", "text": e.code}), flush=True)
+            raise SystemExit(1) from None
+        raise
+    finally:
+        PROGRESS.end()
 
 
 if __name__ == "__main__":
