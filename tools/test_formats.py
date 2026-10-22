@@ -1728,6 +1728,14 @@ def check_pack_files():
         expect("restore of an ans16 delta run as the window runs it (stdin left open): it does not stall", ok,
                "" if ok else f"{code} {''.join(chunks)[-300:]}")
         run.stdin.close()
+    # no worker is forked from the tool, whose progress thread runs meanwhile: Python warns of that fork (3.12+), and
+    # the warning made an error stops the run where it happens (Linux before 3.14); Windows spawns them anyway
+    dest = os.path.join(root, "no-fork")
+    run = subprocess.run([sys.executable, "-I", "-W", "error:This process:DeprecationWarning", os.path.join(TOOL_DIR, "llm_archive.py"),
+                          "restore", single, "t/G", dest, "--progress"], capture_output=True, text=True, timeout=600)
+    ok = run.returncode == 0 and same_tree(dest, sources["t/G"])
+    expect("ans16 workers are never forked from the tool's own threaded process (a fork server on Linux)", ok,
+           "" if ok else (run.stdout + run.stderr)[-300:])
     dest = os.path.join(root, "one")
     code, out = tool("restore", single, "t/G", dest, "--file", "config.json")
     ok = code == 0 and os.listdir(dest) == ["config.json"]
@@ -2081,5 +2089,5 @@ def main():
     sys.exit(1 if failures else 0)
 
 
-if __name__ == "__main__":  # worker processes (Windows spawn) re-import this file
+if __name__ == "__main__":  # worker processes (spawn on Windows, a fork server elsewhere) import this file again
     main()

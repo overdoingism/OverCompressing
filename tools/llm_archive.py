@@ -44,6 +44,7 @@ import hashlib
 import itertools
 import json
 import math
+import multiprocessing
 import os
 import secrets
 import shutil
@@ -1105,8 +1106,16 @@ def ans16_workers():
 
 
 def worker_pool(n):
-    """A pool of n worker processes, at most 61 on Windows: Python's pool refuses more there (ValueError)."""
-    return ProcessPoolExecutor(min(n, 61) if sys.platform == "win32" else n)
+    """A pool of n worker processes: at most 61 on Windows, where Python's pool refuses more (ValueError); where they
+    would be forked from this process (Linux before Python 3.14), forked by a fork server instead. This process has
+    threads (progress, the window's stdin watch) that may hold a lock at that moment, and a forked worker inherits
+    it held, by no thread: it hangs when it takes it (closing stdin, flushing stderr)."""
+    if sys.platform == "win32":
+        return ProcessPoolExecutor(min(n, 61))
+    context = multiprocessing.get_context()
+    if context.get_start_method() == "fork" and "forkserver" in multiprocessing.get_all_start_methods():
+        context = multiprocessing.get_context("forkserver")
+    return ProcessPoolExecutor(n, mp_context=context)
 
 
 def frame_workers():

@@ -33,7 +33,9 @@ import llm_archive as la  # noqa: E402
 
 # Runs llm_archive.py in the child process. When its stdin closes (Cancel, or this window going away), it stops as on
 # Ctrl+C, so a pack or restore still removes what it had begun. On Windows the pipe is polled, not read: a read left
-# pending on it would stall every process started meanwhile (the ans16 workers) as it starts.
+# pending on it would stall every process started meanwhile (the ans16 workers) as it starts. Elsewhere it is read
+# from its file descriptor: Python's buffered stdin holds a lock while it waits, and workers forked meanwhile would
+# wait on that lock forever when they close stdin (found by the downstream team on Linux).
 RUNNER = """import os, sys, threading, time, _thread
 if sys.platform != "win32":
     os.nice(10)  # gives way to what the user is doing, as on Windows (BELOW_NORMAL); its workers inherit it
@@ -50,7 +52,10 @@ def cancel_on_eof():
                 break
             time.sleep(0.25)
     else:
-        sys.stdin.read()
+        # A buffered read holds stdin's Python I/O lock across fork; a pool worker then blocks when
+        # multiprocessing closes its inherited stdin. Read the pipe without that lock.
+        while os.read(sys.stdin.fileno(), 4096):
+            pass
     _thread.interrupt_main()
 threading.Thread(target=cancel_on_eof, daemon=True).start()
 sys.argv = ["llm_archive.py", *sys.argv[2:]]

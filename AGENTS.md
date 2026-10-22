@@ -133,7 +133,9 @@ or `--add` (these files join it, same paths replaced), checked before anything i
   `model_summary`, `removal`), closing pack files afterwards. Every change runs `llm_archive.py` in a child process
   through `RUNNER` (at below-normal priority), with `--json --progress`; the window parses those lines (progress events go to the busy window,
   the rest to the log). Closing the child's stdin cancels as Ctrl+C would. On Windows the child polls stdin with
-  `PeekNamedPipe`: a blocking read would stall every ans16 worker process at start (a real bug once).
+  `PeekNamedPipe`: a blocking read would stall every ans16 worker process at start (a real bug once). On POSIX it
+  reads the file descriptor (`os.read`), never `sys.stdin.read()`: the buffered reader's lock, held while it waits,
+  is inherited held by forked workers, which then hang closing stdin (the same bug on Linux, found downstream).
 - While a job runs, a modal window in front holds all input and has Cancel. Activity is a turning ◐; how far it is
   is text (`37% · 5.6 GiB / 15.1 GiB`), never a bar.
 - A pack shows first as a flat list of its models (sortable by name, Packed time, size, …), with what each needs in
@@ -176,7 +178,9 @@ or `--add` (these files join it, same paths replaced), checked before anything i
 ## Speed
 
 - What runs at once: ans16 regions in worker processes, one per CPU the process may use (`ans16_workers`; at most 61
-  on Windows, the most Python's pool takes there: `worker_pool`); byte-plane and zstd
+  on Windows, the most Python's pool takes there: `worker_pool`; on POSIX never forked from the tool itself, whose
+  threads may hold locks a fork copies held: a fork server where the default is `fork`, i.e. Linux before 3.14, so a
+  script driving `llm_archive` in-process needs `if __name__ == "__main__"` there as on Windows); byte-plane and zstd
   frames on threads (`frame_workers`, up to 8) through `ordered_map`, the main thread reading and writing in order
   (CRCs on the threads too); files hashed and blobs checked several at once (`hash_workers`, up to 4), each read a
   block ahead of its hashing (`blocks_ahead`). `OC_WORKERS` caps all of them. One file's SHA-256 is one sequence
