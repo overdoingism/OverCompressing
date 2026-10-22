@@ -1311,8 +1311,8 @@ def blob_damage(span, sha, counted=False):
 
 OCZIP = ".oczip"
 MARKER = "ocpack.json"
-# _kit was the offline kit kit/build_kit.py made, which is retired (no longer made); a portable copy of the tool may be
-# put there instead. It is handled passively: a folder holding only it can become a pack, restore never writes into it,
+# _kit once held an offline kit (no longer made; its scripts are gone from the repository); a portable copy of the tool
+# may be put there instead. It is handled passively: a folder holding only it can become a pack, restore never writes into it,
 # export carries it, and the window started from it opens the pack.
 MODELS, BLOBS, KIT = "models", "blobs", "_kit"
 MARKER_JSON = {"format": PACK_FORMAT, "format_version": FORMAT_VERSION}

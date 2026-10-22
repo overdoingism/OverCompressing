@@ -6,7 +6,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Python 3.13](https://img.shields.io/badge/python-3.13-blue.svg)
 ![Windows tested](https://img.shields.io/badge/Windows-tested-brightgreen.svg)
-![Linux untested](https://img.shields.io/badge/Linux-not%20yet%20tested-lightgrey.svg)
+![Linux tested](https://img.shields.io/badge/Linux-tested%20by%20GPT6-brightgreen.svg)
 
 Model weights hardly compress with zip or zstd, and quantizing them loses information. OverCompressing keeps the
 original files exactly, compresses each tensor with a codec suited to it, and stores fine-tunes as deltas against
@@ -27,6 +27,7 @@ pack, so it can be restored without internet access.
 | community fine-tunes (RL, abliteration, re-uploads) | **0.1 – 5 %** |
 | F16 GGUF against a BF16 base · vocab-extended draft model | **44 %** · **30 %** |
 | test archive: 6 repos, 34.3 GiB | **17.2 GiB (50.1 %)** |
+| speed, 8 cores: pack / restore a 7B BF16 model | **≈ 1.5 min / 30 s** (a 7B fine-tune as a delta: ≈ 5.5 min to pack) |
 
 All results are verified by decoding from disk and matching the original SHA-256 (for these tests, also the
 hashes Hugging Face publishes).
@@ -56,11 +57,14 @@ hashes Hugging Face publishes).
 |---|---|
 | BF16 / F16 / F32 / FP8 safetensors and GGUF | quantized files on their own (95–97 %) |
 | families: Base → Instruct → community fine-tunes | GGUF ↔ safetensors cross-format deltas (not yet) |
-| PyTorch `.bin` and other binaries (auto codec) | Linux (scripts provided, untested) |
+| PyTorch `.bin` and other binaries (auto codec) | speed of deltas: their coder is pure NumPy (≈ 8 MB/s per core) |
 
 → **[Scope](docs/scope.md)**
 
 ## Quick start / 快速開始
+
+With the Python of a portable copy (see Build), or any Python 3.13 with numpy and zstandard
+(`pip install -r requirements.txt`):
 
 ```bash
 python -I tools/llm_archive.py pack    models/Qwen2.5-0.5B packs --name Qwen/Qwen2.5-0.5B
@@ -73,8 +77,7 @@ python -I tools/llm_archive.py restore packs Qwen/Qwen2.5-0.5B-Instruct restored
 Get the model folders with any tool you like (OverCompressing never downloads) → pack the base → pack the fine-tune
 (it finds its base in the pack by itself and is stored as a delta) → verify → restore. Every file is stored once,
 named by its SHA-256 and shared by every model that has it; `remove` deletes only what no other model still needs.
-Prefer a window? `python -I tools/llm_archive_gui.py packs` lists the models of the pack (or shows them by base) and does the rest
-with a few clicks. Just one model in one file? `python -I tools/llm_archive.py pack models/Qwen2.5-0.5B
+Prefer a window? See [below](#the-window--視窗). Just one model in one file? `python -I tools/llm_archive.py pack models/Qwen2.5-0.5B
 Qwen2.5-0.5B.oczip`. Every command can report progress and print JSON lines (`--progress`, `--json`), for scripts and
 agents.
 
@@ -88,6 +91,26 @@ Two forms of a pack / pack 的兩種形態:
   **pack 檔：便於冷儲存管理。** 由 `pack` 或 `export` 一次寫成；方便複製、離線保存；`list`、`verify` 與 `restore` 可直接讀取。
 
 → **[Usage / 使用方式（中英對照）](docs/usage.md)**
+
+## The window / 視窗
+
+A small window (Tkinter) does most of what the commands do: browse folders and packs, pack, extract, verify, remove,
+rename, rebase, save a pack file. What it needs to start:
+
+- **A portable copy** (see Build) has everything: start `OverCompressing.cmd` on Windows (double-click it) or
+  `./overcompressing` on Linux.
+- **Your own Python 3.13**, with numpy and zstandard: `python -I tools/llm_archive_gui.py [<folder> | <pack>]`
+  (`pythonw` on Windows, for no console window). It needs tkinter: python.org's Windows installer has it; on Linux a
+  distribution's Python may need its Tk package (e.g. `python3-tk`). `python -I -m tkinter` opens a small test
+  window when tkinter works.
+- **On Linux**, a graphical desktop (X11, or Wayland with XWayland). Over SSH, use `ssh -X`, or the command line.
+
+How to use it: [usage, "A window instead of commands"](docs/usage.md#a-window-instead-of-commands).
+
+視窗（Tkinter）能做大部分指令的事。啟動所需：**可攜版**什麼都備齊了，Windows 雙擊 `OverCompressing.cmd`、Linux 執行
+`./overcompressing` 即可；**自備的 Python 3.13**（裝有 numpy 與 zstandard）執行 `python -I tools/llm_archive_gui.py`，
+需要 tkinter（python.org 的 Windows 版已內含；Linux 發行版的 Python 可能要另裝 Tk 套件，例如 `python3-tk`）；**Linux**
+需要圖形桌面（X11，或 Wayland 的 XWayland），透過 SSH 時請用 `ssh -X` 或改用命令列。用法見[使用方式](docs/usage.md#圖形介面)。
 
 ## Build / 建置
 
@@ -118,7 +141,8 @@ tools/llm_archive_gui.py   a small window (Tkinter): a pack as the list of its m
 tools/ARCHIVE_FORMAT.md    format specification
 tools/compare_tensors.py   how well a fine-tune lines up with a base
 tools/test_*.py            self-tests (ans16 coder, formats, conversions)
-kit/                       hash-locked requirements for the portable copy (and the retired offline kit's scripts)
+requirements.txt           numpy and zstandard, for your own Python
+requirements-*.lock        the same, pinned and hash-checked: what the build guides install
 docs/                      principles, scope, benchmarks, usage, build guides, protection advice
 dev/                       experiments and measurement scripts used during development
 ```

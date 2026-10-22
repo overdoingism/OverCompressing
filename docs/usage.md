@@ -95,7 +95,9 @@ otherwise mean all of them).
 python -I tools/llm_archive_gui.py [<folder> | <pack folder> | <file.oczip>]
 ```
 
-(On Windows, `pythonw` instead of `python` opens it without a console window.) The window is a file browser, as in
+(On Windows, `pythonw` instead of `python` opens it without a console window; a portable copy starts it with
+`OverCompressing.cmd` or `./overcompressing`. It needs tkinter and, on Linux, a graphical desktop: the README's "The
+window" says how to get it running.) The window is a file browser, as in
 other archivers: it lists the folders and files of a place as they are on disk (**↑** goes up; type a path into the
 bar to go there). Double-click a folder to go into it. A pack (a pack folder, or a pack file) opens as the **list of
 its models**: when each was packed, its files, size, stored size, ratio and the models it needs, each with how much
@@ -544,8 +546,8 @@ carries it too. Started from there (`_kit\OverCompressing.cmd`, `_kit/overcompre
 With a pack file, first extract its `_kit/` folder with any ZIP tool (7-Zip opens it as it is; for Windows Explorer,
 rename a copy to `.zip`), then run the tool from it and give it the pack file.
 
-An earlier version assembled an "offline kit" with install scripts (`kit/build_kit.py`); it is no longer made. A
-`_kit/` of that kind in an older pack still works as its own `README.md` says.
+An earlier version made an "offline kit" with install scripts instead; it is no longer made, and its scripts are gone
+from the repository. A `_kit/` of that kind in an older pack still works as its own `README.md` says.
 
 ## Troubleshooting
 
@@ -662,7 +664,8 @@ export）加入檔案裡列出的模型，`--files-from 檔案`（pack、verify�
 python -I tools/llm_archive_gui.py [<資料夾> | <pack 資料夾> | <檔名.oczip>]
 ```
 
-（Windows 上把 `python` 換成 `pythonw` 就不會多開一個主控台視窗。）視窗是一個檔案瀏覽器，和其他壓縮軟體一樣：照磁碟上的
+（Windows 上把 `python` 換成 `pythonw` 就不會多開一個主控台視窗；可攜版則用 `OverCompressing.cmd` 或 `./overcompressing`
+啟動。視窗需要 tkinter，Linux 上還需要圖形桌面：怎麼讓它能執行，見 README 的「The window / 視窗」。）視窗是一個檔案瀏覽器，和其他壓縮軟體一樣：照磁碟上的
 樣子列出某個位置的資料夾與檔案（**↑** 回上一層；也可以在路徑列直接輸入路徑前往）。雙擊資料夾進入。pack（pack 資料夾或
 pack 檔）會開成**模型清單**：列出每個模型的打包時間、檔案數、大小、儲存大小、比例，以及它需要的其他模型，各附用到其中多少
 （`Qwen/Qwen2.5-7B (99%)`；已移除、但仍需要其檔案的模型會標成 `(removed)`）；按欄位標題即可依該欄排序。**⑂ By base**（依存放基底）改成樹狀顯示，每個模型掛在它大部分資料
@@ -1032,7 +1035,7 @@ pack 檔必須放在 pack 資料夾之外（也不能在其他 pack 資料夾裡
 直接開啟那個 pack。若是 pack 檔，請先用任何 ZIP 工具解出其中的 `_kit/`（7-Zip 可直接開啟；Windows 檔案總管則需把副本改名為
 `.zip`），再從解出的資料夾執行工具，把 pack 檔交給它。
 
-先前的版本會用安裝腳本組裝「離線工具包」（`kit/build_kit.py`），現已不再製作。舊 pack 裡那種 `_kit/` 仍可照它自己的
+先前的版本改用安裝腳本組裝「離線工具包」，現已不再製作，腳本也已從 repo 刪除。舊 pack 裡那種 `_kit/` 仍可照它自己的
 `README.md` 使用。
 
 ## 疑難排解

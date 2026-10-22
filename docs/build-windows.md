@@ -45,7 +45,7 @@ if ((Get-FileHash $py -Algorithm SHA256).Hash -ne "C402EB9A35ABA90DE319BBC87D23E
 $out = "$HOME\OverCompressing"          # a new folder, anywhere
 New-Item -ItemType Directory $out | Out-Null
 tar -xzf $py -C $out                     # its Python, in $out\python
-& "$out\python\python.exe" -I -m pip install --require-hashes --only-binary :all: --no-warn-script-location --disable-pip-version-check -r kit\requirements-win_amd64.lock
+& "$out\python\python.exe" -I -m pip install --require-hashes --only-binary :all: --no-warn-script-location --disable-pip-version-check -r requirements-win_amd64.lock
 New-Item -ItemType Directory "$out\tools" | Out-Null
 Copy-Item tools\llm_archive.py, tools\llm_archive_gui.py, tools\ARCHIVE_FORMAT.md, tools\compare_tensors.py, tools\test_ans16.py, tools\test_formats.py "$out\tools"
 Copy-Item -Recurse docs "$out\docs"
@@ -142,7 +142,7 @@ if ((Get-FileHash $py -Algorithm SHA256).Hash -ne "C402EB9A35ABA90DE319BBC87D23E
 $out = "$HOME\OverCompressing"          # 一個新資料夾，放哪裡都可以
 New-Item -ItemType Directory $out | Out-Null
 tar -xzf $py -C $out                     # 它的 Python，在 $out\python
-& "$out\python\python.exe" -I -m pip install --require-hashes --only-binary :all: --no-warn-script-location --disable-pip-version-check -r kit\requirements-win_amd64.lock
+& "$out\python\python.exe" -I -m pip install --require-hashes --only-binary :all: --no-warn-script-location --disable-pip-version-check -r requirements-win_amd64.lock
 New-Item -ItemType Directory "$out\tools" | Out-Null
 Copy-Item tools\llm_archive.py, tools\llm_archive_gui.py, tools\ARCHIVE_FORMAT.md, tools\compare_tensors.py, tools\test_ans16.py, tools\test_formats.py "$out\tools"
 Copy-Item -Recurse docs "$out\docs"

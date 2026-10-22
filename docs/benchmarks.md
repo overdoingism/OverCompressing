@@ -159,7 +159,7 @@ One thread: 79 → 83 MB/s compressing, 242 → 362 MB/s decompressing.
 | flip 1 byte in a base container | `verify` reports it and every delta / reference depending on it; `restore` refuses |
 | external repair with par2cmdline, 5 % (see [protection.md](protection.md)) | 1990/1991 blocks found, repaired, re-verified, SHA-256 restored |
 | synthetic cyclic reference | refused with the cycle printed (`A -> B -> A`) |
-| offline install from the kit (pip without index) | install, self-tests, verify and restore all pass (Windows) |
+| portable copy made by the Windows build guide, run as written (PowerShell 5.1) | its Python passes both self-test suites and the window checks; the window starts from its launcher |
 | ans16 unit tests (sizes 1…8M, all-zero, random, sign flips, rare contexts, F16, corrupted payloads, empty input) | all pass; corruption always detected |
 | byte planes, every float dtype (lengths 1…1M+1 around element edges; noise, zeros, constant, weights; damaged payloads) | all round trips exact; every damaged payload refused |
 | dtype conversion vs references (200 011 values incl. subnormals, overflow, ±inf, NaN) | 0 mismatches vs numpy (F16) and an exact-arithmetic reference (BF16) |

@@ -21,7 +21,7 @@ byte-plane codec; nothing of ZipNN is left.
 | `tools/ARCHIVE_FORMAT.md` | the on-disk format, byte by byte (enough to restore by hand) |
 | `tools/test_ans16.py`, `tools/test_formats.py` | the test suites |
 | `tools/compare_tensors.py` | how a fine-tune lines up with a base |
-| `kit/` | the hash-locked requirements a portable copy is built from; the rest (`build_kit.py`, install scripts, keys, provenance) is the retired offline kit, kept for reference |
+| `requirements.txt`, `requirements-*.lock` | numpy and zstandard: for any Python 3.13; pinned and hash-checked per platform, what the build guides install into a portable copy |
 | `docs/` | usage (English then Chinese, one file), principles, scope, benchmarks, build guides, protection |
 | `dev/` | experiments and measurement scripts |
 | `archive/` | gitignored leftovers of format 3 (old per-model archives, test folders): **not a pack**, no test data for format 4. To test, pack folders of `models/` (gitignored downloads of real models) into a scratch pack; the owner's own packs elsewhere are read-only for agents |
@@ -68,11 +68,11 @@ facing text uses these words:
 - After a pack, `rebase_hint` names models that may store smaller against what came in (manifests only).
 - **No offline kit** (owner's decision, 2026-10-22: agents do the building anyway). Nothing is built or shipped with a
   pack; `docs/build-windows.md` and `docs/build-linux.md` make a **portable copy** (python-build-standalone CPython
-  3.13.16 with numpy and zstandard from `kit/requirements-*.lock`, the tools, `tools/BUILD`, launchers), as exact,
+  3.13.16 with numpy and zstandard from `requirements-*.lock`, the tools, `tools/BUILD`, launchers), as exact,
   checkable steps. The tool's `_kit/` handling stays, passive: a folder holding only `_kit` can become a pack, restore
   never writes into it, export carries it, the window started from `_kit/tools` opens the pack. So a portable copy put
-  in a pack folder as `_kit` travels with the pack. `kit/build_kit.py` and the install scripts are retired: do not
-  revive them.
+  in a pack folder as `_kit` travels with the pack. The kit's scripts (`kit/build_kit.py`, install scripts) were
+  deleted from the repository (owner, 2026-10-23): do not bring them back.
 
 ## Commands
 
@@ -227,7 +227,8 @@ data), only while the pack's stamp is as it was verified. No guided repair in th
   downstream team, GPT6, mostly on Linux) are input to weigh, not orders: verify each issue first. The README says
   so: developed by Claude, verified by GPT6.
 - When offering options, state a recommendation and why.
-- The repository is not public: no compatibility burden for formats or command lines unless asked.
+- The repository is public (github.com/overdoingism/OverCompressing) but has not been announced and has no users
+  yet: no compatibility burden for formats or command lines unless asked.
 - Commit and push only when asked (the owner often says to hold commits while the window is being polished). Normal
   commits, no squashing unless asked. End commit messages with
   `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.

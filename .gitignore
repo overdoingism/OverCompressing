@@ -9,4 +9,5 @@ tmp/
 __pycache__/
 *.pyc
 
-# Third-party files the kit build downloads (pinned by SHA-256 in kit/build_kit.py)
+# What the build guides download into the checkout (python-build-standalone)
+cpython-*-install_only*.tar.gz

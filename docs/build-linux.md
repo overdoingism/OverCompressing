@@ -46,7 +46,7 @@ echo "ffcb50e716789d1a6e1db5e745d4d194ac8ed9b015ccf5eabcaccb179a25e4a8  $py" | s
 out=~/OverCompressing                    # a new folder, anywhere
 mkdir "$out"
 tar -xzf "$py" -C "$out"                 # its Python, in $out/python
-"$out/python/bin/python3" -I -m pip install --require-hashes --only-binary :all: --no-warn-script-location --disable-pip-version-check -r kit/requirements-linux_x86_64.lock
+"$out/python/bin/python3" -I -m pip install --require-hashes --only-binary :all: --no-warn-script-location --disable-pip-version-check -r requirements-linux_x86_64.lock
 mkdir "$out/tools"
 cp tools/llm_archive.py tools/llm_archive_gui.py tools/ARCHIVE_FORMAT.md tools/compare_tensors.py tools/test_ans16.py tools/test_formats.py "$out/tools/"
 cp -r docs LICENSE THIRD_PARTY_NOTICES.md "$out/"
@@ -147,7 +147,7 @@ echo "ffcb50e716789d1a6e1db5e745d4d194ac8ed9b015ccf5eabcaccb179a25e4a8  $py" | s
 out=~/OverCompressing                    # 一個新資料夾，放哪裡都可以
 mkdir "$out"
 tar -xzf "$py" -C "$out"                 # 它的 Python，在 $out/python
-"$out/python/bin/python3" -I -m pip install --require-hashes --only-binary :all: --no-warn-script-location --disable-pip-version-check -r kit/requirements-linux_x86_64.lock
+"$out/python/bin/python3" -I -m pip install --require-hashes --only-binary :all: --no-warn-script-location --disable-pip-version-check -r requirements-linux_x86_64.lock
 mkdir "$out/tools"
 cp tools/llm_archive.py tools/llm_archive_gui.py tools/ARCHIVE_FORMAT.md tools/compare_tensors.py tools/test_ans16.py tools/test_formats.py "$out/tools/"
 cp -r docs LICENSE THIRD_PARTY_NOTICES.md "$out/"
