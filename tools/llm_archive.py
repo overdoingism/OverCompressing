@@ -1418,15 +1418,23 @@ class FilePack:
 
 def member_span(path, info):
     """(path, start, size): where the bytes of a member stored as it is lie in the ZIP file at `path` (its local
-    header's offset plus 30 plus the lengths of its name and extra field); ValueError if it is compressed."""
+    header's offset plus 30 plus the lengths of its name and extra field); ValueError if it is compressed, or if its
+    local header disagrees with the central directory on its name, method or encryption (a standard ZIP reader would
+    refuse it, or read it otherwise)."""
     if info.compress_type != zipfile.ZIP_STORED or info.flag_bits & 1 or info.compress_size != info.file_size:
         raise ValueError(f"{info.filename} is compressed or encrypted in the pack file: blobs must be stored as they are")
     with open(path, "rb") as f:
         f.seek(info.header_offset)
         head = f.read(30)
+        name = f.read(struct.unpack("<H", head[26:28])[0]) if len(head) == 30 else b""
         end = os.fstat(f.fileno()).st_size
     if len(head) != 30 or head[:4] != b"PK\x03\x04":
         raise ValueError(f"{info.filename}: no ZIP local header where the pack file says it is")
+    flags, method = struct.unpack("<HH", head[6:10])
+    if name.decode("utf-8" if flags & 0x800 else "cp437", "replace") != info.orig_filename or method != zipfile.ZIP_STORED \
+            or flags & 1:  # decoded as zipfile does
+        raise ValueError(f"{info.filename}: its local header disagrees with the pack file's directory (name, method or "
+                         "encryption)")
     start = info.header_offset + 30 + sum(struct.unpack("<HH", head[26:30]))
     if start + info.file_size > end:
         raise ValueError(f"{info.filename} runs past the end of the pack file")

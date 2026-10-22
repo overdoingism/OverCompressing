@@ -340,7 +340,9 @@ Writes the original files of a model, byte-identical, and checks each SHA-256. a
 files they read into `OC_TMP`. `--file PATH` (repeatable) restores only those files, named by their paths in the pack
 (as `verify` lists them after `<name>:`); each lands where a full restore would put it. `--flat` puts every file
 straight into `<dest_dir>`, without the model's folders; of two files of one name, the one further down gets ` (1)`
-(with `--file`, only the files named count).
+(with `--file`, only the files named count). Restore checks what it writes (each file against its SHA-256, and the
+blobs it needs), not the rest of the pack: it can give back the intact files of a pack that `verify` finds faults in,
+and a restore that succeeds says nothing of the other models. `verify` checks the pack as a whole.
 
 Before writing anything, every path in the manifest is checked: it must be relative, without `..`, and land inside
 `<dest_dir>`; restore never writes through a link, so if a folder on the way below `<dest_dir>` is a symlink or a
@@ -847,7 +849,8 @@ python -I tools/llm_archive.py restore <pack> 模型 <目的資料夾> [--overwr
 寫回模型的原始檔案，逐 byte 相同，並核對 SHA-256。ans16 差異檔會先把用到的 base 檔還原到 `OC_TMP`。`--file 路徑`（可重複
 指定）只還原這些檔案，路徑以 pack 中的為準（即 `verify` 列出的 `<名稱>:` 之後的部分）；每個檔案會放在完整還原時的同一個位置。
 `--flat` 把所有檔案直接放進 `<目的資料夾>`，不建立模型裡的資料夾；同名的兩個檔案，位置較深的那個加上 ` (1)`（搭配 `--file`
-時只考慮指定的檔案）。
+時只考慮指定的檔案）。還原只檢查它寫出的東西（每個檔案的 SHA-256，以及它用到的 blob），不檢查 pack 的其他部分：`verify`
+找出問題的 pack，仍可能還原出完好的檔案；還原成功也不代表其他模型沒有問題。整個 pack 是否健全，要用 `verify` 檢查。
 
 寫入任何東西之前，會先檢查 manifest 裡的每個路徑：必須是相對路徑、不含 `..`，而且必須落在 `<目的資料夾>` 之內；還原絕不經過
 連結寫入，所以 `<目的資料夾>` 底下途經的資料夾若是符號連結或 junction，就會停止。這個系統不允許的檔名會像其他解壓縮工具一樣

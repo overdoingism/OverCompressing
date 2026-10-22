@@ -108,7 +108,9 @@ or `--add` (these files join it, same paths replaced), checked before anything i
   list, verify, restore and export shared; never waits. Pack files are not locked.
 - Untrusted input is checked before decoding: blobs (trailing SHA-256, header, frames, base references inside the
   bases, no trailing bytes, zstd output capped), manifests (schema; strict JSON: no duplicate keys, no NaN/Infinity),
-  pack files (no unsafe or duplicate names, blobs stored). A header value looked up in a set or dict, or collected
+  pack files (no unsafe or duplicate names, blobs stored, each blob's local header agreeing with the central directory
+  on name, method and encryption: `member_span`, so the tool and a standard ZIP reader judge a pack file alike). restore
+  checks what it writes and the blobs it needs, not the whole pack: verify is the check of a pack (documented). A header value looked up in a set or dict, or collected
   into one, is checked to be a string first: a JSON list or object there is unhashable (a TypeError, not a refusal;
   found by the downstream team). Bad input is a refusal, never a traceback; `OC_WORKERS` too (ASCII digits only).
 - Restore never writes into a pack folder or anything inside one (`place_problem`); pack never reads from one, and a

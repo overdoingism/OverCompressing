@@ -1827,11 +1827,26 @@ la.store_blob = _stopping"""
         for i in z.infolist():
             if i.filename != la.MARKER:
                 w.writestr(i, z.read(i.filename))
+    member = la.blob_rel(entry(single, "t/G", "model.safetensors")["sha256"])
+    with zipfile.ZipFile(single) as z:
+        at = z.getinfo(member).header_offset
+    renamed, relabeled = os.path.join(root, "renamed.oczip"), os.path.join(root, "relabeled.oczip")
+    for path, offset in ((renamed, 30 + len(member) - 5), (relabeled, 8)):  # a hex digit of the local name; the method
+        shutil.copyfile(single, path)
+        with open(path, "r+b") as f:
+            f.seek(at + offset)
+            byte = f.read(1)
+            f.seek(-1, 1)
+            f.write(b"\x08" if offset == 8 else b"0" if byte != b"0" else b"1")
     for path, words in ((bad, "damaged"), (deflated, "must be stored"), (junk, "cannot open"), (twice, "already"),
-                        (no_marker, "no ocpack.json")):
+                        (no_marker, "no ocpack.json"), (renamed, "local header"), (relabeled, "local header")):
         code, out = tool("verify", path)
         ok = code != 0 and words in out and clean(out)
         expect(f"verify of {os.path.basename(path)}: a clean failure", ok, "" if ok else out[-300:])
+    for path in (renamed, relabeled):  # its central directory and local header disagree: zipfile refuses it as well
+        code, out = tool("restore", path, "t/G", os.path.join(root, "from-" + os.path.basename(path)))
+        ok = code != 0 and "local header" in out and clean(out)
+        expect(f"restore from {os.path.basename(path)}: a clean failure", ok, "" if ok else out[-300:])
 
     print("pack files: --verify, --delete")
     work = os.path.join(root, "work")

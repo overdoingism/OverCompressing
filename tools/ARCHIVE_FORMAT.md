@@ -44,7 +44,9 @@ and `export` leaves them out. Temporary files are `.oc-*.part`.
 A ZIP archive (ZIP64 where needed) whose member names are the paths above, relative to the pack, with `/`
 separators and UTF-8 names: `ocpack.json`, `models/...`, `blobs/...` and optionally `_kit/...`. Every blob is stored
 with method 0 (no compression, no encryption), so it can be read in place at its offset: the member's local header
-offset plus 30 plus the lengths of its name and extra field. Other members are stored or Deflate-compressed
+offset plus 30 plus the lengths of its name and extra field. A blob's local header names it as the central directory
+does, with method 0 and no encryption flag there too (else readers that go by one or the other disagree: refused).
+Other members are stored or Deflate-compressed
 (method 8). No name appears twice and none has an empty, `.` or `..` part. A pack file is written whole and never
 changed; extracting it with any ZIP tool gives a pack folder.
 
