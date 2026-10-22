@@ -52,8 +52,10 @@ Every command prints one line per result (a file packed, verified or restored, a
 exits with code 0 only if it did what it was asked. `--json` (any command) makes each of these lines a JSON object
 `{"event": ..., "text": <the line people would see>, ...fields}`: `file` (with `path`, `size`, `stored` (its blob),
 `added` (new in the pack: 0 if stored already), `method`, `bases`), `ok` / `fail` (verify), `model`, `freed` / `kept` (remove), `summary`, `note`; an error ends the output with
-`{"event": "error", "text": ...}` and exit code 1. `list --json` prints the whole pack as one object (models with
-what they need and what needs them, blobs kept for others, blobs no model needs).
+`{"event": "error", "text": ...}` and exit code 1 (an invalid `OC_WORKERS` too). A command line the tool cannot parse
+(an argument missing, an unknown option, a value out of range) is refused before anything runs, the usual way: usage
+and the error on stderr, exit code 2, with `--json` too. `list --json` prints the whole pack as one object (models
+with what they need and what needs them, blobs kept for others, blobs no model needs).
 
 `--progress` reports on stderr, about once a second, how far the current step is: the step (`hashing <model>`,
 `packing <model>`, `verifying`, `restoring <model>`, `exporting`, …), bytes done of its total, the file it is on and
@@ -203,7 +205,7 @@ there, and export again.
 | `--delta-codec ans16\|xor` | for 16-bit float tensors: ans16 (default, smaller) or the XOR with the base in byte planes (faster) |
 | `--zstd-level N` | zstd level 1–22 for headers, metadata and text (default 19) |
 | `--zstd-tensor-level N` | zstd level 1–22 for quantized tensors and unknown binaries (default 9) |
-| `--workers N` | worker processes for ans16, 1–1024 (default: `OC_WORKERS`, else the CPU count) |
+| `--workers N` | worker processes for ans16, 1–1024, at most 61 on Windows (default: `OC_WORKERS`, else the CPUs it may use) |
 | `--chunk-mib N` | maximum region size, 1–1024, default 64 |
 
 Each line of output shows the method, what the file adds to the pack and the ratio of that, and, for deltas, how
@@ -489,7 +491,7 @@ than one medium: see [protection.md](protection.md).
 | variable | effect |
 |---|---|
 | `OC_TMP` | folder for restored base files (needs room for the base files a delta reads) and for the file `rebase` re-packs |
-| `OC_WORKERS` | cap on ans16 worker processes, a whole number of at least 1 (lower it on small-RAM machines); it also caps the threads that code byte planes and zstd (at most 8) and that hash files (at most 4); any other value stops every command with an error |
+| `OC_WORKERS` | cap on ans16 worker processes, a whole number of at least 1 (lower it on small-RAM machines); it also caps the threads that code byte planes and zstd (at most 8) and that hash files (at most 4); at most 61 processes on Windows; any other value (only the digits 0–9 count) stops every command with an error |
 
 ## Rules for a healthy pack
 
@@ -609,8 +611,10 @@ python -I tools/llm_archive.py pack models/Qwen2.5-7B Qwen2.5-7B.oczip
 每個指令對每項結果（打包、驗證或還原的一個檔案、列出的一個模型）印一行，最後印一行總結；只有完成了要求的工作，結束碼
 才是 0。`--json`（任何指令都可用）把這些行各自改成一個 JSON 物件 `{"event": ..., "text": <給人看的那一行>, ...欄位}`：
 `file`（含 `path`、`size`、`stored`（它的 blob）、`added`（新存入 pack 的量：已存在時為 0）、`method`、`bases`）、`ok` / `fail`（verify）、`model`、`freed` / `kept`（remove）、
-`summary`、`note`；發生錯誤時，最後一行是 `{"event": "error", "text": ...}`，結束碼為 1。`list --json` 把整個 pack 印成
-一個物件（各模型需要誰、被誰需要，為其他模型保留的 blob，以及沒有模型需要的 blob）。
+`summary`、`note`；發生錯誤時，最後一行是 `{"event": "error", "text": ...}`，結束碼為 1（`OC_WORKERS` 無效時也是）。
+無法解析的命令列（缺少參數、未知選項、超出範圍的值）在執行任何動作之前就被拒絕，照一般方式處理：stderr 印出用法與錯誤，
+結束碼 2，加上 `--json` 也一樣。`list --json` 把整個 pack 印成一個物件（各模型需要誰、被誰需要，為其他模型保留的 blob，
+以及沒有模型需要的 blob）。
 
 `--progress` 會在 stderr 上大約每秒報告一次目前步驟的進度：步驟名稱（`hashing <模型>`、`packing <模型>`、`verifying`、
 `restoring <模型>`、`exporting` 等）、已完成與總量的位元組、正在處理的檔案、已經過的時間；搭配 `--json` 時，每次報告是
@@ -729,7 +733,7 @@ python -I tools/llm_archive.py pack <來源資料夾> [<來源資料夾> ...] <p
 | `--delta-codec ans16\|xor` | 16-bit 浮點 tensor 的差異方式：ans16（預設，較小）或與 base 的 XOR 以位元平面壓縮（較快） |
 | `--zstd-level N` | 標頭、metadata、文字檔的 zstd 等級，1–22（預設 19） |
 | `--zstd-tensor-level N` | 量化 tensor 與未知二進位檔的 zstd 等級，1–22（預設 9） |
-| `--workers N` | ans16 平行程序數，1–1024（預設為 `OC_WORKERS`，未設定則為 CPU 數） |
+| `--workers N` | ans16 平行程序數，1–1024，Windows 上最多 61（預設為 `OC_WORKERS`，未設定則為可使用的 CPU 數） |
 | `--chunk-mib N` | 單一區塊上限，1–1024，預設 64 MiB |
 
 輸出的每一行會顯示壓縮方式、這個檔案新增到 pack 的大小與其比例，以及差異檔有多少比例在 base 裡找到對應；pack 裡已有的檔案
@@ -970,7 +974,7 @@ pack 檔必須放在 pack 資料夾之外（也不能在其他 pack 資料夾裡
 | 變數 | 作用 |
 |---|---|
 | `OC_TMP` | 暫存還原 base 檔的資料夾，需容納差異檔用到的 base 檔；`rebase` 重新打包的檔案也放在這裡 |
-| `OC_WORKERS` | ans16 平行程序數上限，須為 1 以上的整數（記憶體小的機器請調低）；同時也是位元平面與 zstd 編碼執行緒（最多 8 個）和計算雜湊執行緒（最多 4 個）的上限；其他值會讓所有指令直接報錯 |
+| `OC_WORKERS` | ans16 平行程序數上限，須為 1 以上的整數（記憶體小的機器請調低）；同時也是位元平面與 zstd 編碼執行緒（最多 8 個）和計算雜湊執行緒（最多 4 個）的上限；Windows 上程序最多 61 個；其他值（只認 0–9 的數字）會讓所有指令直接報錯 |
 
 ## pack 注意事項
 

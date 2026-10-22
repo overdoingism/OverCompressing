@@ -108,7 +108,9 @@ or `--add` (these files join it, same paths replaced), checked before anything i
   list, verify, restore and export shared; never waits. Pack files are not locked.
 - Untrusted input is checked before decoding: blobs (trailing SHA-256, header, frames, base references inside the
   bases, no trailing bytes, zstd output capped), manifests (schema; strict JSON: no duplicate keys, no NaN/Infinity),
-  pack files (no unsafe or duplicate names, blobs stored).
+  pack files (no unsafe or duplicate names, blobs stored). A header value looked up in a set or dict, or collected
+  into one, is checked to be a string first: a JSON list or object there is unhashable (a TypeError, not a refusal;
+  found by the downstream team). Bad input is a refusal, never a traceback; `OC_WORKERS` too (ASCII digits only).
 - Restore never writes into a pack folder or anything inside one (`place_problem`); pack never reads from one, and a
   new pack file is never written into one. Names a system cannot hold become `_`, collisions get ` (1)`.
 - A pack folder is only created in a new, empty or `_kit`-only folder; any other folder without `ocpack.json` is
@@ -171,7 +173,8 @@ or `--add` (these files join it, same paths replaced), checked before anything i
 
 ## Speed
 
-- What runs at once: ans16 regions in worker processes, one per logical CPU (`ans16_workers`); byte-plane and zstd
+- What runs at once: ans16 regions in worker processes, one per CPU the process may use (`ans16_workers`; at most 61
+  on Windows, the most Python's pool takes there: `worker_pool`); byte-plane and zstd
   frames on threads (`frame_workers`, up to 8) through `ordered_map`, the main thread reading and writing in order
   (CRCs on the threads too); files hashed and blobs checked several at once (`hash_workers`, up to 4), each read a
   block ahead of its hashing (`blocks_ahead`). `OC_WORKERS` caps all of them. One file's SHA-256 is one sequence

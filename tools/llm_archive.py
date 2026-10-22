@@ -1094,12 +1094,19 @@ def region_planes_dtype(region):
 
 
 def ans16_workers():
+    """OC_WORKERS, else the CPUs this process may use."""
     value = os.environ.get("OC_WORKERS")
     if not value:
-        return os.cpu_count() or 1
-    if not value.strip().isdigit() or int(value) < 1:
-        sys.exit(f"OC_WORKERS must be a whole number of at least 1, not {value!r}")
-    return int(value)
+        return os.process_cpu_count() or 1
+    digits = value.strip()
+    if not (digits.isascii() and digits.isdigit() and len(digits) <= 6) or int(digits) < 1:
+        sys.exit(f"OC_WORKERS must be a whole number of at least 1, not {value[:40]!r}")
+    return int(digits)
+
+
+def worker_pool(n):
+    """A pool of n worker processes, at most 61 on Windows: Python's pool refuses more there (ValueError)."""
+    return ProcessPoolExecutor(min(n, 61) if sys.platform == "win32" else n)
 
 
 def frame_workers():
@@ -1154,6 +1161,7 @@ def container_header_problem(header):
     if not isinstance(regions, list) or len(regions) > MAX_REGIONS:
         return "no list of regions, or too many"
     if not isinstance(bases, list) or not all(isinstance(b, dict) and is_sha256(b.get("sha256")) and is_size(b.get("size"))
+                                              and isinstance(b.get("model", ""), str) and isinstance(b.get("path", ""), str)
                                               for b in bases):
         return "malformed bases"
     if not isinstance(header.get("method", ""), str):
@@ -1165,7 +1173,7 @@ def container_header_problem(header):
         if isinstance(r, dict) and "dropped" in r and (r["dropped"] is not True or header.get("partial") is not True):
             return f"region at {pos}: dropped, but not in a partial blob"
         if not isinstance(r, dict) or not is_size(r.get("offset")) or r["offset"] != pos or not is_size(r.get("length")) or not 0 < r["length"] <= MAX_REGION \
-                or r.get("kind") not in REGION_KINDS or not isinstance(r.get("dtype", ""), str):
+                or not isinstance(r.get("kind"), str) or r["kind"] not in REGION_KINDS or not isinstance(r.get("dtype", ""), str):
             return f"region at {pos} malformed, out of order or too long"
         base = r.get("base")
         if (base is not None) != (r["kind"] in ("ans16", "xor")):
@@ -1173,7 +1181,8 @@ def container_header_problem(header):
         if base is not None:
             if not (isinstance(base, list) and len(base) == 2 and type(base[0]) is int and 0 <= base[0] < len(bases) and is_size(base[1])):
                 return f"region at {pos}: bad base reference"
-            if r.get("base_dtype", "BF16") not in FLOAT_BYTES or ("base_dtype" in r and r.get("dtype") not in ANS16_EXPONENT):
+            if not isinstance(r.get("base_dtype", "BF16"), str) or r.get("base_dtype", "BF16") not in FLOAT_BYTES \
+                    or ("base_dtype" in r and r.get("dtype") not in ANS16_EXPONENT):
                 return f"region at {pos}: bad base_dtype"
             if r["kind"] == "ans16" and (r.get("dtype") not in ANS16_EXPONENT or r["length"] % 2):
                 return f"region at {pos}: bad ans16 region"
@@ -1654,7 +1663,7 @@ def iter_blob_bytes(p, sha, span=None, depth=0):
             (path, start + off, plen, base_paths[r["base"][0]], r["base"][1], r.get("base_dtype"), r["length"], r["dtype"])
             for r, (codec, _, off, plen, _) in ((r, fr) for r, fr in zip(regions, frames) if fr) if codec == CODEC_ANS16
         ]
-        pool = ProcessPoolExecutor(ans16_workers()) if jobs else None
+        pool = worker_pool(ans16_workers()) if jobs else None
         bases = [open(b, "rb") for b in base_paths]
         plain = None
         try:
@@ -1929,7 +1938,7 @@ def write_container(src_path, out, header, base_paths=(), levels=(19, 9), worker
         (base_paths[r["base"][0]], r["base"][1], r.get("base_dtype"), src_path, r["offset"], r["length"], r["dtype"])
         for r in regions if r["kind"] == "ans16"
     ]
-    pool = ProcessPoolExecutor(workers) if jobs else None
+    pool = worker_pool(workers) if jobs else None
     bases = [open(b, "rb") for b in base_paths]
 
     def code(region, data, base):
@@ -4574,11 +4583,11 @@ def main():
             stream.reconfigure(errors="backslashreplace")
     if args.progress or (args.progress is None and sys.stderr.isatty()):
         PROGRESS.start()
-    workers = ans16_workers()  # checks OC_WORKERS before any command starts
-    if getattr(args, "workers", 0) is None:
-        args.workers = workers
     try:
         try:
+            workers = ans16_workers()  # checks OC_WORKERS before any command starts
+            if getattr(args, "workers", 0) is None:
+                args.workers = workers
             read_lists(args)
             args.func(args)
         except OSError as e:  # e.g. a full disk: reported plainly; what a command had begun to write is removed already

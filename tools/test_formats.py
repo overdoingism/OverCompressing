@@ -784,6 +784,23 @@ def check_output():
     except (ValueError, IndexError, KeyError):
         ok = False
     expect("an error with --json: {\"event\": \"error\"} and exit code 1", ok, out[-200:])
+    for value in ("0", "-1", "1.5", "words", "\u00b2", "\u0663", " ", "9" * 5000):  # ² and ٣ count as digits for Python
+        run = subprocess.run([sys.executable, "-I", os.path.join(TOOL_DIR, "llm_archive.py"), "list", archive, "--json"],
+                             capture_output=True, text=True, env={**os.environ, "OC_WORKERS": value})
+        try:
+            events = [json.loads(line) for line in run.stdout.splitlines()]
+            ok = run.returncode == 1 and len(events) == 1 and events[0]["event"] == "error" \
+                and "OC_WORKERS" in events[0]["text"] and "Traceback" not in run.stderr
+        except (ValueError, KeyError):
+            ok = False
+        shown = ascii(value) if len(value) < 80 else "<5000 digits>"  # ascii: a console's code page may lack ²
+        expect(f"OC_WORKERS={shown}: refused, a JSON error without a traceback", ok, (run.stdout + run.stderr)[-200:])
+    try:
+        with la.worker_pool(100) as pool:
+            ok = pool.submit(abs, -7).result() == 7
+    except ValueError:  # Windows: more than 61
+        ok = False
+    expect("a pool of 100 worker processes runs (on Windows: 61, the most Python's pool takes there)", ok)
     code, out = tool("verify", archive, "--progress")
     expect("verify --progress: the results as without it", code == 0 and "ALL VERIFIED" in out, out[-200:])
 
@@ -1449,6 +1466,12 @@ la.rename_no_replace = _rival"""
         "a region longer than the limit": container(one(1 << 31), [good]),
         "an ans16 frame in a region that is not a delta": container(one(len(data)), [(la.CODEC_ANS16, len(data), data, 0)]),
         "bases that are not a list": container({**one(len(data)), "bases": {"x": 1}}, [good]),
+        "a region kind that is a list": container(one(len(data), []), [good]),
+        "a region kind that is an object": container(one(len(data), {}), [good]),
+        "a base dtype that is a list": container({**one(len(data)), "regions": [{"offset": 0, "length": len(data), "kind": "xor", "dtype": "BF16", "base": [0, 0], "base_dtype": []}], "bases": [base]}, [good]),
+        "a base dtype that is an object": container({**one(len(data)), "regions": [{"offset": 0, "length": len(data), "kind": "xor", "dtype": "BF16", "base": [0, 0], "base_dtype": {}}], "bases": [base]}, [good]),
+        "a base's model that is a list": container({**one(len(data)), "bases": [{**base, "model": ["t/B"]}]}, [good]),
+        "a base's path that is an object": container({**one(len(data)), "bases": [{**base, "path": {"a": 1}}]}, [good]),
         "a base reference past the list of bases": container({**one(len(data)), "regions": [{"offset": 0, "length": len(data), "kind": "xor", "dtype": "BF16", "base": [1, 0]}], "bases": [base]}, [good]),
         "base bytes past the end of the base": container({**one(len(data)), "regions": [{"offset": 0, "length": len(data), "kind": "xor", "dtype": "BF16", "base": [0, 0]}], "bases": [base]}, [good]),
         "a duplicate key in the header": container(json.dumps(one(len(data))).replace('"bases"', '"original_size": 11, "bases"').encode(), [good]),
