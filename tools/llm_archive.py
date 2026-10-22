@@ -91,6 +91,23 @@ def say(text, event="note", **fields):
         print(line, flush=True)
 
 
+# What failed, for programs: the "code" of the error event that ends --json output. The text is for people and may
+# change; these do not. Only failures a caller can act on have a code of their own; the rest are "other".
+ERROR_CODES = ("exists", "name_taken", "busy", "no_room", "damaged", "cancelled", "other")
+
+
+class Failure(SystemExit):
+    """sys.exit(text) of a failure with a code (ERROR_CODES) for programs."""
+
+    def __init__(self, kind, text):
+        super().__init__(text)
+        self.kind = kind
+
+
+def fail(kind, text):
+    raise Failure(kind, text)
+
+
 class Progress:
     """How far the running step is, reported on stderr about once a second by a thread of its own, so that a step
     with nothing to count (choosing a base, preparing one) still shows it is alive: the step, the bytes done of its
@@ -2496,8 +2513,8 @@ def pack_model(args, p, source, name, paths, manifests, base):
     replaced, the others kept). A file already stored in the pack (by its SHA-256) is not stored again."""
     clash = next((n for n in manifests if n != name and name_key(n) == name_key(name)), None)
     if clash:
-        sys.exit(f"the name {name} is taken: the model {clash} has the same manifest file ({manifest_rel(clash)}) "
-                 "where case is ignored")
+        fail("name_taken", f"the name {name} is taken: the model {clash} has the same manifest file "
+                           f"({manifest_rel(clash)}) where case is ignored")
     if base and base not in manifests:
         sys.exit(f"--base {base}: no model of that name in {p.root}")
     say(f"hashing {len(paths)} files in {source}")
@@ -2601,8 +2618,8 @@ def pack_into_folder(args, root, plans):
     base = args.base if not args.base or args.base in planned else model_named(manifests, args.base, p)
     for _, name, _ in plans:  # before anything is packed
         if name in manifests and not (args.replace or args.add):
-            sys.exit(f"{p.root} holds a model named {name} already: add --replace to replace it with these files, or "
-                     "--add to add them to it (files of the same path replaced)")
+            fail("name_taken", f"{p.root} holds a model named {name} already: add --replace to replace it with these "
+                               "files, or --add to add them to it (files of the same path replaced)")
         if args.add and name not in manifests:
             sys.exit(f"--add: no model named {name} in {p.root} to add the files to")
     try:
@@ -2679,8 +2696,8 @@ def cmd_pack(args):
         sys.exit("use --file or --exclude, not both")
     new_file = is_oczip(target)
     if new_file and os.path.lexists(target):
-        sys.exit(f"{target} exists already: a pack file is written whole, never added to. To add a model to it, "
-                 "extract it into a pack folder (it is a ZIP), pack into that folder, then export it")
+        fail("exists", f"{target} exists already: a pack file is written whole, never added to. To add a model to it, "
+                       "extract it into a pack folder (it is a ZIP), pack into that folder, then export it")
     plans, keys = [], set()
     for source in sources:
         if not os.path.isdir(source):
@@ -2939,8 +2956,8 @@ def lock_archive(archive_root, exclusive, skip=False):
                  "; if you are sure nothing changes the archive while this runs, add --no-lock"))
     if not locked:
         os.close(fd)
-        sys.exit("the pack folder is in use by another command: run this when it has finished" if exclusive else
-                 "the pack folder is being changed by another pack, remove, rename or rebase: run this when it has finished")
+        fail("busy", "the pack folder is in use by another command: run this when it has finished" if exclusive else
+             "the pack folder is being changed by another pack, remove, rename or rebase: run this when it has finished")
     _HELD_LOCK.append(fd)
 
 
@@ -3233,10 +3250,10 @@ def restore_entry(p, entry, tree, rel, replace):
     """Write the original bytes of a model's file to rel in tree (SafeTree.placing): into a new temporary file that
     is put in place only once its size and SHA-256 are right, so on a problem rel is left as it was; over a file
     already there only if `replace` (else the placing fails, in one step, if a file of that name has appeared).
-    Returns a problem, or None."""
+    Returns None, or (the kind of failure, ERROR_CODES; the problem)."""
     problem = blob_problem(p, entry["sha256"])
     if problem:
-        return problem
+        return "damaged", problem
     try:
         with tree.placing(rel, replace) as f:
             out = HashingWriter(f)
@@ -3246,15 +3263,17 @@ def restore_entry(p, entry, tree, rel, replace):
             if out.size != entry["size"] or out.hash.hexdigest() != entry["sha256"]:
                 raise _Mismatch
     except _Mismatch:
-        return "restored bytes differ from the original SHA-256"
+        return "damaged", "restored bytes differ from the original SHA-256"
     except FileExistsError:
-        return "a file of that name appeared in the destination while restoring: not overwritten (--overwrite replaces it)"
+        return "exists", "a file of that name appeared in the destination while restoring: not overwritten (--overwrite replaces it)"
     except NoReplaceUnsupported as e:
-        return f"{e}; restore into an empty folder with --overwrite instead"
+        return "other", f"{e}; restore into an empty folder with --overwrite instead"
     except UnsafePath as e:
-        return str(e)
+        return "other", str(e)
+    except ValueError as e:  # a frame that does not decode or fails its CRC
+        return "damaged", f"restore failed: {e}"
     except Exception as e:
-        return f"restore failed: {e}"
+        return "no_room" if isinstance(e, OSError) and e.errno == errno.ENOSPC else "other", f"restore failed: {e}"
     return None
 
 
@@ -3292,8 +3311,8 @@ def cmd_restore(args):
                 conflicts.append(shown)
         targets.append((entry, rel, shown, present))
     if conflicts and not args.overwrite:
-        sys.exit(f"{len(conflicts)} file(s) already exist in {args.dest_dir} with other contents, e.g. {conflicts[0]}: "
-                 "restore into an empty folder, or add --overwrite to replace them")
+        fail("exists", f"{len(conflicts)} file(s) already exist in {args.dest_dir} with other contents, e.g. "
+                       f"{conflicts[0]}: restore into an empty folder, or add --overwrite to replace them")
     os.makedirs(args.dest_dir, exist_ok=True)
     tree = SafeTree(args.dest_dir)
     PROGRESS.begin("checking blobs")
@@ -3308,7 +3327,7 @@ def cmd_restore(args):
         PROGRESS.at(entry["path"])
         problem = restore_entry(p, entry, tree, rel, replace=args.overwrite)
         if problem:
-            sys.exit(f"  cannot restore {shown}: {problem}")
+            fail(problem[0], f"  cannot restore {shown}: {problem[1]}")
         say(f"  ok    {shown}", event="file", path=entry["path"], dest=rel, written=True)
     PROGRESS.end()
     renamed = sum(1 for e, _, rel, r in plan if r and (not args.flat or rel != e["path"].rsplit("/", 1)[-1]))
@@ -3610,7 +3629,7 @@ def cmd_verify(args):
     if failures:
         lines, data = damage_report(p, manifests, names, findings, problems)
         say("\n".join(lines), event="damage", **data)
-        sys.exit(f"{failures} FAILURE(S): what is lost, why, and what to do are in the damage report above")
+        fail("damaged", f"{failures} FAILURE(S): what is lost, why, and what to do are in the damage report above")
     if not checked:
         sys.exit("no files found: nothing verified")
     say(f"ALL VERIFIED ({checked} files)", event="summary", checked=checked)
@@ -3690,6 +3709,7 @@ def pack_summary(p, manifests):
     models = {}
     for name in sorted(manifests):
         summary = model_summary(p, graph, name)
+        summary["blobs"] = {f["sha256"]: f["stored"] for f in summary["files"]}  # so sums over models count each once
         summary["files"] = len(summary["files"])
         models[name] = summary
     for m in models.values():
@@ -3874,7 +3894,7 @@ def rename_file(p, manifests, name, old, new):
     if problem:
         sys.exit(problem)
     if new in paths:
-        sys.exit(f"{name} has a file {new!r} already")
+        fail("name_taken", f"{name} has a file {new!r} already")
     files = [{**e, "path": new} if e["path"] == old else e for e in manifest["files"]]
     write_manifest(p, {**manifest, "files": files})
     touch_marker(p)
@@ -3894,8 +3914,8 @@ def cmd_rename(args):
         sys.exit(f"{old} has that name already")
     clash = next((n for n in manifests if n != old and name_key(n) == name_key(new)), None)
     if clash:
-        sys.exit(f"the name {new} is taken: the model {clash} has the same manifest file ({manifest_rel(clash)})"
-                 + (" where case is ignored" if clash != new else ""))
+        fail("name_taken", f"the name {new} is taken: the model {clash} has the same manifest file "
+                           f"({manifest_rel(clash)})" + (" where case is ignored" if clash != new else ""))
     manifest = {**manifests[old], "name": new}
     tree = SafeTree(p.root)
     if name_key(old) == name_key(new):  # only the case changes: the file is renamed, then rewritten
@@ -4038,14 +4058,14 @@ def rebase_model(args, p, graph, name, base, release=frozenset(), entries=None):
             # about as big as the file
             problem = space_problem({tmp: e["size"] + reads, p.root: e["size"] + (1 << 20)})
             if problem:
-                sys.exit(f"  not enough room to rebase {e['path']}: {problem} (OC_TMP picks the temporary folder)")
+                fail("no_room", f"  not enough room to rebase {e['path']}: {problem} (OC_TMP picks the temporary folder)")
             t0 = time.perf_counter()
             PROGRESS.begin(f"rebasing {name}", 3 * e["size"], e["path"])
             local = local_parts(e["path"])[-1]  # keeps the extension file_regions looks at
             try:
                 problem = restore_entry(p, e, SafeTree(tmp), local, replace=False)
                 if problem:
-                    sys.exit(f"  cannot restore {e['path']}: {problem}")
+                    fail(problem[0], f"  cannot restore {e['path']}: {problem[1]}")
                 src = os.path.join(tmp, local)
                 regions = file_regions(src, e["size"], chunk_size)[2]
                 info = pack_blob(args, p, src, e, e["format"], e["tensors"], regions, chosen if used else None, others,
@@ -4244,7 +4264,7 @@ def cmd_export(args):
     if problem:
         sys.exit(f"a pack file is not written into a pack folder: {problem}")
     if os.path.lexists(out) and not args.overwrite:
-        sys.exit(f"{args.oczip} exists already: choose another name, or add --overwrite to replace it")
+        fail("exists", f"{args.oczip} exists already: choose another name, or add --overwrite to replace it")
     if isinstance(p, FolderPack):
         lock_archive(p.root, exclusive=args.delete, skip=args.no_lock and not args.delete)
     manifests = all_manifests(p)
@@ -4265,7 +4285,7 @@ def cmd_export(args):
     os.makedirs(os.path.dirname(out), exist_ok=True)
     problem = space_problem({os.path.dirname(out): total + (len(blobs) + len(kit) << 10) + (16 << 20)})
     if problem:
-        sys.exit(f"not enough room for {args.oczip}: {problem}")
+        fail("no_room", f"not enough room for {args.oczip}: {problem}")
     which = "every model" if len(names) == len(manifests) else ", ".join(names)
     say(f"exporting {which} of {p.root} ({len(blobs)} blobs, {human(sum(sizes.values()))}) into {out}")
     PROGRESS.begin("exporting", total)
@@ -4326,7 +4346,7 @@ def cmd_export(args):
         finally:
             new.close()
         if problems or failures:
-            sys.exit(f"{len(problems) + failures} FAILURE(S) in {out}" + (": nothing removed" if args.delete else ""))
+            fail("damaged", f"{len(problems) + failures} FAILURE(S) in {out}" + (": nothing removed" if args.delete else ""))
         say(f"VERIFIED: all {len(digests)} members read back identical; {checked} model files restored exactly")
     if args.delete:
         tree = SafeTree(p.root)
@@ -4611,11 +4631,13 @@ def main():
             read_lists(args)
             args.func(args)
         except OSError as e:  # e.g. a full disk: reported plainly; what a command had begun to write is removed already
-            sys.exit(f"error: {e}")
+            fail("no_room" if e.errno == errno.ENOSPC else "other", f"error: {e}")
+        except KeyboardInterrupt:  # Ctrl+C, or the window closing stdin: what had begun is removed already, as above
+            fail("cancelled", "cancelled")
     except SystemExit as e:
         PROGRESS.end()
         if JSON_OUT and isinstance(e.code, str):
-            print(json.dumps({"event": "error", "text": e.code}), flush=True)
+            print(json.dumps({"event": "error", "code": getattr(e, "kind", "other"), "text": e.code}), flush=True)
             raise SystemExit(1) from None
         raise
     finally:

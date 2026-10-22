@@ -52,10 +52,25 @@ Every command prints one line per result (a file packed, verified or restored, a
 exits with code 0 only if it did what it was asked. `--json` (any command) makes each of these lines a JSON object
 `{"event": ..., "text": <the line people would see>, ...fields}`: `file` (with `path`, `size`, `stored` (its blob),
 `added` (new in the pack: 0 if stored already), `method`, `bases`), `ok` / `fail` (verify), `model`, `freed` / `kept` (remove), `summary`, `note`; an error ends the output with
-`{"event": "error", "text": ...}` and exit code 1 (an invalid `OC_WORKERS` too). A command line the tool cannot parse
+`{"event": "error", "code": ..., "text": ...}` and exit code 1 (an invalid `OC_WORKERS` too; the codes are below). A
+command line the tool cannot parse
 (an argument missing, an unknown option, a value out of range) is refused before anything runs, the usual way: usage
 and the error on stderr, exit code 2, with `--json` too. `list --json` prints the whole pack as one object (models
-with what they need and what needs them, blobs kept for others, blobs no model needs).
+with what they need and what needs them, blobs kept for others, blobs no model needs); each model has `blobs`, the
+SHA-256 of each of its files' blobs with the blob's stored size, so that a sum over several models can count a blob
+they share once.
+
+The `code` of an error tells programs what failed; the text is for people and may change, the codes do not:
+
+| code | when | what a program can do |
+|---|---|---|
+| `exists` | the destination holds something already: files with other contents (restore), the pack file (export, pack) | restore, export: run again with `--overwrite`; pack never writes over a pack file |
+| `name_taken` | the pack holds a model of that name (or of the same manifest file, case ignored); rename: the new name or path is taken | pack: `--replace` or `--add`; else another name |
+| `busy` | the pack folder is in use by another command | run again when it has finished |
+| `no_room` | not enough free space, found before writing or while writing | free space, or point `OC_TMP` elsewhere |
+| `damaged` | verify or `export --verify` found damage (its `damage` event comes before), or a restore met it | read the damage report, or run `verify` |
+| `cancelled` | stopped by Ctrl+C, or by the window's Cancel | — |
+| `other` | anything else | read the text |
 
 `--progress` reports on stderr, about once a second, how far the current step is: the step (`hashing <model>`,
 `packing <model>`, `verifying`, `restoring <model>`, `exporting`, …), bytes done of its total, the file it is on and
@@ -609,10 +624,24 @@ python -I tools/llm_archive.py pack models/Qwen2.5-7B Qwen2.5-7B.oczip
 每個指令對每項結果（打包、驗證或還原的一個檔案、列出的一個模型）印一行，最後印一行總結；只有完成了要求的工作，結束碼
 才是 0。`--json`（任何指令都可用）把這些行各自改成一個 JSON 物件 `{"event": ..., "text": <給人看的那一行>, ...欄位}`：
 `file`（含 `path`、`size`、`stored`（它的 blob）、`added`（新存入 pack 的量：已存在時為 0）、`method`、`bases`）、`ok` / `fail`（verify）、`model`、`freed` / `kept`（remove）、
-`summary`、`note`；發生錯誤時，最後一行是 `{"event": "error", "text": ...}`，結束碼為 1（`OC_WORKERS` 無效時也是）。
+`summary`、`note`；發生錯誤時，最後一行是 `{"event": "error", "code": ..., "text": ...}`，結束碼為 1（`OC_WORKERS` 無效時
+也是；code 見下文）。
 無法解析的命令列（缺少參數、未知選項、超出範圍的值）在執行任何動作之前就被拒絕，照一般方式處理：stderr 印出用法與錯誤，
 結束碼 2，加上 `--json` 也一樣。`list --json` 把整個 pack 印成一個物件（各模型需要誰、被誰需要，為其他模型保留的 blob，
-以及沒有模型需要的 blob）。
+以及沒有模型需要的 blob）；每個模型都有 `blobs`：它每個檔案的 blob 的 SHA-256 與該 blob 的儲存大小，加總多個模型時，
+它們共用的 blob 就能只算一次。
+
+錯誤事件的 `code` 告訴程式是什麼失敗；文字是給人看的，可能會改，code 不會改：
+
+| code | 什麼時候 | 程式可以 |
+|---|---|---|
+| `exists` | 目的地已有東西：內容不同的檔案（restore）、該 pack 檔（export、pack） | restore、export：加 `--overwrite` 重跑；pack 絕不覆寫 pack 檔 |
+| `name_taken` | pack 裡已有同名模型（或大小寫不計時同一個 manifest 檔名）；rename：新名稱或新路徑已被使用 | pack：改用 `--replace` 或 `--add`；其他：換個名稱 |
+| `busy` | pack 資料夾正被另一個指令使用 | 等它結束再跑 |
+| `no_room` | 空間不足，寫入前或寫入途中發現 | 清出空間，或把 `OC_TMP` 指到別處 |
+| `damaged` | verify 或 `export --verify` 發現損毀（前面會有 `damage` 事件），或 restore 途中遇到 | 看損毀報告，或執行 `verify` |
+| `cancelled` | 被 Ctrl+C 或視窗的 Cancel 中止 | — |
+| `other` | 其他所有情況 | 看文字 |
 
 `--progress` 會在 stderr 上大約每秒報告一次目前步驟的進度：步驟名稱（`hashing <模型>`、`packing <模型>`、`verifying`、
 `restoring <模型>`、`exporting` 等）、已完成與總量的位元組、正在處理的檔案、已經過的時間；搭配 `--json` 時，每次報告是

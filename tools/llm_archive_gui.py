@@ -715,7 +715,8 @@ class App:
         self.extract_dest, self.extract_layout = "", "last"  # where and how the last extract went
         self.jobs, self.job, self.proc, self.output, self.busy = [], None, None, [], None
         self.list_files = []  # the list files of the command running (--models-from, --files-from), if any
-        self.job_damage = self.marks = None  # the damage report of the job running; what the last one found lost
+        self.job_damage = self.job_error = self.marks = None  # the damage report and error event of the job running;
+        # what the last one found lost
         self.events = []  # the hints and summaries of the job running (or that ran last)
         self.lines = queue.Queue()  # output of the running process; None when it has ended
         self.cancelling = self.quit_after = False
@@ -1375,9 +1376,10 @@ class App:
         self.start(jobs, lambda: messagebox.askyesno(t("extract"), t("done_extract_q", dest=short(dest)), parent=self.root)
                    and open_folder(dest))
 
-    def offer_overwrite(self, job, output):
-        """The arguments to run a failed restore again with --overwrite, if that is why it failed and the user agrees."""
-        if "with other contents" in output and "--overwrite" not in job["argv"] and messagebox.askyesno(
+    def offer_overwrite(self, job, error):
+        """The arguments to run a failed restore again with --overwrite, if that is why it failed (its error event's
+        code, never its text) and the user agrees."""
+        if error.get("code") == "exists" and "--overwrite" not in job["argv"] and messagebox.askyesno(
                 t("extract"), t("overwrite_q", dest=short(job["argv"][3])), parent=self.front()):
             return job["argv"] + ["--overwrite"]
         return None
@@ -2017,7 +2019,7 @@ class App:
         if not self.jobs:
             self.finish(True)
             return
-        self.job, self.output, self.job_damage, self.events = self.jobs.pop(0), [], None, []
+        self.job, self.output, self.job_damage, self.job_error, self.events = self.jobs.pop(0), [], None, None, []
         self.job_number += 1
         counted = f"  ({self.job_number}/{self.job_total})" if self.job_total > 1 else ""
         self.busy_title.configure(text=self.job["title"] + counted)
@@ -2080,6 +2082,8 @@ class App:
                     event = {"event": "note", "text": line.rstrip("\n")}
                 if event["event"] == "damage":
                     self.job_damage = event
+                if event["event"] == "error":
+                    self.job_error = event
                 if event["event"] in ("hint", "summary"):
                     self.events.append(event)
                 if event["event"] == "progress":
@@ -2117,7 +2121,7 @@ class App:
             self.finish(False)
             return
         if code != 0:
-            retry = self.job.get("retry") and self.job["retry"](self.job, output)
+            retry = self.job.get("retry") and self.job["retry"](self.job, self.job_error or {})
             if not retry:
                 damage = self.job_damage
                 if damage:

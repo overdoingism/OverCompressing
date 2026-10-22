@@ -24,7 +24,7 @@ byte-plane codec; nothing of ZipNN is left.
 | `kit/` | the hash-locked requirements a portable copy is built from; the rest (`build_kit.py`, install scripts, keys, provenance) is the retired offline kit, kept for reference |
 | `docs/` | usage (English then Chinese, one file), principles, scope, benchmarks, build guides, protection |
 | `dev/` | experiments and measurement scripts |
-| `archive/` | local test pack folder with real Qwen models (gitignored) |
+| `archive/` | gitignored leftovers of format 3 (old per-model archives, test folders): **not a pack**, no test data for format 4. To test, pack folders of `models/` (gitignored downloads of real models) into a scratch pack; the owner's own packs elsewhere are read-only for agents |
 
 ## Concepts and terms
 
@@ -93,7 +93,9 @@ window uses them when a command line would pass `ARGS_LIMIT` (8,000 characters; 
 no `@FILE` (it would make every value starting with `@` special) and no NUL-separated lists (names with line breaks are
 not worth it). A model is named by its name (`Org/Name`) or its manifest's file stem
 (`Org__Name`). Every command takes `--json` (every stdout line a JSON object `{"event", "text", ...}`; errors end with
-`{"event": "error"}` and exit 1) and `--progress` (stderr, about once a second, also when nothing can be counted; on by
+`{"event": "error", "code", "text"}` and exit 1; `code`, given by `fail`, is one of `ERROR_CODES`: exists, name_taken,
+busy, no_room, damaged, cancelled, other, the failures a program can act on, the text being for people only, and the
+window decides its `--overwrite` retry by it; Ctrl+C is `cancelled`, without a traceback) and `--progress` (stderr, about once a second, also when nothing can be counted; on by
 default on a terminal). `pack` into a new `.oczip` writes the ZIP as it goes (no folder in between) and checks each
 blob from the unfinished file; several sources in one command can be bases for one another (`--base` goes first).
 Pack files are never changed: no rebase, no adding (extract, change, export again); `export` from one makes a new,

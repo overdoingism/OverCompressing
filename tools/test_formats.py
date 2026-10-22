@@ -106,6 +106,18 @@ def tool(*argv, env=None, timeout=None):
     return run.returncode, run.stdout + run.stderr
 
 
+def error_code(out):
+    """The "code" of the error event that ends --json output, or None."""
+    for line in reversed(out.strip().splitlines()):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("event") == "error":
+            return event.get("code")
+    return None
+
+
 def script_for(patch, argv):
     return f"""import sys
 sys.path.insert(0, {TOOL_DIR!r})
@@ -334,7 +346,7 @@ def check_auto_base():
         json.dump({"version": 2}, fh)
     new_tok = la.sha256_file(tok)
     code, out = interrupted("before", "pack", os.path.join(src, "t_A"), archive, "--name", "t/A", "--replace")
-    ok = code != 0 and "KeyboardInterrupt" in out and entry(archive, "t/A", "tokenizer_config.json")["sha256"] == old_tok \
+    ok = code != 0 and "cancelled" in out and clean(out) and entry(archive, "t/A", "tokenizer_config.json")["sha256"] == old_tok \
         and blobs(archive) == before and not leftovers(archive)
     expect("a re-pack stopped before its manifest is put in place: the old manifest; the new blob deleted", ok,
            "" if ok else out[-400:])
@@ -466,9 +478,16 @@ def check_remove():
         by_name = {m["name"]: m for m in summary["models"]}
         ok = code == 0 and summary["event"] == "pack" and by_name["t/Tune"]["base"] == "t/Base" \
             and by_name["t/Base"]["needed_by"] == ["t/Tune"] and summary["unused"]["blobs"] == 0
+        every = {}
+        for m in summary["models"]:
+            every.update(m["blobs"])
+        shared = set(by_name["t/Base"]["blobs"]) & set(by_name["t/Other"]["blobs"])
+        counted = ok and shared and sum(every.values()) == summary["stored"] - sum(k["size"] for k in summary["kept"])
     except (ValueError, KeyError, IndexError) as e:
-        ok, out = False, f"{e}: {out}"
+        ok, counted, out = False, False, f"{e}: {out}"
     expect("list --json: needs and needed by, per model", ok, "" if ok else out[-400:])
+    expect("list --json: each model's blobs with their sizes; over all models, a shared one counted once makes the pack's total",
+           counted, "" if counted else out[-400:])
     code, out = tool("list", archive, "t/Tune")
     ok = code == 0 and "against t/Base" in out and "= also in t/Base, t/Other" in out
     expect("list <model>: each file with what it is coded against, and the models sharing it", ok, "" if ok else out[-400:])
@@ -610,6 +629,9 @@ def check_damage():
     except (StopIteration, ValueError, KeyError) as e:
         ok, out = False, f"{e}: {out[-600:]}"
     expect("verify --json: the damage report as data (lost, own or not, affected, what heals)", ok, "" if ok else str(lost))
+    expect("  and its error event's code: damaged", error_code(out) == "damaged", out[-200:])
+    code, out = tool("restore", archive, "t/Tune", os.path.join(root, "from-damaged"), "--json")
+    expect("a restore that meets the damage: code damaged", code == 1 and error_code(out) == "damaged", out[-200:])
     code, out = tool("pack", os.path.join(root, "src", "Base"), archive, "--name", "t/Base", "--add", "--file", "a.safetensors")
     code2, out2 = tool("verify", archive)
     expect("storing the original again heals it and what is coded against it", code == 0 and code2 == 0
@@ -780,10 +802,20 @@ def check_output():
     code, out = tool("verify", os.path.join(root, "nowhere"), "--json")
     try:
         last = json.loads(out.strip().splitlines()[-1])
-        ok = code == 1 and last["event"] == "error" and "nowhere" in last["text"]
+        ok = code == 1 and last["event"] == "error" and "nowhere" in last["text"] and last["code"] == "other"
     except (ValueError, IndexError, KeyError):
         ok = False
-    expect("an error with --json: {\"event\": \"error\"} and exit code 1", ok, out[-200:])
+    expect("an error with --json: {\"event\": \"error\", \"code\": \"other\"} and exit code 1", ok, out[-200:])
+    code, out = tool("pack", folder, archive, "--name", "t/J", "--json")
+    expect("a name the pack holds already: code name_taken", code == 1 and error_code(out) == "name_taken", out[-200:])
+    full = "la.shutil.disk_usage = lambda path: la.shutil._ntuple_diskusage(1 << 40, 1 << 40, 0)"
+    code, out = patched(full, "export", archive, os.path.join(root, "full.oczip"), "--json")
+    expect("not enough room, found before writing: code no_room", code == 1 and error_code(out) == "no_room", out[-200:])
+    code, out = patched("la.cmd_list = lambda args: (_ for _ in ()).throw(OSError(la.errno.ENOSPC, 'No space left on device'))",
+                        "list", archive, "--json")
+    expect("... and a disk that fills up meanwhile: code no_room too", code == 1 and error_code(out) == "no_room", out[-200:])
+    code, out = patched("la.cmd_list = lambda args: (_ for _ in ()).throw(KeyboardInterrupt)", "list", archive, "--json")
+    expect("Ctrl+C: code cancelled, no traceback", code == 1 and error_code(out) == "cancelled" and clean(out), out[-200:])
     for value in ("0", "-1", "1.5", "words", "\u00b2", "\u0663", " ", "9" * 5000):  # ² and ٣ count as digits for Python
         run = subprocess.run([sys.executable, "-I", os.path.join(TOOL_DIR, "llm_archive.py"), "list", archive, "--json"],
                              capture_output=True, text=True, env={**os.environ, "OC_WORKERS": value})
@@ -1079,6 +1111,7 @@ la.write_container = _changed"""
         code_o, out_o = pack(os.path.join(root, "src2b"), archive, "t/Other")
         code_v, out_v = tool("verify", archive)
         code_m, out_m = tool("remove", archive, "t/L")
+        code_j, out_j = tool("verify", archive, "--json")
         open(go, "w").close()
         out_a = first.communicate(timeout=120)[0]
         code_v2, _ = tool("verify", archive)
@@ -1086,6 +1119,7 @@ la.write_container = _changed"""
         expect("while a pack runs, a second pack (same or other model), a remove and a verify stop at once",
                code_b != 0 and code_o != 0 and code_v != 0 and code_m != 0 and "in use" in out_b and "being changed" in out_v
                and clean(out_b + out_v + out_m))
+        expect("  with --json, its code: busy", error_code(out_j) == "busy", out_j[-200:])
         expect("  and the first pack finishes; the pack verifies and holds its version",
                first.returncode == 0 and code_v2 == code_r == 0 and same_tree(os.path.join(root, "r2"), {"a.txt": b"AAA2"}),
                out_a[-200:] if first.returncode else "")
@@ -1553,7 +1587,7 @@ def _stop(p, sha, size, span=None, counted=False):
 la.blob_restores = _stop"""
     code, out = patched(stop, "rebase", archive, "t/F", "--no-base")
     code_v, out_v = tool("verify", archive)
-    ok = code != 0 and "KeyboardInterrupt" in out and state(archive) == before and not leftovers(archive) and code_v == 0
+    ok = code != 0 and "cancelled" in out and clean(out) and state(archive) == before and not leftovers(archive) and code_v == 0
     expect("the pack is as it was, without temporary files, and verifies", ok, "" if ok else (out + out_v)[-300:])
 
 
