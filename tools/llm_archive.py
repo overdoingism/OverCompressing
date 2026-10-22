@@ -312,11 +312,31 @@ def sha256_file(path, counted=False):
 def sha256_stream(f, counted=False):
     """counted: the bytes go to the progress report."""
     h = hashlib.sha256()
-    while block := f.read(16 << 20):
+    for block in blocks_ahead(f):
         h.update(block)
         if counted:
             PROGRESS.add(len(block))
     return h.hexdigest()
+
+
+def blocks_ahead(f, size=None, block=16 << 20):
+    """The bytes of f from where it is (`size` of them, else to its end) in blocks, each read on a thread of its own
+    while the caller works on the one before: reading and hashing (which lets other threads run) overlap."""
+    left = size
+
+    def read():
+        nonlocal left
+        n = block if left is None else min(block, left)
+        data = f.read(n) if n else b""
+        if left is not None:
+            left -= len(data)
+        return data
+
+    with ThreadPoolExecutor(1) as reader:
+        ahead = reader.submit(read)
+        while data := ahead.result():
+            ahead = reader.submit(read)
+            yield data
 
 
 def human(n):
@@ -358,7 +378,9 @@ def safetensors_layout(path):
 
 
 def xor_bytes(a, b):
-    return np.bitwise_xor(np.frombuffer(a, np.uint8), np.frombuffer(b, np.uint8)).tobytes()
+    out = bytearray(len(a))
+    np.bitwise_xor(np.frombuffer(a, np.uint8), np.frombuffer(b, np.uint8), out=np.frombuffer(out, np.uint8))
+    return out
 
 
 def strict_json(data):
@@ -449,31 +471,47 @@ def byte_planes(data, dtype):
     exponent, 2 mantissa bits); low byte. F32: exponent; sign and the top 7 mantissa bits; the middle and the low
     mantissa byte. F8: the bytes themselves."""
     size = FLOAT_DTYPES[dtype]
-    whole = len(data) - len(data) % size
-    tail = bytes(data[whole:])
+    n = len(data) // size
+    tail = bytes(data[n * size:])
+    u = np.frombuffer(data, np.uint8, n * size)
     if size == 1:
-        return [np.frombuffer(data, np.uint8, whole)], tail
-    if size == 2:
-        b = np.frombuffer(data, "<u2", whole // 2)
-        if dtype == "BF16":
-            return [((b >> 7) & 0xFF).astype(np.uint8), (((b >> 8) & 0x80) | (b & 0x7F)).astype(np.uint8)], tail
-        return [(b >> 8).astype(np.uint8), (b & 0xFF).astype(np.uint8)], tail
-    b = np.frombuffer(data, "<u4", whole // 4)
-    return [((b >> 23) & 0xFF).astype(np.uint8), (((b >> 24) & 0x80) | ((b >> 16) & 0x7F)).astype(np.uint8),
-            ((b >> 8) & 0xFF).astype(np.uint8), (b & 0xFF).astype(np.uint8)], tail
+        return [u], tail
+    u = u.reshape(n, size)  # a row per element, its bytes from the lowest up (little-endian)
+    if dtype == "F16":
+        return [np.ascontiguousarray(u[:, 1]), np.ascontiguousarray(u[:, 0])], tail
+    # BF16 and F32: the top byte holds the sign and the exponent's top 7 bits, the next the exponent's lowest bit and
+    # the top 7 mantissa bits; byte operations into arrays made once (whole-width ones cost more memory traffic than
+    # the coding itself, and threads doing them at once wait for memory)
+    hi, lo = u[:, size - 1], u[:, size - 2]
+    exponent, sign, tmp = np.empty(n, np.uint8), np.empty(n, np.uint8), np.empty(n, np.uint8)
+    np.left_shift(hi, 1, out=exponent)
+    np.bitwise_or(exponent, np.right_shift(lo, 7, out=tmp), out=exponent)
+    np.bitwise_and(hi, 0x80, out=sign)
+    np.bitwise_or(sign, np.bitwise_and(lo, 0x7F, out=tmp), out=sign)
+    return [exponent, sign, *(np.ascontiguousarray(u[:, i]) for i in range(size - 3, -1, -1))], tail
 
 
 def join_planes(planes, tail, dtype):
-    """Inverse of byte_planes."""
+    """Inverse of byte_planes, as a bytearray built in place."""
     size = FLOAT_DTYPES[dtype]
+    n = len(planes[0])
+    out = bytearray(n * size + len(tail))
+    out[n * size:] = tail
+    u = np.frombuffer(out, np.uint8, n * size).reshape(n, size)
     if size == 1:
-        return planes[0].tobytes() + tail
-    if size == 2:
-        p0, p1 = (p.astype(np.uint16) for p in planes)
-        b = (((p1 & 0x80) << 8) | (p0 << 7) | (p1 & 0x7F)) if dtype == "BF16" else ((p0 << 8) | p1)
-        return b.astype("<u2").tobytes() + tail
-    e, m, b1, b0 = (p.astype(np.uint32) for p in planes)
-    return (((m & 0x80) << 24) | (e << 23) | ((m & 0x7F) << 16) | (b1 << 8) | b0).astype("<u4").tobytes() + tail
+        u[:, 0] = planes[0]
+    elif dtype == "F16":
+        u[:, 1], u[:, 0] = planes
+    else:
+        exponent, sign, *rest = planes
+        hi, lo, tmp = u[:, size - 1], u[:, size - 2], np.empty(n, np.uint8)
+        np.right_shift(exponent, 1, out=hi)
+        np.bitwise_or(hi, np.bitwise_and(sign, 0x80, out=tmp), out=hi)
+        np.left_shift(exponent, 7, out=lo)
+        np.bitwise_or(lo, np.bitwise_and(sign, 0x7F, out=tmp), out=lo)
+        for i, plane in zip(range(size - 3, -1, -1), rest):
+            u[:, i] = plane
+    return out
 
 
 def deflate_huffman(data):
@@ -484,10 +522,9 @@ def deflate_huffman(data):
 def planes_encode(data, dtype):
     planes, tail = byte_planes(data, dtype)
     streams = []
-    for plane in planes:
-        raw = plane.tobytes()
-        options = [(PLANE_STORED, raw), (PLANE_ZSTD, zstandard.ZstdCompressor(level=1).compress(raw)),
-                   (PLANE_DEFLATE, deflate_huffman(raw))]
+    for plane in planes:  # the arrays go to the coders as they are
+        options = [(PLANE_STORED, plane), (PLANE_ZSTD, zstandard.ZstdCompressor(level=1).compress(plane)),
+                   (PLANE_DEFLATE, deflate_huffman(plane))]
         streams.append(min(options, key=lambda o: len(o[1])))
     if tail:
         streams.append((PLANE_STORED, tail))
@@ -508,12 +545,12 @@ def planes_decode(payload, raw_len, dtype):
     pos = PLANES_HEAD.size + count * PLANE_HEAD.size
     if pos + sum(length for _, length in heads) != len(payload):
         raise ValueError("byte planes: stream lengths do not add up to the payload")
-    out = []
+    out, view = [], memoryview(payload)  # streams read where they are, not copied
     for i, (coding, length) in enumerate(heads):
-        body, pos = payload[pos:pos + length], pos + length
+        body, pos = view[pos:pos + length], pos + length
         expect = tail_len if i == size else n
         if coding == PLANE_STORED:
-            raw = bytes(body)
+            raw = body
         elif coding == PLANE_DEFLATE:
             d = zlib.decompressobj(-15)
             raw = d.decompress(body, expect)
@@ -1070,6 +1107,12 @@ def frame_workers():
     return max(1, min(ans16_workers(), 8))
 
 
+def hash_workers():
+    """Threads that hash or check files at once (each file's SHA-256 is one sequence): up to 4, past which the disk
+    is the limit, fewer with OC_WORKERS."""
+    return max(1, min(ans16_workers(), 4))
+
+
 def _ans16_encode_job(job):
     base_path, base_offset, base_dtype, target_path, offset, length, dtype = job
     base = base_prediction(base_path, base_offset, length // 2, base_dtype, dtype)
@@ -1180,9 +1223,10 @@ def read_container(f, start=0, size=None):
     return header, frames
 
 
-def blob_damage(span, sha):
+def blob_damage(span, sha, counted=False):
     """Why the bytes at span (path, start, size) are not an intact blob of the file `sha`, or None: its last 32 bytes
-    must be the SHA-256 of the rest, its container valid (read_container) and its header naming that file."""
+    must be the SHA-256 of the rest, its container valid (read_container) and its header naming that file. counted:
+    the bytes go to the progress report."""
     path, start, size = span
     try:
         with open(path, "rb") as f:
@@ -1190,12 +1234,13 @@ def blob_damage(span, sha):
                 return "too short to be a blob"
             f.seek(start)
             h, left = hashlib.sha256(), size - TRAILER
-            while left:
-                block = f.read(min(left, 16 << 20))
-                if not block:
-                    return "cut short"
+            for block in blocks_ahead(f, left):
                 h.update(block)
                 left -= len(block)
+                if counted:
+                    PROGRESS.add(len(block))
+            if left:
+                return "cut short"
             if f.read(TRAILER) != h.digest():
                 return "damaged (its SHA-256 does not match)"
             header, _ = read_container(f, start, size)
@@ -1623,9 +1668,10 @@ def iter_blob_bytes(p, sha, span=None, depth=0):
                         base = base_bytes(base_paths, bases, region) if "base" in region and not codec & STANDALONE else None
                         yield codec, payload, raw_len, region, base
 
-            def decode(codec, payload, raw_len, region, base):
+            def decode(codec, payload, raw_len, region, base):  # with its CRC, on the thread too
                 chunk = decode_payload(codec & ~STANDALONE, payload, raw_len, region_planes_dtype(region))
-                return chunk if base is None else xor_bytes(chunk, base)
+                chunk = chunk if base is None else xor_bytes(chunk, base)
+                return chunk, zlib.crc32(chunk)
 
             plain = ordered_map(decode, to_decode(), frame_workers())
             for region, frame in zip(regions, frames):
@@ -1634,8 +1680,12 @@ def iter_blob_bytes(p, sha, span=None, depth=0):
                         yield bytes(min(16 << 20, region["length"] - at))
                     continue
                 codec, raw_len, off, plen, crc = frame
-                chunk = next(decoded) if codec == CODEC_ANS16 else next(plain)
-                if len(chunk) != raw_len or zlib.crc32(chunk) != crc:
+                if codec == CODEC_ANS16:
+                    chunk = next(decoded)
+                    check = zlib.crc32(chunk)
+                else:
+                    chunk, check = next(plain)
+                if len(chunk) != raw_len or check != crc:
                     raise ValueError(f"{path}: region at {region['offset']} failed its CRC check")
                 yield chunk
         finally:
@@ -1660,7 +1710,7 @@ class BaseFailed(ValueError):
 def materialize_blob(p, sha, depth=0):
     """Restore the file of the blob `sha` into a temporary file (OC_TMP or the system temp folder) and return its
     path; BaseFailed if its bytes do not restore that file (an error of the system, OSError, is passed on as it is)."""
-    fd, tmp = tempfile.mkstemp(prefix="oc-base-", suffix=".bin", dir=os.environ.get("OC_TMP") or None)
+    fd, tmp = temp_base_file()
     h = hashlib.sha256()
     try:
         with os.fdopen(fd, "wb") as out:
@@ -1679,6 +1729,50 @@ def materialize_blob(p, sha, depth=0):
         os.remove(tmp)
         raise
     return tmp
+
+
+def temp_base_file():
+    """(fd, path) of a new temporary file for a restored base: in OC_TMP, else the system's temp folder."""
+    return tempfile.mkstemp(prefix="oc-base-", suffix=".bin", dir=os.environ.get("OC_TMP") or None)
+
+
+class SideCopy:
+    """A file written beside bytes being checked: verify keeps a restored file this way as the base of the files after
+    it. If it cannot be written (no room, say), there is no copy, and those files restore their base themselves."""
+
+    def __init__(self):
+        self.path = self.f = None
+        with contextlib.suppress(OSError):
+            fd, self.path = temp_base_file()
+            self.f = os.fdopen(fd, "wb")
+
+    def write(self, data):
+        if self.f:
+            try:
+                self.f.write(data)
+            except OSError:
+                self.discard()
+
+    def done(self, ok):
+        """Its path if it was written whole and `ok`; else it is deleted (None)."""
+        if self.f and ok:
+            try:
+                self.f.close()
+                self.f = None
+                return self.path
+            except OSError:
+                pass
+        self.discard()
+        return None
+
+    def discard(self):
+        with contextlib.suppress(OSError):
+            if self.f:
+                self.f.close()
+        with contextlib.suppress(OSError):
+            if self.path:
+                os.remove(self.path)
+        self.f = self.path = None
 
 
 def cached_base(p, sha):
@@ -2380,10 +2474,12 @@ def pack_model(args, p, source, name, paths, manifests, base):
     say(f"hashing {len(paths)} files in {source}")
     full = {rel: os.path.join(source, *rel.split("/")) for rel in paths}
     PROGRESS.begin(f"hashing {name}", sum(os.path.getsize(f) for f in full.values()))
-    records = []
-    for rel in paths:
+
+    def hashed(rel):
         PROGRESS.at(rel)
-        records.append({"path": rel, "size": os.path.getsize(full[rel]), "sha256": sha256_file(full[rel], counted=True)})
+        return {"path": rel, "size": os.path.getsize(full[rel]), "sha256": sha256_file(full[rel], counted=True)}
+
+    records = list(ordered_map(hashed, ((rel,) for rel in paths), hash_workers()))  # several files at once
     have = p.blob_ids()
     how = f"delta base: {base}" if base else "no delta base" if args.no_base else "delta base chosen per file"
     say(f"packing {name} -> {p.root}  ({how})")
@@ -3171,6 +3267,10 @@ def cmd_restore(args):
                  "restore into an empty folder, or add --overwrite to replace them")
     os.makedirs(args.dest_dir, exist_ok=True)
     tree = SafeTree(args.dest_dir)
+    PROGRESS.begin("checking blobs")
+    shas = dict.fromkeys(e["sha256"] for e, _, _, present in targets if not present)
+    for _ in ordered_map(blob_problem, ((p, sha) for sha in shas), hash_workers()):
+        pass  # several at once; an intact one is remembered (_INTACT), what is wrong with another restore_entry says
     PROGRESS.begin(f"restoring {name}", sum(e["size"] for e, _, _, present in targets if not present))
     for entry, rel, shown, present in targets:
         if present:
@@ -3250,40 +3350,73 @@ def scan(p, manifests, names, paths=(), passed=None):
                 todo.extend(graph.edges.get(s, ()))
         return found
 
-    for sha in sorted(headers):  # 2
-        if sha not in faults:
-            problem = blob_damage(p.blob_span(sha), sha)
-            if problem:
-                faults[sha] = f"is {problem}"
+    blobs = [sha for sha in sorted(headers) if sha not in faults]  # 2
+    PROGRESS.begin("checking blobs", sum(p.blob_span(sha)[2] for sha in blobs))
+    damage = lambda span, sha: (sha, blob_damage(span, sha, counted=True))  # noqa: E731
+    for sha, problem in ordered_map(damage, ((p.blob_span(sha), sha) for sha in blobs), hash_workers()):
+        if problem:
+            faults[sha] = f"is {problem}"
     for sha in headers:
         if not chain(sha) & faults.keys():
             _INTACT.add((p.root, sha))  # checked: decoding it reads it once more, not twice
-    sound = {e["sha256"]: e["size"] for _, e in chosen if not chain(e["sha256"]) & faults.keys()}
-    PROGRESS.begin("verifying", sum(sound.values()))
-    restored, wrong = {}, {}
+    entries = {}  # blob -> the (model, entry) pairs that are its file, in the order chosen
     for name, e in chosen:
-        sha = e["sha256"]
-        PROGRESS.at(f"{name}:{e['path']}")
-        if sha not in restored and not chain(sha) & faults.keys():
-            h, n = hashlib.sha256(), 0
-            try:
-                for chunk in iter_blob_bytes(p, sha):
-                    h.update(chunk)
-                    n += len(chunk)
-                    PROGRESS.add(len(chunk))
-            except BaseFailed as err:
-                faults.setdefault(err.sha, f"does not restore its file ({err.problem})")
-            except Exception as err:
-                faults[sha] = f"does not restore its file ({err})"
-            else:
-                if h.hexdigest() != sha:
-                    faults[sha] = "restores other bytes than its file's (their SHA-256 differs)"
-            restored[sha] = n
-        if sha not in faults and not chain(sha) & faults.keys():
-            if restored.get(sha) != e["size"]:
-                wrong[(name, e["path"])] = f"the pack lists it with {e['size']} bytes, its blob holds {restored.get(sha)}"
-            elif passed:
-                passed(name, e)
+        entries.setdefault(e["sha256"], []).append((name, e))
+    sound = [sha for sha in entries if not chain(sha) & faults.keys()]
+    users = {}  # blob -> how many of those still to verify are coded against it
+    for sha in sound:
+        for b in set(graph.edges[sha]):
+            users[b] = users.get(b, 0) + 1
+    PROGRESS.begin("verifying", sum(entries[sha][0][1]["size"] for sha in sound))
+
+    def restore(sha):
+        """(bytes, whether their SHA-256 is the file's) of the restored file; if blobs still to verify are coded against
+        it, it is kept for them as it is restored (instead of being restored again for each)."""
+        h, n, ok = hashlib.sha256(), 0, False
+        copy = SideCopy() if users.get(sha) else None
+        try:
+            for chunk in iter_blob_bytes(p, sha):
+                h.update(chunk)
+                n += len(chunk)
+                PROGRESS.add(len(chunk))
+                if copy:
+                    copy.write(chunk)
+            ok = h.hexdigest() == sha
+        finally:
+            if copy and (path := copy.done(ok)):
+                _BASE_CACHE[(p.root, sha)] = path
+        return n, ok
+
+    restored, wrong = {}, {}
+    try:
+        for sha in bases_first(sound, graph.edges):
+            name, e = entries[sha][0]
+            PROGRESS.at(f"{name}:{e['path']}")
+            if not chain(sha) & faults.keys():
+                try:
+                    restored[sha], ok = restore(sha)
+                except BaseFailed as err:
+                    faults.setdefault(err.sha, f"does not restore its file ({err.problem})")
+                except Exception as err:
+                    faults[sha] = f"does not restore its file ({err})"
+                else:
+                    if not ok:
+                        faults[sha] = "restores other bytes than its file's (their SHA-256 differs)"
+            for b in set(graph.edges[sha]):
+                users[b] -= 1
+                if not users[b] and (p.root, b) in _BASE_CACHE:  # nothing more coded against it to verify
+                    os.remove(_BASE_CACHE.pop((p.root, b)))
+            for name, e in entries[sha]:
+                if sha not in faults and not chain(sha) & faults.keys():
+                    if restored.get(sha) != e["size"]:
+                        wrong[(name, e["path"])] = f"the pack lists it with {e['size']} bytes, its blob holds {restored.get(sha)}"
+                    elif passed:
+                        passed(name, e)
+    finally:
+        for sha in users:
+            with contextlib.suppress(OSError):
+                if (p.root, sha) in _BASE_CACHE:
+                    os.remove(_BASE_CACHE.pop((p.root, sha)))
     PROGRESS.end()
     lost = []
     for name, e in chosen:  # 3
@@ -3300,6 +3433,29 @@ def scan(p, manifests, names, paths=(), passed=None):
         lost.append({"model": name, "path": e["path"], "size": e["size"], "sha256": sha, "weights": bool(e.get("tensors")),
                      "causes": causes, "own": not causes or causes[0] == sha, "problem": problem})
     return faults, lost, len(chosen), graph, headers
+
+
+def bases_first(blobs, edges):
+    """`blobs` in their order, but each that others of them are coded against just before the first of those, after
+    its own bases: a restored base kept for what follows is then kept the shortest while (edges: blob -> its bases)."""
+    wanted = set(blobs)
+    needed = {b for sha in blobs for b in edges.get(sha, ()) if b in wanted}
+    order, placed = [], set()
+
+    def place(sha):  # recursion only down a chain of bases, which scan has found sound (no cycle, at most 32 deep)
+        if sha not in placed:
+            placed.add(sha)
+            for b in edges.get(sha, ()):
+                if b in wanted:
+                    place(b)
+            order.append(sha)
+
+    for sha in blobs:
+        if sha not in needed:
+            place(sha)
+    for sha in blobs:
+        place(sha)
+    return order
 
 
 def blob_name(manifests, headers, sha):

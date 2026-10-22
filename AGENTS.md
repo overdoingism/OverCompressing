@@ -127,7 +127,7 @@ or `--add` (these files join it, same paths replaced), checked before anything i
   as the path bar.
 - Reading (listing a pack, a model, the remove preview) is done in-process through `llm_archive` (`pack_summary`,
   `model_summary`, `removal`), closing pack files afterwards. Every change runs `llm_archive.py` in a child process
-  through `RUNNER`, with `--json --progress`; the window parses those lines (progress events go to the busy window,
+  through `RUNNER` (at below-normal priority), with `--json --progress`; the window parses those lines (progress events go to the busy window,
   the rest to the log). Closing the child's stdin cancels as Ctrl+C would. On Windows the child polls stdin with
   `PeekNamedPipe`: a blocking read would stall every ans16 worker process at start (a real bug once).
 - While a job runs, a modal window in front holds all input and has Cancel. Activity is a turning ◐; how far it is
@@ -168,6 +168,25 @@ or `--add` (these files join it, same paths replaced), checked before anything i
   dialog is open or the window is minimized. F5 lists again at once (owner's rule: no reading more often than that).
 - Driving the window in tests: click dialog buttons instead of sending keys (keys need the system focus); keep test
   windows topmost only for the moment of a screenshot; do not leave windows covering the user's screen.
+
+## Speed
+
+- What runs at once: ans16 regions in worker processes, one per logical CPU (`ans16_workers`); byte-plane and zstd
+  frames on threads (`frame_workers`, up to 8) through `ordered_map`, the main thread reading and writing in order
+  (CRCs on the threads too); files hashed and blobs checked several at once (`hash_workers`, up to 4), each read a
+  block ahead of its hashing (`blocks_ahead`). `OC_WORKERS` caps all of them. One file's SHA-256 is one sequence
+  (about 2 GB/s here) and stays SHA-256: it names the blob and is what Hugging Face publishes.
+- Byte planes are byte operations into arrays made once (`byte_planes`; `join_planes` builds a bytearray in place),
+  with no copies of a whole region. Measured (2026-10-22, 7B): what held threads back was memory traffic from
+  whole-width temporaries, not the GIL; worker processes were no faster, and slower to decode (the decoded bytes
+  cross a pipe). Planes and payloads are byte for byte what they were (checked against the earlier code).
+- verify restores a base once: `bases_first` puts a file that others are coded against just before the first of
+  them, and its restored bytes are kept (`SideCopy`, in `OC_TMP`) until the last one is checked; a copy that cannot be
+  written only means they restore it themselves.
+- The window runs its jobs at below-normal priority (`BELOW_NORMAL_PRIORITY_CLASS`; `nice` 10 in `RUNNER` elsewhere),
+  so they use idle cores and give way to the user; the command line keeps the normal priority.
+- Speed work is measured on real models before and after (cores in use per step, not only the total time):
+  `docs/benchmarks.md`. ans16 itself (NumPy rANS, about 8 MB/s per process) is the limit for deltas.
 
 ## Damage and repair
 

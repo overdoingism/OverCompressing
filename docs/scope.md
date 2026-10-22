@@ -57,9 +57,9 @@ Not supported yet:
 |---|---|
 | Python | CPython 3.13, x86-64 (the offline kit bundles it), with numpy and zstandard: prebuilt wheels, no compiler |
 | OS | Windows 10/11 (tested end to end); Linux glibc x86-64 (scripts provided, not yet tested on a real machine) |
-| RAM | ≈ 4 GB peak with 16 worker processes on a 7B model; `OC_WORKERS` lowers it |
+| RAM | ≈ 12 GB committed at peak for a 7B delta with 16 ans16 worker processes, ≈ 2.5 GB without deltas; `OC_WORKERS` lowers it |
 | temporary disk | the base files a delta reads are restored to `OC_TMP` (default: system temp), e.g. one 3.7 GB shard per 7B shard; `rebase` also restores the file it re-packs there |
-| speed (8 cores) | pack 7B base ≈ 3 min, 7B Instruct delta ≈ 5.5 min; restore 7B base ≈ 1 min, 7B Instruct ≈ 3 min |
+| speed (8 cores) | pack 7B base ≈ 1.5 min, 7B Instruct delta ≈ 5.5 min; restore 7B base ≈ 30 s, 7B Instruct ≈ 2.7 min |
 | GPU | not used |
 
 ## What it is not

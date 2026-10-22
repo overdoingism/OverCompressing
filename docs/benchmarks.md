@@ -7,6 +7,7 @@
 > - Qwen2.5 測試歸檔：6 個 repo 共 34.3 GiB → **17.2 GiB（50.1%）**。
 > - base 自動挑選：社群微調模型全部選到與手動相同的 base，每個檔案約 1–10 秒。
 > - 每一筆數字都經過「從磁碟解回、SHA-256 一致」的驗證。
+> - 速度（8 核 16 緒）：pack 7B 約 97 秒、restore 約 31 秒、verify 7B 加 Instruct 約 155 秒；delta 的速度取決於 ans16，它本身已用滿所有核心。
 
 Setup: Windows 10, 8 cores / 16 threads, 92 GB RAM, local disk, CPython 3.13, tool version 4, measured 2026-10-21.
 Sizes are stored size ÷ original size. Every result was verified by decoding from disk and comparing the SHA-256
@@ -45,9 +46,10 @@ of DEFLATE, zstd and stored for every plane and gains a little more, e.g. 66.1 %
 | FP8 E5M2: the same weights, scaled per tensor | 70.10 % | 69.34 % | −0.75 pp |
 
 zstd alone on the exponent plane is worse (level 3: +3.8 pp, a literals-only setting: +1.2 pp; level 19 matches
-DEFLATE's ratio at 2 MB/s): its LZ matching finds nothing to reuse in exponents. In memory, on the 0.5B with 8–16
-threads, byte planes run at about 550 MB/s in both directions (ZipNN with its own threads: about 850 MB/s compress,
-1.4 GB/s decompress); whole-model times are below.
+DEFLATE's ratio at 2 MB/s): its LZ matching finds nothing to reuse in exponents. In memory, on 64 MiB pieces of the
+7B with 8 threads, byte planes run at about 490 MB/s compressing (each plane tried with DEFLATE and zstd) and 1.5 GB/s
+decompressing (ZipNN with its own threads, on the 0.5B: about 850 MB/s compress, 1.4 GB/s decompress); whole-model
+times are below.
 
 ## Official fine-tunes against their base
 
@@ -108,18 +110,38 @@ Shared tokenizers (0.5B and 7B use the same files) are stored once.
 
 ## Speed and memory (Qwen2.5-7B)
 
-| operation | time | peak memory (Python processes) |
-|---|---|---|
-| pack 7B base (incl. hashing and verification) | 174 s | — |
-| pack 7B-Instruct as ans16 delta (incl. base selection and verification) | 339 s | — |
-| verify 7B-Instruct | 199 s | 3.2 GiB |
-| restore 7B base to disk | 64 s (≈ 230 MB/s) | 3.0 GiB |
-| restore 7B-Instruct to disk | 193 s (≈ 77 MB/s) | 3.0 GiB |
-| ans16 on one 3.3 GB shard\* | encode 29 s, decode 27 s | — |
+Measured 2026-10-22 on the same files before and after that day's speed work (byte planes without whole-width
+temporaries, files hashed and blobs checked several at once, verify restoring a base once); models read from one
+NVMe SSD, pack and temporary files on another.
 
-ans16 runs in one worker process per CPU thread (16 here), byte planes and zstd on up to 8 threads; `OC_WORKERS`
-lowers both, and with them the memory. Peak memory is the working set of all Python processes, sampled every
-0.25 s, above what was in use before. \* measured with tool version 3; the ans16 code did not change.
+| operation | before | after | cores in use (after) | peak memory (after) |
+|---|---|---|---|---|
+| pack 7B base (incl. hashing and verification) | 143 s | **97 s** | 4.2 | 2.4 GiB |
+| pack 7B-Instruct as ans16 delta (incl. base selection and verification) | 331 s | 336 s | 9.5 | 12.5 GiB |
+| verify both models | 194 s | **155 s** | 9.8 | 11.4 GiB |
+| restore 7B base to disk | 49 s | **31 s** (≈ 500 MB/s) | 3.0 | 1.9 GiB |
+| restore 7B-Instruct to disk | 165 s | 164 s | 9.2 | 11.5 GiB |
+| ans16 on one 3.3 GB shard\* | encode 29 s, decode 27 s | — | — | — |
+
+Cores in use: CPU time of all the tool's processes over the time taken (16 threads here). Peak memory: their
+committed memory together, the peak of a job object holding them. Deltas are bound by ans16 (NumPy rANS, about
+8 MB/s per process), which the speed work did not touch: verifying one Instruct shard took 45.1 s before and 39.9 s
+after, its ans16 part 31.6 s both times (two runs each, alternating); the delta rows vary by about ±10% from run to
+run. ans16 runs in one worker process per CPU thread (16 here), byte planes and zstd on up to 8 threads, hashing on
+up to 4; `OC_WORKERS` lowers all of them, and with them the memory. With 16 byte-plane threads the 7B base packed in
+89 s instead of 97 s but took 4.1 GiB instead of 2.4 GiB, so 8 stays. \* measured with tool version 3; the ans16 code
+did not change.
+
+### What held the byte-plane threads back (64 MiB pieces of the 7B, in memory)
+
+| code | compress, 8 / 16 threads | decompress, 8 / 16 threads |
+|---|---|---|
+| before: whole-width (16-bit) temporaries and copies, on threads | 342 / 433 MB/s | 615 / 687 MB/s |
+| the same code in worker processes | 327 / 361 MB/s | 413 / 365 MB/s |
+| now: byte operations into arrays made once, on threads | 490 / 672 MB/s | 1541 / 1582 MB/s |
+
+Processes were no faster, so the GIL was not the limit; memory traffic was. The output is byte for byte the same.
+One thread: 79 → 83 MB/s compressing, 242 → 362 MB/s decompressing.
 
 ### zstd level on quantized GGUF tensor data (Q4_K_M, 64 MiB pieces)
 

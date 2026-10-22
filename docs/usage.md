@@ -159,8 +159,9 @@ Each action runs `llm_archive.py` exactly as below and shows its output (a comma
 list file, `--models-from` or `--files-from`, deleted after). While it runs, a window in front shows what
 runs, its last line, the step and how far it is (`37% · 5.6 GiB / 15.1 GiB`, when the tool can tell) and the time so
 far beside a turning ◐, and holds the rest of the window; **✕ Cancel** there, or closing it, stops the run as Ctrl+C
-would, so nothing half-done stays in the pack. Delta bases are always chosen automatically; `--base`, `rebase` and the
-other options are on the command line only. The window's text is English and symbols, whatever the system language.
+would, so nothing half-done stays in the pack. The run has below-normal priority (`nice` 10 on Linux): it uses every
+core left idle and gives way to what you are doing meanwhile. Delta bases are always chosen automatically; `--base`,
+`rebase` and the other options are on the command line only. The window's text is English and symbols, whatever the system language.
 Run from an offline kit, it opens the kit's pack. Its title shows its own version and that of `llm_archive.py`, each
 with its build (the date and commit the file was last changed in; `edited` if it differs from that commit), e.g.
 `OverCompressing GUI 0.5 (2026-10-22 1a2b3c4) · CLI 0.5 (2026-10-22 1a2b3c4)`: give both when reporting a problem.
@@ -309,8 +310,10 @@ python -I tools/llm_archive.py verify <pack> [MODEL ...] [--models-from FILE] [-
 
 Checks in three passes. First the structure, from the blobs' headers alone: every blob a model needs is there,
 names its file, and names each blob it is coded against with the size that one holds; no chain of bases goes round
-or deeper than 32. Then the content: every blob is read whole against its own SHA-256, and every file whose chain is
-sound is decoded in memory and compared with the original SHA-256 (a blob several files share is decoded once).
+or deeper than 32. Then the content: every blob is read whole against its own SHA-256 (several at once), and every
+file whose chain is sound is decoded in memory and compared with the original SHA-256 (a blob several files share is
+decoded once; a file that others being verified are coded against is checked just before the first of them, and what
+it restores is kept in `OC_TMP` for them until the last, so it is decoded once too).
 Last the structure again, to tell a file whose own blob is at fault from one lost only because of a blob it is coded
 against. Without models, every model of
 the pack, and it also reports blobs that no model needs. When anything fails, a **damage report** follows: the
@@ -486,7 +489,7 @@ than one medium: see [protection.md](protection.md).
 | variable | effect |
 |---|---|
 | `OC_TMP` | folder for restored base files (needs room for the base files a delta reads) and for the file `rebase` re-packs |
-| `OC_WORKERS` | cap on ans16 worker processes, a whole number of at least 1 (lower it on small-RAM machines); any other value stops every command with an error |
+| `OC_WORKERS` | cap on ans16 worker processes, a whole number of at least 1 (lower it on small-RAM machines); it also caps the threads that code byte planes and zstd (at most 8) and that hash files (at most 4); any other value stops every command with an error |
 
 ## Rules for a healthy pack
 
@@ -688,7 +691,8 @@ pack 檔）會開成**模型清單**：列出每個模型的打包時間、檔�
 
 每個動作都是照下文的方式執行 `llm_archive.py`，並顯示它的輸出（命令列太長時，改用清單檔 `--models-from` 或 `--files-from` 傳遞，結束後刪除）。執行期間會有一個置前的視窗，顯示正在做什麼、最後一行輸出、
 目前步驟與進度（工具能計量時，例如 `37% · 5.6 GiB / 15.1 GiB`），以及轉動的 ◐ 旁的已執行時間，主視窗則暫時無法操作；在那個
-視窗按 **✕ Cancel** 或關掉它，效果等同按 Ctrl+C，pack 裡不會留下做一半的東西。差異基底一律自動選擇；`--base`、`rebase`
+視窗按 **✕ Cancel** 或關掉它，效果等同按 Ctrl+C，pack 裡不會留下做一半的東西。執行的優先權是「低於標準」（Linux 上為
+`nice` 10）：閒置的核心都會用上，你同時在用電腦時則讓給你的程式。差異基底一律自動選擇；`--base`、`rebase`
 等其他選項只能用命令列。介面文字只有英文與符號，與系統語系無關。從離線工具包執行時，會直接開啟工具包所在的 pack。視窗標題會顯示它自己和 `llm_archive.py` 的版本，各附 build（該檔案最後一次變更的
 commit 日期與編號；與該 commit 不同時加註 `edited`），例如 `OverCompressing GUI 0.5 (2026-10-22 1a2b3c4) · CLI 0.5 (2026-10-22 1a2b3c4)`。
 回報問題時請附上這兩個版本。`llm_archive.py --version` 會印出後者。
@@ -816,8 +820,9 @@ python -I tools/llm_archive.py verify <pack> [模型 ...] [--models-from 檔案]
 ```
 
 分三輪檢查。先檢查結構，只讀 blob 的標頭：模型需要的每個 blob 都在、標頭指向正確的檔案、它所依據的每個 blob 大小相符，
-而且基底鏈沒有繞成一圈、也沒有超過 32 層。再檢查內容：每個 blob 整個讀過、核對它自己的 SHA-256，基底鏈完好的檔案在記憶體中
-解碼並比對原始 SHA-256（多個檔案共用的 blob 只解碼一次）。最後再檢查一次結構，分辨「自己的 blob 壞了」和「只因為所依據的
+而且基底鏈沒有繞成一圈、也沒有超過 32 層。再檢查內容：每個 blob 整個讀過、核對它自己的 SHA-256（多個同時進行），基底鏈完好的
+檔案在記憶體中解碼並比對原始 SHA-256（多個檔案共用的 blob 只解碼一次；其他受驗檔案所依據的檔案，會排在第一個依據它的檔案之前
+驗證，還原結果暫存在 `OC_TMP` 給它們用到最後一個為止，所以也只解碼一次）。最後再檢查一次結構，分辨「自己的 blob 壞了」和「只因為所依據的
 blob 壞了而遺失」。不指定模型時驗證 pack 中的所有模型，並列出沒有任何模型需要的 blob。有任何失敗時，後面會接一份**損毀報告**：出問題的 blob；
 遺失的檔案（`its own blob` 是自己的 blob 壞了，`through` 是經由所依據的檔案）；有遺失檔案的模型，以及其中有幾個權重檔；需要
 這些模型資料的其他模型；以及每個出問題的 blob 對應檔案的 SHA-256、把那個原檔重新存回去能救回幾個遺失的檔案
@@ -965,7 +970,7 @@ pack 檔必須放在 pack 資料夾之外（也不能在其他 pack 資料夾裡
 | 變數 | 作用 |
 |---|---|
 | `OC_TMP` | 暫存還原 base 檔的資料夾，需容納差異檔用到的 base 檔；`rebase` 重新打包的檔案也放在這裡 |
-| `OC_WORKERS` | ans16 平行程序數上限，須為 1 以上的整數（記憶體小的機器請調低）；其他值會讓所有指令直接報錯 |
+| `OC_WORKERS` | ans16 平行程序數上限，須為 1 以上的整數（記憶體小的機器請調低）；同時也是位元平面與 zstd 編碼執行緒（最多 8 個）和計算雜湊執行緒（最多 4 個）的上限；其他值會讓所有指令直接報錯 |
 
 ## pack 注意事項
 

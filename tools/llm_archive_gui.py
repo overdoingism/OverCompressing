@@ -34,7 +34,9 @@ import llm_archive as la  # noqa: E402
 # Runs llm_archive.py in the child process. When its stdin closes (Cancel, or this window going away), it stops as on
 # Ctrl+C, so a pack or restore still removes what it had begun. On Windows the pipe is polled, not read: a read left
 # pending on it would stall every process started meanwhile (the ans16 workers) as it starts.
-RUNNER = """import sys, threading, time, _thread
+RUNNER = """import os, sys, threading, time, _thread
+if sys.platform != "win32":
+    os.nice(10)  # gives way to what the user is doing, as on Windows (BELOW_NORMAL); its workers inherit it
 sys.path.insert(0, sys.argv[1])
 import llm_archive as la
 def cancel_on_eof():
@@ -2021,7 +2023,9 @@ class App:
         shown = subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
         self.write(f"\n> llm_archive.py {shown}" + (t("listed", count=listed) if listed else "") + "\n", "command")
         self.status.configure(text=self.job["title"] + " …")
-        where = dict(creationflags=subprocess.CREATE_NO_WINDOW) if os.name == "nt" else dict(start_new_session=True)
+        # below normal priority: a job uses every core the user leaves idle, and gives way when the user needs them
+        where = (dict(creationflags=subprocess.CREATE_NO_WINDOW | subprocess.BELOW_NORMAL_PRIORITY_CLASS) if os.name == "nt"
+                 else dict(start_new_session=True))
         self.proc = subprocess.Popen([python_exe(), "-I", "-X", "utf8", "-u", "-c", RUNNER, HERE, *argv, "--json", "--progress"],
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                      text=True, encoding="utf-8", errors="replace", **where)
