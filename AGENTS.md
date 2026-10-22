@@ -107,7 +107,8 @@ or `--add` (these files join it, same paths replaced), checked before anything i
 
 - Every written file goes to a fresh `.oc-*.part` (created exclusively), is synced, then put in place. A blob is
   decoded back from its temporary file to its SHA-256 before it takes its name (`store_blob`; ans16 failures redone as
-  XOR, except in a new pack file, which then stops). Without `--overwrite`, placing is atomic no-clobber: hard link,
+  XOR, except in a new pack file, which then stops). `export --verify` likewise reads the pack file back from its
+  temporary file before placing it: one that fails is never there, nor replaces a file (owner's choice). Without `--overwrite`, placing is atomic no-clobber: hard link,
   else `renameat2`/`renamex_np`; if neither, fail, never check-then-rename.
 - Order: blobs first, manifest replaced in one step last, sweep after. A rebase replaces a blob by one that restores
   the same file, so nothing that needs it changes. The pack is complete at every moment.

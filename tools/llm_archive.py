@@ -108,6 +108,12 @@ def fail(kind, text):
     raise Failure(kind, text)
 
 
+def damage_kind(e):
+    """The code of an error met reading a pack's blobs: one missing or malformed is damage, any other error of the
+    system (no permission, a failing disk) is not."""
+    return "damaged" if isinstance(e, (FileNotFoundError, ValueError)) else "other"
+
+
 class Progress:
     """How far the running step is, reported on stderr about once a second by a thread of its own, so that a step
     with nothing to count (choosing a base, preparing one) still shows it is alive: the step, the bytes done of its
@@ -3858,7 +3864,7 @@ def cmd_remove(args):
     try:
         freed, kept, users = removal(p, manifests, changed)
     except (OSError, ValueError) as e:
-        sys.exit(f"cannot tell what the models of {p.root} need ({e}): nothing removed; run verify")
+        fail(damage_kind(e), f"cannot tell what the models of {p.root} need ({e}): nothing removed; run verify")
     freed_size, kept_size = blobs_size(p, freed), blobs_size(p, kept)
     say(f"{'would remove' if args.dry_run else 'removing'} {what}")
     say(f"  {'would free' if args.dry_run else 'frees'} {human(freed_size)} ({len(freed)} blob(s))", event="freed",
@@ -4123,7 +4129,7 @@ def cmd_rebase(args):
     try:
         order = sorted(names, key=lambda n: (graph.model_depth(n), n))  # bases before the models that use them
     except (OSError, ValueError) as e:
-        sys.exit(f"cannot tell what the models of {p.root} need ({e}): run verify")
+        fail(damage_kind(e), f"cannot tell what the models of {p.root} need ({e}): run verify")
     before = after = 0
     pack_before = blobs_size(p, p.blob_ids())
     skipped = {n for n in order if args.all and not args.no_base and manifests[n].get("base_choice", "auto") != "auto"}
@@ -4137,7 +4143,7 @@ def cmd_rebase(args):
     try:
         release = set() if forced else weigh_kept(args, p, graph, todo)
     except (OSError, ValueError) as e:
-        sys.exit(f"cannot weigh the bases kept for other models ({e}): run verify")
+        fail(damage_kind(e), f"cannot weigh the bases kept for other models ({e}): run verify")
     try:
         for name in order:
             if name in skipped:
@@ -4242,9 +4248,9 @@ def unlock_archive(root):
 def cmd_export(args):
     """Put models of a pack (default: all) into a new pack file, with every blob they need and the _kit: the blobs
     stored as they are, the rest Deflated where that helps. From a pack file, this makes a smaller one. --verify
-    reads it back (every member compared with what was put in, every model verified from it); --delete then removes
-    those models from the pack folder (only the blobs no remaining model needs go), verifying first unless
-    --no-verify."""
+    reads it back before it is put in place (every member compared with what was put in, every model verified from
+    it), so one that fails is never there, nor replaces a file of its name; --delete then removes those models from
+    the pack folder (only the blobs no remaining model needs go), verifying first unless --no-verify."""
     try:
         p = open_pack(args.pack)
     except (OSError, ValueError) as e:
@@ -4275,7 +4281,7 @@ def cmd_export(args):
         blobs = sorted(Graph(p, manifests).needed(names))
         sizes = {sha: p.blob_span(sha)[2] for sha in blobs}
     except (OSError, ValueError) as e:
-        sys.exit(f"cannot tell what {', '.join(names)} need ({e}): nothing written; run verify")
+        fail(damage_kind(e), f"cannot tell what {', '.join(names)} need ({e}): nothing written; run verify")
     kit, problems = kit_files(p)
     if problems:
         sys.exit(f"cannot export {p.root} as it is:\n  " + "\n  ".join(problems) + "\nmove or delete these first")
@@ -4297,57 +4303,59 @@ def cmd_export(args):
         info.compress_type = method
         return info
 
-    with SafeTree(os.path.dirname(out)).placing(os.path.basename(out), replace=args.overwrite) as f, \
-            zipfile.ZipFile(f, "w", allowZip64=True) as z:
-        for rel in [MARKER] + [manifest_rel(n) for n in names]:
-            data = p.read(rel)
-            z.writestr(member(rel, zipfile.ZIP_DEFLATED), data)
-            digests[rel] = hashlib.sha256(data).hexdigest()
-        for sha in blobs:
-            rel, (path, start, _) = blob_rel(sha), p.blob_span(sha)
-            PROGRESS.at(rel)
-            with open(path, "rb") as src, z.open(member(rel, zipfile.ZIP_STORED), "w", force_zip64=True) as dst:
-                src.seek(start)
-                try:
-                    digests[rel] = copy_blob(src, dst, sizes[sha])
-                except ValueError as e:
-                    sys.exit(f"{rel} is {e}: nothing written; run verify")
-        for rel in kit:
-            PROGRESS.at(rel)
-            if isinstance(p, FilePack):
-                info = zipfile.ZipInfo(rel, p.zip.getinfo(rel).date_time)
-                opened = lambda rel=rel: p.zip.open(rel)  # noqa: E731
-            else:
-                info = zipfile.ZipInfo.from_file(p.full(rel), rel, strict_timestamps=False)
-                opened = lambda rel=rel: open(p.full(rel), "rb")  # noqa: E731
-            with opened() as src:
-                info.compress_type = zip_method(rel, kit_sizes[rel], src.read(1 << 20))
-            h, n = hashlib.sha256(), 0
-            with opened() as src, z.open(info, "w", force_zip64=True) as dst:
-                while block := src.read(16 << 20):
-                    h.update(block)
-                    dst.write(block)
-                    n += len(block)
-                    PROGRESS.add(len(block))
-            if n != kit_sizes[rel]:
-                sys.exit(f"{rel} changed while it was exported: nothing written")
-            digests[rel] = h.hexdigest()
-    PROGRESS.end()
+    with SafeTree(os.path.dirname(out)).placing(os.path.basename(out), replace=args.overwrite) as f:
+        with zipfile.ZipFile(f, "w", allowZip64=True) as z:
+            for rel in [MARKER] + [manifest_rel(n) for n in names]:
+                data = p.read(rel)
+                z.writestr(member(rel, zipfile.ZIP_DEFLATED), data)
+                digests[rel] = hashlib.sha256(data).hexdigest()
+            for sha in blobs:
+                rel, (path, start, _) = blob_rel(sha), p.blob_span(sha)
+                PROGRESS.at(rel)
+                with open(path, "rb") as src, z.open(member(rel, zipfile.ZIP_STORED), "w", force_zip64=True) as dst:
+                    src.seek(start)
+                    try:
+                        digests[rel] = copy_blob(src, dst, sizes[sha])
+                    except ValueError as e:
+                        fail("damaged", f"{rel} is {e}: nothing written; run verify")
+            for rel in kit:
+                PROGRESS.at(rel)
+                if isinstance(p, FilePack):
+                    info = zipfile.ZipInfo(rel, p.zip.getinfo(rel).date_time)
+                    opened = lambda rel=rel: p.zip.open(rel)  # noqa: E731
+                else:
+                    info = zipfile.ZipInfo.from_file(p.full(rel), rel, strict_timestamps=False)
+                    opened = lambda rel=rel: open(p.full(rel), "rb")  # noqa: E731
+                with opened() as src:
+                    info.compress_type = zip_method(rel, kit_sizes[rel], src.read(1 << 20))
+                h, n = hashlib.sha256(), 0
+                with opened() as src, z.open(info, "w", force_zip64=True) as dst:
+                    while block := src.read(16 << 20):
+                        h.update(block)
+                        dst.write(block)
+                        n += len(block)
+                        PROGRESS.add(len(block))
+                if n != kit_sizes[rel]:
+                    sys.exit(f"{rel} changed while it was exported: nothing written")
+                digests[rel] = h.hexdigest()
+        PROGRESS.end()
+        f.flush()
+        if verify:  # read back before it is put in place: a pack file that fails is never there, nor replaces one
+            say(f"verifying {out} before it is put in place")
+            problems = readback_problems(f.temp_path, digests)
+            for problem in problems:
+                say(f"  FAIL  {problem}", event="fail", problem=problem)
+            new = FilePack(f.temp_path)
+            try:
+                failures, checked, _ = verify_models(new, all_manifests(new, []), names)
+            finally:
+                new.close()
+            if problems or failures:
+                fail("damaged", f"{len(problems) + failures} FAILURE(S) in {out}: not put in place"
+                                + ("; nothing removed" if args.delete else ""))
+            say(f"VERIFIED: all {len(digests)} members read back identical; {checked} model files restored exactly")
     say(f"wrote {out}: {human(os.path.getsize(out))}  ({time.perf_counter() - t0:.0f}s)", event="written", path=out,
         size=os.path.getsize(out))
-    if verify:
-        say(f"verifying {out}")
-        problems = readback_problems(out, digests)
-        for problem in problems:
-            say(f"  FAIL  {problem}", event="fail", problem=problem)
-        new = FilePack(out)
-        try:
-            failures, checked, _ = verify_models(new, all_manifests(new, []), names)
-        finally:
-            new.close()
-        if problems or failures:
-            fail("damaged", f"{len(problems) + failures} FAILURE(S) in {out}" + (": nothing removed" if args.delete else ""))
-        say(f"VERIFIED: all {len(digests)} members read back identical; {checked} model files restored exactly")
     if args.delete:
         tree = SafeTree(p.root)
         for name in names:

@@ -632,6 +632,10 @@ def check_damage():
     expect("  and its error event's code: damaged", error_code(out) == "damaged", out[-200:])
     code, out = tool("restore", archive, "t/Tune", os.path.join(root, "from-damaged"), "--json")
     expect("a restore that meets the damage: code damaged", code == 1 and error_code(out) == "damaged", out[-200:])
+    made = os.path.join(root, "from-damaged.oczip")
+    code, out = tool("export", damaged, made, "--json")
+    expect("an export that meets the damaged blob: code damaged, nothing written", code == 1
+           and error_code(out) == "damaged" and not os.path.exists(made), out[-200:])
     code, out = tool("pack", os.path.join(root, "src", "Base"), archive, "--name", "t/Base", "--add", "--file", "a.safetensors")
     code2, out2 = tool("verify", archive)
     expect("storing the original again heals it and what is coded against it", code == 0 and code2 == 0
@@ -650,6 +654,8 @@ def check_damage():
     shutil.copytree(archive, gone)
     path = blob_path(gone, entry(gone, "t/Base", "a.safetensors")["sha256"])
     os.remove(path)
+    code, out = tool("export", gone, os.path.join(root, "from-gone.oczip"), "--json")
+    expect("an export of a pack with a missing blob: code damaged", code == 1 and error_code(out) == "damaged", out[-200:])
     code, out = tool("remove", gone, "t/Base", "t/Tune", "t/Side")
     expect("removing every model of a pack with a missing blob: nothing left over", code == 0 and blobs(gone) == set(),
            "" if code == 0 else out[-300:])
@@ -1913,9 +1919,22 @@ la.store_blob = _stopping"""
     ok = methods.get("_kit/README.md") == zipfile.ZIP_DEFLATED and methods.get("_kit/fake.whl") == zipfile.ZIP_STORED
     expect("the _kit goes in too (text deflated, a wheel stored)", ok, "" if ok else str(methods))
     patch = 'la.readback_problems = lambda path, digests: ["models/t__F.json: differs from what was put in"]'
-    code, out = patched(patch, "export", work, os.path.join(root, "failing.oczip"), "--delete")
-    ok = code != 0 and "nothing removed" in out and state(work) == listing
-    expect("--delete after a failed verification: nothing removed", ok, "" if ok else out[-300:])
+    code, out = patched(patch, "export", work, os.path.join(root, "failing.oczip"), "--delete", "--json")
+    left = [n for n in os.listdir(root) if n.startswith(".oc-") or n == "failing.oczip"]
+    ok = code != 0 and "nothing removed" in out and state(work) == listing and error_code(out) == "damaged" and not left
+    expect("--delete after a failed verification: nothing removed, and no pack file (it is checked before it is placed)",
+           ok, "" if ok else f"{left} {out[-300:]}")
+    kept = os.path.join(root, "kept.oczip")
+    shutil.copyfile(os.path.join(root, "checked.oczip"), kept)
+    good = open(kept, "rb").read()
+    code, out = patched(patch, "export", work, kept, "--verify", "--overwrite")
+    ok = code != 0 and open(kept, "rb").read() == good and not [n for n in os.listdir(root) if n.startswith(".oc-")]
+    expect("--overwrite with a failed verification: the file there before is kept as it was", ok, "" if ok else out[-300:])
+    stop = 'la.verify_models = lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt)'
+    code, out = patched(stop, "export", work, os.path.join(root, "unchecked.oczip"), "--verify", "--json")
+    left = [n for n in os.listdir(root) if n.startswith(".oc-") or n == "unchecked.oczip"]
+    expect("stopped while it verifies: no pack file, no temporary file", code != 0 and error_code(out) == "cancelled"
+           and not left, f"{left} {out[-200:]}")
     stop = """_inner, _calls = la.copy_blob, []
 def _stopping(*a):
     _calls.append(1)

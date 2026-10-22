@@ -68,7 +68,7 @@ The `code` of an error tells programs what failed; the text is for people and ma
 | `name_taken` | the pack holds a model of that name (or of the same manifest file, case ignored); rename: the new name or path is taken | pack: `--replace` or `--add`; else another name |
 | `busy` | the pack folder is in use by another command | run again when it has finished |
 | `no_room` | not enough free space, found before writing or while writing | free space, or point `OC_TMP` elsewhere |
-| `damaged` | verify or `export --verify` found damage (its `damage` event comes before), or a restore met it | read the damage report, or run `verify` |
+| `damaged` | a blob is damaged or missing: verify found it, or another command met it (restore, export, rebase, remove) | run `verify` for the full report; verify itself gives it first, as a `damage` event (the others do not) |
 | `cancelled` | stopped by Ctrl+C, or by the window's Cancel | — |
 | `other` | anything else | read the text |
 
@@ -483,7 +483,7 @@ temporary file next to it and put in place only when complete, so a stopped expo
 
 | option | meaning |
 |---|---|
-| `--verify` | then read it back: every member compared with what was put in (SHA-256), and every model exported verified from the file as `verify` does. Off by default |
+| `--verify` | read it back before it is put in place: every member compared with what was put in (SHA-256), and every model exported verified from the file as `verify` does. A pack file that fails is not put in place (nor does it replace a file of that name, with `--overwrite`). Off by default |
 | `--delete` | then remove those models from the pack folder (as `remove` does: what other models still need stays); exporting every model removes the pack folder (what you keep there yourself stays). Verifies first unless `--no-verify`; if anything fails, nothing is removed |
 | `--no-verify` | with `--delete`: remove without verifying first |
 | `--overwrite` | replace an existing file of that name |
@@ -639,7 +639,7 @@ python -I tools/llm_archive.py pack models/Qwen2.5-7B Qwen2.5-7B.oczip
 | `name_taken` | pack 裡已有同名模型（或大小寫不計時同一個 manifest 檔名）；rename：新名稱或新路徑已被使用 | pack：改用 `--replace` 或 `--add`；其他：換個名稱 |
 | `busy` | pack 資料夾正被另一個指令使用 | 等它結束再跑 |
 | `no_room` | 空間不足，寫入前或寫入途中發現 | 清出空間，或把 `OC_TMP` 指到別處 |
-| `damaged` | verify 或 `export --verify` 發現損毀（前面會有 `damage` 事件），或 restore 途中遇到 | 看損毀報告，或執行 `verify` |
+| `damaged` | 有 blob 損毀或遺失：verify 發現，或其他指令（restore、export、rebase、remove）途中遇到 | 執行 `verify` 取得完整報告；只有 verify 自己會先輸出它（`damage` 事件），其他指令不會 |
 | `cancelled` | 被 Ctrl+C 或視窗的 Cancel 中止 | — |
 | `other` | 其他所有情況 | 看文字 |
 
@@ -981,7 +981,7 @@ python -I tools/llm_archive.py export <pack> <檔名.oczip> [模型 ...] [--mode
 
 | 選項 | 說明 |
 |---|---|
-| `--verify` | 寫完後讀回驗證：每個成員都與放進去的內容比對（SHA-256），並像 `verify` 一樣從檔案驗證每個匯出的模型。預設不做 |
+| `--verify` | 寫完後、放到定位之前讀回驗證：每個成員都與放進去的內容比對（SHA-256），並像 `verify` 一樣從檔案驗證每個匯出的模型。驗證失敗的 pack 檔不會放到定位（加了 `--overwrite` 時，也不會取代原有的同名檔案）。預設不做 |
 | `--delete` | 之後從 pack 資料夾移除這些模型（同 `remove`：其他模型仍需要的會保留）；匯出全部模型時，連 pack 資料夾一起移除（你自己放的檔案會保留）。除非加上 `--no-verify`，否則會先驗證；任何一項失敗就什麼都不移除 |
 | `--no-verify` | 與 `--delete` 併用：不驗證就移除 |
 | `--overwrite` | 取代同名的既有檔案 |
