@@ -5,8 +5,8 @@
 Everything goes through one script, `tools/llm_archive.py`, with eight commands: `pack`, `list`, `verify`,
 `restore`, `remove`, `rename`, `rebase` and `export` (or a small window for most of them: see below). It never
 downloads anything: get the model files however you like (Hugging Face, ModelScope, git, a mirror, a USB drive), then
-pack the folder. Run it with the Python environment from the offline kit or from a development setup
-([Windows](build-windows.md) / [Linux](build-linux.md)). Below, `python` means that environment's interpreter; `-I`
+pack the folder. Run it with the Python of a portable copy ([Windows](build-windows.md) / [Linux](build-linux.md)),
+or any Python 3.13 with numpy and zstandard. Below, `python` means that interpreter; `-I`
 (isolated mode) keeps it from importing stray files from the current folder.
 
 ## Two forms of a pack
@@ -164,7 +164,7 @@ far beside a turning ◐, and holds the rest of the window; **✕ Cancel** there
 would, so nothing half-done stays in the pack. The run has below-normal priority (`nice` 10 on Linux): it uses every
 core left idle and gives way to what you are doing meanwhile. Delta bases are always chosen automatically; `--base`,
 `rebase` and the other options are on the command line only. The window's text is English and symbols, whatever the system language.
-Run from an offline kit, it opens the kit's pack. Its title shows its own version and that of `llm_archive.py`, each
+Started from a portable copy kept in a pack folder as `_kit` (see Portable copy), it opens that pack. Its title shows its own version and that of `llm_archive.py`, each
 with its build (the date and commit the file was last changed in; `edited` if it differs from that commit), e.g.
 `OverCompressing GUI 0.5 (2026-10-22 1a2b3c4) · CLI 0.5 (2026-10-22 1a2b3c4)`: give both when reporting a problem.
 `llm_archive.py --version` prints the second.
@@ -507,35 +507,30 @@ than one medium: see [protection.md](protection.md).
   only when the system reports the pack's volume read-only (a CD/DVD/BD, a write-protected drive, a read-only mount),
   since nothing can change it then; otherwise they stop. `--no-lock` makes them go on anyway: use it only when you
   know nothing changes the pack meanwhile (e.g. a share that is read-only for you but not for others).
-- Keep `_kit/` (the offline kit) in the pack folder, and keep more than one copy on different media.
+- Keep a portable copy of the tool with the pack (in the pack folder as `_kit/`, see below), and keep more than one
+  copy on different media.
 - Links are never followed below the pack folder or a restore destination: if another program swaps a folder there
   for a symlink or junction while the tool runs, the write is refused instead of landing elsewhere. On Linux and macOS
   this holds at every step (folders are opened one by one without following links); on Windows it is a best effort
   (each folder is checked just before use, and every new file's real location through its own handle before it is
   put in place). Do not let untrusted users write into the pack or the destination while the tool runs.
 
-## Offline kit
+## Portable copy
 
-Build it once with network access; afterwards everything works without it:
+The tool needs Python 3.13 with numpy and zstandard. The build guides ([Windows](build-windows.md) /
+[Linux](build-linux.md)) make a **portable copy**: one folder with its own Python, the two packages and the tools,
+which runs wherever it is copied, without installing anything and without network. Make it once, with network;
+afterwards it works offline.
 
-```bash
-python -I kit/build_kit.py <pack_folder>/_kit [--cache <old_kit>]
-```
+So that a pack can be restored years later on a machine without network, keep a portable copy with it: copy the
+folder into the pack folder as `_kit/`. The tool reads nothing in `_kit/` but keeps it with the pack: a folder holding
+only `_kit/` can become a pack, restore never writes into it, and `export` puts it into the pack file, so a pack file
+carries it too. Started from there (`_kit\OverCompressing.cmd`, `_kit/overcompressing`), the window opens that pack.
+With a pack file, first extract its `_kit/` folder with any ZIP tool (7-Zip opens it as it is; for Windows Explorer,
+rename a copy to `.zip`), then run the tool from it and give it the pack file.
 
-On the restore machine:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File _kit\install_windows.ps1
-```
-
-```bash
-sh _kit/install_linux.sh
-```
-
-The install scripts create a virtual environment from the bundled wheels (installing the bundled Python 3.13 first if
-none is found) and print the exact `list` / `restore` / `verify` commands to use. Details: `_kit/README.md`. With a
-pack file, first extract its `_kit/` folder with any ZIP tool (7-Zip opens it as it is; for Windows Explorer, rename a
-copy to `.zip`), then give the pack file to `list`, `verify`, `restore` or the window.
+An earlier version assembled an "offline kit" with install scripts (`kit/build_kit.py`); it is no longer made. A
+`_kit/` of that kind in an older pack still works as its own `README.md` says.
 
 ## Troubleshooting
 
@@ -570,8 +565,9 @@ copy to `.zip`), then give the pack file to `list`, `verify`, `restore` or the w
 
 所有功能都在 `tools/llm_archive.py` 這支程式裡，共八個指令：`pack`、`list`、`verify`、`restore`、`remove`、`rename`、
 `rebase`、`export`（大部分也可以用圖形介面，見下文）。本工具不會下載任何東西：請用你習慣的方式取得模型檔（Hugging Face、
-ModelScope、git、鏡像站、隨身碟皆可），再打包整個資料夾。請用離線工具包安裝出來的 Python 環境，或依建置頁面
-（[Windows](build-windows.md) / [Linux](build-linux.md)）建立的開發環境來執行。以下的 `python` 指的都是該環境的直譯器；
+ModelScope、git、鏡像站、隨身碟皆可），再打包整個資料夾。請用可攜版的 Python（依建置頁面
+[Windows](build-windows.md) / [Linux](build-linux.md) 做出），或任何裝有 numpy 與 zstandard 的 Python 3.13 來執行。以下的
+`python` 指的都是那個直譯器；
 `-I`（隔離模式）可避免它載入目前資料夾裡來路不明的檔案。
 
 ## Pack 的兩種形態
@@ -699,7 +695,7 @@ pack 檔）會開成**模型清單**：列出每個模型的打包時間、檔�
 目前步驟與進度（工具能計量時，例如 `37% · 5.6 GiB / 15.1 GiB`），以及轉動的 ◐ 旁的已執行時間，主視窗則暫時無法操作；在那個
 視窗按 **✕ Cancel** 或關掉它，效果等同按 Ctrl+C，pack 裡不會留下做一半的東西。執行的優先權是「低於標準」（Linux 上為
 `nice` 10）：閒置的核心都會用上，你同時在用電腦時則讓給你的程式。差異基底一律自動選擇；`--base`、`rebase`
-等其他選項只能用命令列。介面文字只有英文與符號，與系統語系無關。從離線工具包執行時，會直接開啟工具包所在的 pack。視窗標題會顯示它自己和 `llm_archive.py` 的版本，各附 build（該檔案最後一次變更的
+等其他選項只能用命令列。介面文字只有英文與符號，與系統語系無關。從放在 pack 資料夾裡的可攜版（`_kit`，見「可攜版」）啟動時，會直接開啟那個 pack。視窗標題會顯示它自己和 `llm_archive.py` 的版本，各附 build（該檔案最後一次變更的
 commit 日期與編號；與該 commit 不同時加註 `edited`），例如 `OverCompressing GUI 0.5 (2026-10-22 1a2b3c4) · CLI 0.5 (2026-10-22 1a2b3c4)`。
 回報問題時請附上這兩個版本。`llm_archive.py --version` 會印出後者。
 
@@ -989,33 +985,26 @@ pack 檔必須放在 pack 資料夾之外（也不能在其他 pack 資料夾裡
   所以鎖檔屬於誰、權限如何都不影響。若完全無法加鎖，只有在作業系統回報 pack 所在的磁碟是唯讀時（光碟、防寫磁碟、唯讀掛載）
   才照常執行，因為這時不可能有人寫入；其他情況會停止。加上 `--no-lock` 可強制執行：請只在確定這段期間沒有人會改動 pack 時使用
   （例如對你唯讀、但別人可寫的共用資料夾）。
-- 把 `_kit/`（離線工具包）放在 pack 資料夾裡，並在不同媒體保留多份副本。
+- 讓 pack 帶著一份可攜版工具（放在 pack 資料夾裡，命名為 `_kit/`，見下文），並在不同媒體保留多份副本。
 - 在 pack 資料夾與還原目的資料夾底下，絕不跟隨連結：若工具執行期間有其他程式把某個資料夾換成符號連結或 junction，寫入會被
   拒絕，而不會寫到別處。在 Linux 與 macOS 上每一步都有保障（逐層開啟資料夾、不跟隨連結）；在 Windows 上則是盡力而為（每層
   資料夾使用前檢查，每個新檔案放上前再透過它自己的 handle 確認實際位置）。工具執行期間，請不要讓不受信任的使用者能寫入 pack
   或目的資料夾。
 
-## 離線工具包
+## 可攜版
 
-在有網路時建置一次，之後完全離線可用：
+本工具需要裝有 numpy 與 zstandard 的 Python 3.13。建置頁面（[Windows](build-windows.md) / [Linux](build-linux.md)）會做出
+**可攜版**：一個資料夾，裡面有它自己的 Python、這兩個套件和工具，複製到哪裡就能在哪裡執行，不必安裝任何東西，也不需要網路。
+在有網路時做一次，之後完全離線可用。
 
-```bash
-python -I kit/build_kit.py <pack_folder>/_kit [--cache <舊工具包>]
-```
+為了讓 pack 多年後也能在沒有網路的機器上還原，請讓它帶著一份可攜版：把整個資料夾複製到 pack 資料夾裡，命名為 `_kit/`。
+本工具不會讀取 `_kit/` 的內容，但把它當成 pack 的一部分：只有 `_kit/` 的資料夾可以成為新的 pack，還原絕不寫進它，`export`
+也會把它放進 pack 檔，所以 pack 檔同樣帶著它。從那裡啟動（`_kit\OverCompressing.cmd`、`_kit/overcompressing`）時，視窗會
+直接開啟那個 pack。若是 pack 檔，請先用任何 ZIP 工具解出其中的 `_kit/`（7-Zip 可直接開啟；Windows 檔案總管則需把副本改名為
+`.zip`），再從解出的資料夾執行工具，把 pack 檔交給它。
 
-在還原用的機器上：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File _kit\install_windows.ps1
-```
-
-```bash
-sh _kit/install_linux.sh
-```
-
-安裝腳本會用內附的 wheel 建立虛擬環境（找不到 Python 3.13 時會先安裝內附的版本），並印出可直接使用的 `list` / `restore` /
-`verify` 指令。詳見 `_kit/README.md`。若是 pack 檔，請先用任何 ZIP 工具解出其中的 `_kit/`（7-Zip 可直接開啟；Windows 檔案總管
-則需把副本改名為 `.zip`），再把 pack 檔交給 `list`、`verify`、`restore` 或圖形介面。
+先前的版本會用安裝腳本組裝「離線工具包」（`kit/build_kit.py`），現已不再製作。舊 pack 裡那種 `_kit/` 仍可照它自己的
+`README.md` 使用。
 
 ## 疑難排解
 

@@ -1,5 +1,9 @@
 # Offline restore kit
 
+> **Retired.** This is the README of the offline kit that `kit/build_kit.py` made, which is no longer made: the build
+> guides (`docs/build-*.md` in the repository) make a portable copy instead. A `_kit/` built with it still works as
+> described below.
+
 Everything needed to verify and restore the models in this pack **without network access**.
 The pack folder holding `_kit/` holds `ocpack.json`, one manifest per model in `models/` (e.g.
 `models/Qwen__Qwen2.5-0.5B.json`, listing every original file with its SHA-256) and the stored files in `blobs/`,

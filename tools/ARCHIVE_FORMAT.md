@@ -21,7 +21,8 @@ A pack is a folder (a *pack folder*) or the same tree in one ZIP file (a *pack f
     <ab>/<sha256>.ocz       one blob per distinct file: an OCZ4 container named by the SHA-256 of the ORIGINAL
                             file (64 lowercase hex digits; <ab> is its first two), shared by every model that has
                             that file
-  _kit/                     optional offline restore kit (tools, wheels, Python, docs)
+  _kit/                     optional: a portable copy of the tool (its Python and tools), which the tool never
+                            reads; export carries it into a pack file
   .overcompressing.lock     empty; the tools lock it while they run (pack, remove, rename, rebase and
                             export --delete alone; list, verify, restore and export together; readers skip it only
                             on a read-only volume or with --no-lock)

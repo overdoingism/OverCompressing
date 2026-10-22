@@ -1279,7 +1279,7 @@ def blob_damage(span, sha, counted=False):
 #     ocpack.json                   {"format": "overcompressing-pack", "format_version": 4}: what makes it a pack
 #     models/<Org__Name>.json       one manifest per model: the paths, sizes and SHA-256s of its files
 #     blobs/<ab>/<sha256>.ocz       one blob per distinct file, shared by every model that has that file
-#     _kit/                         the offline restore kit, if one was put there
+#     _kit/                         a portable copy of the tool, if one was put there (never read; export carries it)
 #
 # In a pack file the blobs are stored as they are (ZIP method 0) and read where they lie; the other members may be
 # Deflated. A model refers to nothing but its blobs, and a blob to nothing but the blobs it is coded against: what a
@@ -1288,6 +1288,9 @@ def blob_damage(span, sha, counted=False):
 
 OCZIP = ".oczip"
 MARKER = "ocpack.json"
+# _kit was the offline kit kit/build_kit.py made, which is retired (no longer made); a portable copy of the tool may be
+# put there instead. It is handled passively: a folder holding only it can become a pack, restore never writes into it,
+# export carries it, and the window started from it opens the pack.
 MODELS, BLOBS, KIT = "models", "blobs", "_kit"
 MARKER_JSON = {"format": PACK_FORMAT, "format_version": FORMAT_VERSION}
 MAX_MANIFEST = 256 << 20
@@ -4388,7 +4391,7 @@ def add_codec_options(s):
 
 def build_of(path):
     """Which build a tool file is, "<date> <commit>" of the last commit that changed it (", edited" when the file
-    differs from that commit): from the BUILD file a kit puts beside the tools, else from git when the file sits in a
+    differs from that commit): from the BUILD file of a portable copy (docs/build-*.md), else from git when the file sits in a
     checkout; None if neither tells. Git is asked only what reads its objects (log, rev-parse): nothing that runs hooks."""
     folder, name = os.path.split(os.path.abspath(path))
     try:

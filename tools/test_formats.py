@@ -759,7 +759,7 @@ def check_output():
         json.dump({"llm_archive.py": "2026-01-02 abc1234"}, fh)
     run = subprocess.run([sys.executable, "-I", os.path.join(kit, "llm_archive.py"), "--version"], capture_output=True, text=True)
     ok = run.returncode == 0 and "(2026-01-02 abc1234)" in run.stdout
-    expect("... in a kit, the build is read from the BUILD file beside the tools", ok, run.stdout + run.stderr)
+    expect("... in a portable copy, the build is read from the BUILD file beside the tools", ok, run.stdout + run.stderr)
     archive = os.path.join(root, "pack")
     st = os.path.join(root, "w.safetensors")
     os.makedirs(root)

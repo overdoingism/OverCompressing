@@ -6,7 +6,7 @@ command line (delta bases are chosen automatically); rebase, --base and the othe
 
     python -I llm_archive_gui.py [<folder> | <pack folder> | <file.oczip>]
 
-Run from an offline kit (<pack folder>/_kit/tools), it opens that pack. Its text is Unicode symbols where they say
+Run from a portable copy kept in a pack folder (<pack folder>/_kit/tools), it opens that pack. Its text is Unicode symbols where they say
 it, else English: nothing depends on the system's language.
 """
 
@@ -2303,8 +2303,8 @@ class App:
 
 
 def start_place():
-    """Where the list starts: the folder or pack given, else the pack this file is in when it runs from an offline
-    kit (<pack folder>/_kit/tools), else the current folder."""
+    """Where the list starts: the folder or pack given, else the pack this file is in when it runs from a portable copy
+    kept there as _kit (<pack folder>/_kit/tools), else the current folder."""
     if len(sys.argv) > 1:
         return place_from_text(sys.argv[1])
     kit = os.path.dirname(HERE)

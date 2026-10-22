@@ -21,16 +21,16 @@ byte-plane codec; nothing of ZipNN is left.
 | `tools/ARCHIVE_FORMAT.md` | the on-disk format, byte by byte (enough to restore by hand) |
 | `tools/test_ans16.py`, `tools/test_formats.py` | the test suites |
 | `tools/compare_tensors.py` | how a fine-tune lines up with a base |
-| `kit/` | offline kit: `build_kit.py`, install scripts, hash-locked requirements, keys, provenance |
+| `kit/` | the hash-locked requirements a portable copy is built from; the rest (`build_kit.py`, install scripts, keys, provenance) is the retired offline kit, kept for reference |
 | `docs/` | usage (English then Chinese, one file), principles, scope, benchmarks, build guides, protection |
 | `dev/` | experiments and measurement scripts |
-| `archive/` | local test pack folder with real Qwen models (gitignored); its `_kit/` is the built kit |
+| `archive/` | local test pack folder with real Qwen models (gitignored) |
 
 ## Concepts and terms
 
 Format version 4. The CLI (`llm_archive.py`) and the window each have a `VERSION` ("0.5"), raised by hand; their
-build is the date and commit each file was last changed in (`build_of`: the kit's `tools/BUILD`, written by
-`build_kit.py`, else `git log`/`rev-parse` only, nothing that runs hooks), ", edited" when the file differs. The window's
+build is the date and commit each file was last changed in (`build_of`: a portable copy's `tools/BUILD`, written by
+the build guide, else `git log`/`rev-parse` only, nothing that runs hooks), ", edited" when the file differs. The window's
 title shows both, separately (owner's wish: easier debugging); `--version` the CLI's; manifests' `tool` the CLI's. User-
 facing text uses these words:
 
@@ -66,6 +66,13 @@ facing text uses these words:
   `with_choice`): `--all` and naming the model leave such files; naming them with `--file` re-chooses. The window has
   ⇄ Rebase in the pack view (models) and the model view (files).
 - After a pack, `rebase_hint` names models that may store smaller against what came in (manifests only).
+- **No offline kit** (owner's decision, 2026-10-22: agents do the building anyway). Nothing is built or shipped with a
+  pack; `docs/build-windows.md` and `docs/build-linux.md` make a **portable copy** (python-build-standalone CPython
+  3.13.16 with numpy and zstandard from `kit/requirements-*.lock`, the tools, `tools/BUILD`, launchers), as exact,
+  checkable steps. The tool's `_kit/` handling stays, passive: a folder holding only `_kit` can become a pack, restore
+  never writes into it, export carries it, the window started from `_kit/tools` opens the pack. So a portable copy put
+  in a pack folder as `_kit` travels with the pack. `kit/build_kit.py` and the install scripts are retired: do not
+  revive them.
 
 ## Commands
 
@@ -220,19 +227,18 @@ data), only while the pack's stamp is as it was verified. No guided repair in th
 - Commit and push only when asked (the owner often says to hold commits while the window is being polished). Normal
   commits, no squashing unless asked. End commit messages with
   `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
-- Before a commit: run both suites, rebuild the kit, then commit and push:
+- Before a commit: run both suites, then commit and push:
 
 ```bash
 python -I tools/test_ans16.py
 python -I tools/test_formats.py <scratch_dir>
-python -I kit/build_kit.py archive/_kit.new --cache archive/_kit   # then replace archive/_kit with it
 ```
 
   `test_formats.py` takes several minutes (about 360 checks; on Windows two are skipped: a broken link, and the
   POSIX-only no-hard-link cases). Update both halves of `docs/usage.md` (English and Chinese) with any user-facing
   change, and `tools/ARCHIVE_FORMAT.md` with any format change.
-- Windows is tested here; Linux paths (atomic placing via `renameat2`, `SafeTree` dir fds, Tk 9.0 in the kit's Python)
-  are verified by the downstream team.
+- Windows is tested here; Linux paths (atomic placing via `renameat2`, `SafeTree` dir fds, Tk 9.0 in
+  python-build-standalone's Python, the Linux build guide) are verified by the downstream team.
 - Write patch scripts with the Write tool, not shell heredocs (backticks and quotes in docs break them).
 
 ## Open questions

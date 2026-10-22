@@ -1,4 +1,7 @@
-"""Assemble the offline restore kit (normally <pack_folder>/_kit) from this repository plus pinned third-party
+"""RETIRED (2026-10-22): the offline kit is no longer made; docs/build-windows.md and docs/build-linux.md make a portable
+copy instead, and kit/requirements-*.lock serve it. Kept for reference only.
+
+Assemble the offline restore kit (normally <pack_folder>/_kit) from this repository plus pinned third-party
 downloads. Every downloaded file is checked against the SHA-256 recorded below or in kit/requirements-*.lock.
 
     python -I kit/build_kit.py <out_dir> [--cache DIR]

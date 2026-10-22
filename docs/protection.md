@@ -15,7 +15,8 @@ compares common options and lists what matters for this kind of pack.
 2. **Regenerate repair data after every change.** `pack`, `remove` and `rebase` add, replace and delete blobs;
    recovery data made earlier now describes old contents. OverCompressing never deletes files it did not create, so
    remove or rebuild such data yourself. A pack file never changes: make its repair data once.
-3. **Protect `_kit/` too**, and keep a copy of it with every copy of the pack.
+3. **Keep the tool with the pack**: a portable copy in the pack folder as `_kit/` (see the build guides), protected
+   like the rest and kept with every copy of the pack.
 4. **Verify regularly and after every repair**: `python -I tools/llm_archive.py verify <pack>`.
 5. **When verify fails, read its damage report** (usage, section 4): it says which blobs are at fault, which files
    are lost because of them (their own blob, or one they are coded against), and what to do. Storing the original of
@@ -71,7 +72,8 @@ OverCompressing 只負責**偵測**損毀：每個儲存檔（blob）結尾都�
    base 的一個 blob 損毀，會連帶影響所有以它為基礎的模型，所以請給 pack 盡可能多的副本或冗餘。
 2. **每次變更後都要重建修復資料。** `pack`、`remove` 與 `rebase` 會新增、取代、刪除 blob，舊的修復資料描述的是舊內容。
    本工具不會刪除不是它建立的檔案，請自行移除或重建。pack 檔永遠不會改變：修復資料做一次就好。
-3. **`_kit/` 也要保護**，每一份 pack 副本都要附上它。
+3. **讓 pack 帶著工具**：把可攜版放在 pack 資料夾裡、命名為 `_kit/`（見建置頁面），和其他部分一樣保護，每一份 pack
+   副本都要附上它。
 4. **定期驗證，修復後也要驗證**：`python -I tools/llm_archive.py verify <pack>`。
 5. **verify 失敗時，請看它的損毀報告**（使用說明第 4 節）：它會說明哪些 blob 出了問題、哪些檔案因此遺失（自己的 blob 壞了，
    或它所依據的 blob 壞了），以及該怎麼處理。把檔案的原檔重新存進去（`pack … --add --file`），它和所有以它為基礎的檔案都會

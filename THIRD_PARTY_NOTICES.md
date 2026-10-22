@@ -1,17 +1,16 @@
 # Third-party notices
 
 OverCompressing itself is MIT-licensed (see [LICENSE](LICENSE)). It builds on the projects below. Nothing here is
-vendored into this repository; the offline kit (`kit/build_kit.py`) downloads the listed artifacts at pinned versions
-and SHA-256 hashes and ships them with their own license files.
+vendored into this repository; the build guides (`docs/build-*.md`) download the listed artifacts at pinned versions
+and SHA-256 hashes into a portable copy, with their own license files.
 
-## Shipped with OverCompressing (offline kit)
+## In a portable copy
 
 | Component | License | How it is used |
 |---|---|---|
-| [CPython](https://www.python.org/) 3.13.16 Windows installer | PSF-2.0 (+ bundled components' licenses, among them [zlib](https://zlib.net/), which the byte-plane codec uses through Python's `zlib` module) | Shipped unmodified in the kit for machines without Python 3.13. |
-| [python-build-standalone](https://github.com/astral-sh/python-build-standalone) 20261001 | MPL-2.0 (build system); the distribution contains CPython and libraries under their own licenses | Shipped unmodified in the kit (Linux). |
+| [python-build-standalone](https://github.com/astral-sh/python-build-standalone) 20261001: [CPython](https://www.python.org/) 3.13.16 for Windows and Linux | MPL-2.0 (build system); CPython PSF-2.0, with its bundled components' licenses, among them [zlib](https://zlib.net/) (which the byte-plane codec uses through Python's `zlib` module) and Tcl/Tk (the window) | Unmodified, as the copy's Python. |
 
-## Python runtime dependencies (installed from wheels, shipped in the kit)
+## Python runtime dependencies (installed from wheels into a portable copy)
 
 | Package | Version | License |
 |---|---|---|

@@ -10,11 +10,11 @@
 
 Model weights hardly compress with zip or zstd, and quantizing them loses information. OverCompressing keeps the
 original files exactly, compresses each tensor with a codec suited to it, and stores fine-tunes as deltas against
-their base model. An offline kit (Python, wheels, tools, docs) is stored in the pack folder so it can be restored
-without internet access.
+their base model. A portable copy of the tool (its own Python, packages and docs, in one folder) can travel with each
+pack, so it can be restored without internet access.
 
 模型權重用 zip、zstd 幾乎壓不動，量化又會失真。OverCompressing 完整保留原檔，對每個 tensor 用最合適的方式壓縮，
-並把微調模型存成「和 base 的差異」。歸檔旁附有離線工具包（Python、套件、工具、文件），沒有網路也能還原。
+並把微調模型存成「和 base 的差異」。可攜版工具（自帶 Python、套件與文件的單一資料夾）可以跟著 pack 一起保存，沒有網路也能還原。
 
 ---
 
@@ -96,8 +96,8 @@ Two forms of a pack / pack 的兩種形態:
 | Windows 10/11 x64 | **[docs/build-windows.md](docs/build-windows.md)** (中英對照) |
 | Linux x86-64 | **[docs/build-linux.md](docs/build-linux.md)** (中英對照) |
 
-Needs CPython 3.13 with numpy and zstandard, both available as prebuilt wheels: no compiler on any platform.
-`kit/build_kit.py` assembles the offline kit from pinned, hash-checked downloads.
+Each guide makes a portable copy: one folder with its own CPython 3.13, numpy and zstandard (pinned, hash-checked
+downloads) and the tools. Nothing is installed and no compiler is needed; agents can follow the steps as written.
 
 ## Protecting the archive / 防護與修復
 
@@ -118,7 +118,7 @@ tools/llm_archive_gui.py   a small window (Tkinter): a pack as the list of its m
 tools/ARCHIVE_FORMAT.md    format specification
 tools/compare_tensors.py   how well a fine-tune lines up with a base
 tools/test_*.py            self-tests (ans16 coder, formats, conversions)
-kit/                       offline kit: install scripts, pinned locks, keys, build_kit.py
+kit/                       hash-locked requirements for the portable copy (and the retired offline kit's scripts)
 docs/                      principles, scope, benchmarks, usage, build guides, protection advice
 dev/                       experiments and measurement scripts used during development
 ```
