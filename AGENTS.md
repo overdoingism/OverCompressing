@@ -63,7 +63,8 @@ python -I tools/test_formats.py <scratch_dir>   # several minutes, about 360 che
   for people; programs, the window included, decide by the code. A command line that does not parse exits 2.
 - A user-facing change goes into both halves of `docs/usage.md` (English and Chinese).
 - Versions are pinned (python-build-standalone in the build guides, numpy and zstandard in the lock files) and bumped
-  on purpose: new hashes, the Windows guide followed as written, both suites run. Bump soon when a security fix touches
+  on purpose: new hashes, the Windows guide followed as written, both suites run; the Linux guide's glibc minimum is
+  the highest the pinned wheels' manylinux tags ask for (numpy 2.5.4: 2.27). Bump soon when a security fix touches
   what the tool exposes to outside data (zlib, libzstd, `zipfile`, `json`, `hashlib`, numpy, Tk); skip releases
   younger than two weeks.
 

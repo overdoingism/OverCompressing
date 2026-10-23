@@ -56,7 +56,7 @@ Not supported yet:
 | item | value |
 |---|---|
 | Python | CPython 3.13, x86-64 (a portable copy brings its own: see the build guides), with numpy and zstandard: prebuilt wheels, no compiler |
-| OS | Windows 10/11 (tested end to end); Linux glibc x86-64 (build guide provided; checked by a downstream team) |
+| OS | Windows 10/11 (tested end to end); Linux x86-64 with glibc 2.27 or later, what the pinned numpy wheel needs (build guide provided; checked by a downstream team) |
 | RAM | ≈ 12 GB committed at peak for a 7B delta with 16 ans16 worker processes, ≈ 2.5 GB without deltas; `OC_WORKERS` lowers it |
 | temporary disk | the base files a delta reads are restored to `OC_TMP` (default: system temp), e.g. one 3.7 GB shard per 7B shard; `rebase` also restores the file it re-packs there |
 | speed (8 cores) | pack 7B base ≈ 1.5 min, 7B Instruct delta ≈ 5.5 min; restore 7B base ≈ 30 s, 7B Instruct ≈ 2.7 min |

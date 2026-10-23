@@ -14,7 +14,7 @@ an agent can carry it out and verify each step.
 
 | item | why |
 |---|---|
-| Linux x86-64 with glibc 2.17 or later | what python-build-standalone runs on |
+| Linux x86-64 with glibc 2.27 or later | what the pinned numpy wheel needs (the Python itself needs 2.17) |
 | bash, git, curl, tar, sha256sum | get the code and the downloads, and check them |
 | for the window: an X11 desktop (or XWayland) | tkinter comes with the Python and draws through the system's X libraries |
 | internet access, once | the Python and two wheels are downloaded |
@@ -116,7 +116,7 @@ SHA-256 可核對的指令，交給 AI 代理照做時，每一步都能驗證�
 
 | 項目 | 用途 |
 |---|---|
-| Linux x86-64，glibc 2.17 以後 | python-build-standalone 的執行條件 |
+| Linux x86-64，glibc 2.27 以後 | 鎖定版本的 numpy wheel 所需（Python 本身只需 2.17） |
 | bash、git、curl、tar、sha256sum | 取得原始碼與下載檔，並加以核對 |
 | 使用圖形介面時：X11 桌面（或 XWayland） | tkinter 隨 Python 附帶，透過系統的 X 函式庫繪圖 |
 | 網路（只需一次） | 下載 Python 與兩個 wheel |
