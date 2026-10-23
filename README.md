@@ -81,21 +81,23 @@ Prefer a window? See [below](#the-window--視窗). Just one model in one file? `
 Qwen2.5-0.5B.oczip`. Every command can report progress and print JSON lines (`--progress`, `--json`), for scripts and
 agents.
 
-Two forms of a pack / pack 的兩種形態:
+Two forms of a pack:
 
 - **Pack folder (`ocpack.json`, `models/`, `blobs/`): for upkeep.** Add, re-pack, remove, rename or rebase models one
   change at a time.
-  **pack 資料夾：便於高效能維護。** 逐一新增、重新打包、移除、改名或 rebase 模型。
 - **Pack file (`.oczip`, the same tree in one ZIP file): for cold storage.** Made by `pack` or `export`, written once;
   copy it, shelve it. `list`, `verify` and `restore` read it as it is.
-  **pack 檔：便於冷儲存管理。** 由 `pack` 或 `export` 一次寫成；方便複製、離線保存；`list`、`verify` 與 `restore` 可直接讀取。
 
-→ **[Usage / 使用方式（中英對照）](docs/usage.md)**
+→ **[Usage](docs/usage.md)** (中英對照)
 
 ## The window / 視窗
 
 A small window (Tkinter) does most of what the commands do: browse folders and packs, pack, extract, verify, remove,
-rename, rebase, save a pack file. What it needs to start:
+rename, rebase, save a pack file.
+
+![The window: a pack folder listed as its models, what each needs, and the log of a command it ran](img/TheGUI.jpg)
+
+What it needs to start:
 
 - **A portable copy** (see Build) has everything: start `OverCompressing.cmd` on Windows (double-click it) or
   `./overcompressing` on Linux.
@@ -106,11 +108,6 @@ rename, rebase, save a pack file. What it needs to start:
 - **On Linux**, a graphical desktop (X11, or Wayland with XWayland). Over SSH, use `ssh -X`, or the command line.
 
 How to use it: [usage, "A window instead of commands"](docs/usage.md#a-window-instead-of-commands).
-
-視窗（Tkinter）能做大部分指令的事。啟動所需：**可攜版**什麼都備齊了，Windows 雙擊 `OverCompressing.cmd`、Linux 執行
-`./overcompressing` 即可；**自備的 Python 3.13**（裝有 numpy 與 zstandard）執行 `python -I tools/llm_archive_gui.py`，
-需要 tkinter（python.org 的 Windows 版已內含；Linux 發行版的 Python 可能要另裝 Tk 套件，例如 `python3-tk`）；**Linux**
-需要圖形桌面（X11，或 Wayland 的 XWayland），透過 SSH 時請用 `ssh -X` 或改用命令列。用法見[使用方式](docs/usage.md#圖形介面)。
 
 ## Build / 建置
 
@@ -145,6 +142,7 @@ requirements.txt           numpy and zstandard, for your own Python
 requirements-*.lock        the same, pinned and hash-checked: what the build guides install
 docs/                      principles, scope, benchmarks, usage, build guides, protection advice
 dev/                       experiments and measurement scripts used during development
+OCUI2/                     a second window, on the Godot engine (C#): its sources (see OCUI2 below)
 ```
 
 ## References / 參考文獻
@@ -168,6 +166,33 @@ This program was developed by Claude and verified by GPT6, which tested every ch
 security and window tests, mainly on Linux) and reported back.
 
 本程式由 Claude 開發，由 GPT6 驗證：每次修改都由 GPT6 獨立測試（功能、安全與視窗測試，主要在 Linux 上）並回報結果。
+
+## OCUI2 / 第二視窗
+
+A second window for the same tool, built on a game engine (Godot 4.7, C#): a live circuit board behind the panels,
+neon glow, a graph of what needs what, synthesized sounds. An archiver needs none of this; the author was clearly out
+of their mind. It does what the window above does, with the same words, and runs the same `tools/llm_archive.py`
+underneath. Windows 10/11 x64.
+
+![OCUI2: the same pack as a graph of what needs what, the selected model beside it](img/TheGUI2.jpg)
+
+It needs the archiver with its Python (a checkout with `.venv`, or a portable copy: see Build); put the window in
+`OCUI2\dist\` of the checkout and it finds the tool by itself, or point ⚙ Settings at it. Two ways to get it:
+
+- **Build it yourself (recommended).** Ask your AI assistant to build it by [OCUI2/AGENTS.md](OCUI2/AGENTS.md), or do
+  it by hand: install the .NET SDK 8 or later, then, in `OCUI2\`:
+
+  ```powershell
+  powershell -ExecutionPolicy Bypass -File engine\get_engine.ps1   # the Godot engine, once (checked against its SHA-512 sums)
+  powershell -ExecutionPolicy Bypass -File build.ps1               # dist\OverCompressingUI.exe and the release zip
+  ```
+
+- **Or download the built window**: `OverCompressingUI-<version>-win64.zip` from
+  [Releases](https://github.com/overdoingism/OverCompressing/releases); unzip it anywhere. **At your own risk:** the
+  exe is not signed and Windows may warn about it; you are the one who decides to trust a downloaded program.
+  Building it yourself means running only what you can read.
+
+More: [OCUI2/README.md](OCUI2/README.md).
 
 ## License / 授權
 
