@@ -5,6 +5,7 @@
 > - 浮點 tensor 用本工具自己的位元平面編碼（NumPy + zlib + zstd），壓縮率比原本使用的 ZipNN 還小 0.1–0.9 個百分點。
 > - 同家族 delta：官方 Instruct 對 Base 為 **44%（0.5B）/ 30%（7B）**；社群輕度微調可到 **0.1–5%**；F16 GGUF 對 BF16 base、詞彙表擴充的模型也能共用。
 > - Qwen2.5 測試歸檔：6 個 repo 共 34.3 GiB → **17.2 GiB（50.1%）**。
+> - FP8 的 MoE 微調（ThinkingCap 對 Qwen3.8-Flash-Next-FP8）：微調沒有動 routed experts，FP8 部分以 XOR 存成幾乎 0；實測一個 6.7 GiB 的 shard 存成 **0.27%**，整個 185.5 GB 模型估計約 1 GB。
 > - base 自動挑選：社群微調模型全部選到與手動相同的 base，每個檔案約 1–10 秒。
 > - 每一筆數字都經過「從磁碟解回、SHA-256 一致」的驗證。
 > - 速度（8 核 16 緒）：pack 7B 約 97 秒、restore 約 31 秒、verify 7B 加 Instruct 約 155 秒；delta 的速度取決於 ans16，它本身已用滿所有核心。
@@ -74,6 +75,29 @@ times are below.
 | same Instruct, re-sharded into 2 files, tensor order reversed (synthetic)\* | layout change | Base | — | 44.2 % (identical to the original) |
 
 \* measured with tool version 3; ans16 deltas did not change in version 4.
+
+## An FP8 fine-tune of a MoE model (Qwen3.8-Flash-Next)
+
+bottlecapai/ThinkingCap-Qwen3.8-Flash-Next-FP8 (revision `ca9f7a5c`) against Qwen/Qwen3.8-Flash-Next-FP8 (`236dfdf2`):
+the fine-tune's last shard (layers 8–9, the embeddings and `lm_head`; 6.71 GiB) and the five base shards its tensors
+match (7.23 GiB), measured 2026-10-24 on the same machine. The by-dtype figures are from `dev/blob_stats.py`.
+
+| | original | stored |
+|---|---|---|
+| base, 5 shards | 7.23 GiB | 76.5 % (F8_E4M3 81.9 %, BF16 66.4 %) |
+| fine-tune shard, standalone | 6.71 GiB | 76.1 % |
+| fine-tune shard, as a delta | 6.71 GiB | **0.27 %** (18.3 MiB) |
+| … its F8_E4M3 routed experts, XOR delta | 4.17 GiB | 0.2 MiB: bit-identical to the base |
+| … its BF16 tensors, ans16 delta | 2.54 GiB | 0.67 % |
+
+Times: pack the base 50 s; the fine-tune shard as a delta 109 s (standalone 41 s); verify both 46 s; restore the
+fine-tune shard 48 s.
+
+The fine-tune left the routed experts as the official FP8 release has them: a 64 KiB slice of one routed expert per
+layer, read from both repositories, was identical in all 48 layers, while the BF16 attention (36 of 48 layers) and the
+shared experts (all 48) differ. So the FP8 part of such a fine-tune needs nothing beyond XOR, and its changes take the
+ans16 path. For the whole 185.5 GB model this suggests about 1 GB stored as a delta (an estimate: at most its 11 GB of
+BF16 tensors change, coded at about 10 % as in layers 8–9).
 
 ## Automatic base selection
 
