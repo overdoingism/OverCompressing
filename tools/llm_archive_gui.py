@@ -2271,7 +2271,14 @@ class App:
         if self.quit_after:
             self.root.destroy()
             return
-        self.refresh()  # also turns the buttons back on
+        gone = self.place.path if self.place.path and not os.path.exists(self.place.path) else None
+        if gone:  # the job took the place shown (export --delete of every model: the pack folder), so it is not
+            # listed again, which would say it cannot be (found by GPT6): its nearest parent instead
+            while not os.path.isdir(gone) and os.path.dirname(gone) != gone:
+                gone = os.path.dirname(gone)
+            self.go(Place(gone, pack=is_pack(gone)))
+        else:
+            self.refresh()  # also turns the buttons back on
         if ok:
             self.done()
 
