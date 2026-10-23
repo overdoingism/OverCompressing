@@ -32,6 +32,14 @@ pack, so it can be restored without internet access.
 All results are verified by decoding from disk and matching the original SHA-256 (for these tests, also the
 hashes Hugging Face publishes).
 
+![A pack of 11 models as a graph: arrows from each base to the models stored as deltas against it, each circle the share of its own size a model takes](img/graph.jpg)
+
+A real pack, 11 models: 60.4 GiB of files in 37.9 GiB (drawn by [OCUI2](#ocui2--第二視窗)). Each arrow runs from a
+base to a model stored as a delta against it; each circle is what that model takes, as a share of its own size.
+Qwen2.5-0.5B-Instruct (selected) reads 99 % of Qwen2.5-0.5B and takes 44.0 % (953.3 MiB → 419.5 MiB); three community
+fine-tunes are stored against it in turn, at 0.4 – 5.3 %. A quantized GGUF with no relative in the pack
+(granite-4.2-30b-GGUF) stands on its own and barely shrinks (99.6 %).
+
 → **[Benchmarks](docs/benchmarks.md)**
 
 ## How it works / 原理
