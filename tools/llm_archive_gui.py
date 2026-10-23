@@ -84,10 +84,10 @@ BUTTONS = {  # the buttons (and right-click menu) of each view, in order; None: 
     "pack": ("pack_in", "save", None, "extract", "verify", None, "rebase", None, "remove", "rename"),
     "model": ("add_file", None, "extract", "verify", None, "rebase", None, "remove", "rename"),
 }
-WATCH_SECONDS = 5
+WATCH_SECONDS = 5  # the place is looked at (one file's time stamp) at most this often
 WRAP = 460  # pixels (at 100%): the width of a dialog's text
 ARGS_LIMIT = 8000  # characters: past it, models and files go in list files (--models-from, --files-from); Windows: 32,767
-BELOW = "\0below"  # a drag begun under the last row of the list  # the place is looked at (one file's time stamp) at most this often
+BELOW = "\0below"  # a drag begun under the last row of the list
 
 TEXT = {  # all of the window's text: symbols (Unicode BMP, which every Tk renders) where they say it, else English
     "up": "↑",
