@@ -20,6 +20,7 @@ coder in NumPy, or XOR). Python 3.13 with NumPy and zstandard only: no compiled 
 | `requirements.txt`, `requirements-*.lock` | numpy and zstandard; pinned and hash-checked per platform for the portable copy |
 | `docs/` | usage (English, then Chinese), principles, scope, benchmarks, build guides, protection |
 | `dev/` | experiments and measurement scripts |
+| `OCUI2/` | a second window, on the Godot engine (C#), kept on its own: its rules are in `OCUI2/AGENTS.md`; work there never changes `tools/` or `docs/`, and what it finds about the tool goes into `OCUI2/docs/original-project-notes.md` |
 
 Terms: a **pack** holds models, as a **pack folder** (`ocpack.json`, `models/`, `blobs/`; for upkeep) or a **pack
 file** (`.oczip`, the same tree in one ZIP; written once, read in place). A **blob** is one stored file, named by the

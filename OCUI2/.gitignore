@@ -1,0 +1,17 @@
+# Engine binaries and export templates (downloaded by engine/get_engine.ps1; the scripts themselves stay)
+engine/download/
+engine/godot/
+engine/templates/
+
+# Godot and .NET build output
+OverCompressingUI/.godot/
+OverCompressingUI/bin/
+OverCompressingUI/obj/
+OverCompressingUI/.mono/
+OverCompressingUI/*.user
+build/
+dist/
+
+# Local test packs (large model data) and scratch
+.testpacks/
+tmp/
