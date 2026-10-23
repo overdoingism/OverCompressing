@@ -373,12 +373,13 @@ def human(n):
 SAFETENSORS_MAX_HEADER = 100 << 20  # the format's own limit
 
 
-def safetensors_layout(path):
+def safetensors_layout(path, size=None):
     """(header_bytes_len, {name: (dtype, shape, offsets)}) or None if not a well-formed safetensors file: header
     within the format's size limit and the file, a JSON object of tensors with a string dtype, a shape of
-    non-negative integers and offsets inside the data (overlaps are caught later, by tensor_regions)."""
+    non-negative integers and offsets inside the data (overlaps are caught later, by tensor_regions). size: the
+    file's, if known (dev/coverage.py describes a file by its first bytes)."""
     try:
-        size = os.path.getsize(path)
+        size = os.path.getsize(path) if size is None else size
         with open(path, "rb") as f:
             n = struct.unpack("<Q", f.read(8))[0]
             if n > min(SAFETENSORS_MAX_HEADER, size - 8):
@@ -738,7 +739,7 @@ def file_tensors(path, size):
             else:
                 return "gguf", tensors
     if path.endswith(".safetensors") or head[8:9] == b"{":  # by its content too: ComfyUI's .sft, or any other name
-        layout = safetensors_layout(path)
+        layout = safetensors_layout(path, size)
         if layout:
             data_start, items = layout
             return "safetensors", [[name, dtype, data_start + s, data_start + e, list(shape)] for name, (dtype, shape, (s, e)) in items.items()]
