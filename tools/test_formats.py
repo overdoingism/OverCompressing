@@ -4,9 +4,11 @@ files) built, changed, damaged and misused through the command line.
 Usage: python -I test_formats.py <scratch_dir>
 """
 
+import errno
 import json
 import math
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -14,6 +16,7 @@ import sys
 import threading
 import time
 import tracemalloc
+import types
 import zipfile
 import zlib
 
@@ -22,6 +25,7 @@ import numpy as np  # noqa: E402
 import zstandard  # noqa: E402
 
 import llm_archive as la  # noqa: E402
+from fractions import Fraction  # noqa: E402
 
 rng = np.random.default_rng(7)
 scratch = os.path.abspath(sys.argv[1]) if __name__ == "__main__" else None
@@ -662,6 +666,649 @@ def check_damage():
            "" if code == 0 else out[-300:])
 
 
+def write_gguf(path, tensors):
+    """A GGUF v3 file without metadata: {name: (ggml type, shape outermost first, bytes)}."""
+    infos, blobs, off = [], [], 0
+    for name, (kind, shape, blob) in tensors.items():
+        key = name.encode()
+        infos.append(struct.pack("<Q", len(key)) + key + struct.pack("<I", len(shape)) + b"".join(struct.pack("<Q", d) for d in reversed(shape)) + struct.pack("<IQ", kind, off))
+        padded = blob + bytes(-len(blob) % 32)
+        blobs.append(padded)
+        off += len(padded)
+    head = b"GGUF" + struct.pack("<IQQ", 3, len(tensors), 0) + b"".join(infos)
+    with open(path, "wb") as f:
+        f.write(head + bytes(-len(head) % 32) + b"".join(blobs))
+
+
+def check_cross_format():
+    """A tensor is found by its bytes in a base file of another format, whatever its name, in either direction and
+    across float dtypes; among tensors of one shape it is the right one; what is not like it, or quantized, is not."""
+    print("bases in another format")
+    root = os.path.join(scratch, "cross")
+    shutil.rmtree(root, ignore_errors=True)
+    os.makedirs(root)
+    rows, cols, layers = 200, 1000, 4
+    weights = {}
+    for i in range(layers):
+        for part in ("q", "k", "v"):
+            weights[i, part] = (rng.standard_normal(rows * cols) * 0.02).astype(np.float32)
+    head = (rng.standard_normal(5000 * 64) * 0.02).astype(np.float32)
+
+    def as_safetensors(path):
+        tensors = {f"model.layers.{i}.self_attn.{part}_proj.weight": ("BF16", [rows, cols], bf(w)) for (i, part), w in weights.items()}
+        tensors["lm_head.weight"] = ("BF16", [5000, 64], bf(head))
+        write_safetensors(path, tensors)
+
+    def as_gguf(path, kind=30, shift=None):
+        def code(w):
+            w = w if shift is None else w + (rng.standard_normal(w.size) * shift).astype(np.float32)
+            return bf(w) if kind == 30 else w.astype(np.float16).tobytes()
+        tensors = {"output.weight": (kind, [5000, 64], code(head))}
+        for (i, part), w in reversed(list(weights.items())):
+            tensors[f"blk.{i}.attn_{part}.weight"] = (kind, [rows, cols], code(w))
+        write_gguf(path, tensors)
+
+    def folder(name, make, file, *args, **options):
+        where = os.path.join(root, name)
+        os.makedirs(where)
+        make(os.path.join(where, file), *args, **options)
+        return where
+
+    def stored(archive, name):
+        la.forget_cached_reads()
+        p = la.open_pack(archive)
+        try:
+            manifest = models(archive)[name]
+            sha = manifest["files"][0]["sha256"]
+            size = manifest["files"][0]["size"]
+            return p.blob_span(sha)[2] / size, [b.get("model") for b in la.blob_header(p, sha)["bases"]]
+        finally:
+            la.forget_cached_reads()
+
+    st = folder("st", as_safetensors, "model.safetensors")
+    same = folder("gguf", as_gguf, "m.bf16.gguf")
+    f16 = folder("f16", as_gguf, "m.f16.gguf", 1)
+    tuned = folder("tuned", as_gguf, "tuned.gguf", 30, 1e-4)
+    other = os.path.join(root, "other")
+    os.makedirs(other)
+    write_gguf(os.path.join(other, "other.gguf"), {f"blk.{i}.attn_{part}.weight": (30, [rows, cols], bf((rng.standard_normal(rows * cols) * 0.02).astype(np.float32))) for (i, part) in weights})
+    quant = os.path.join(root, "quant")
+    os.makedirs(quant)
+    write_gguf(os.path.join(quant, "q.gguf"), {f"blk.{i}.attn_{part}.weight": (8, [rows, cols], rng.integers(0, 256, rows * cols // 32 * 34, dtype=np.uint8).tobytes()) for (i, part) in weights})
+
+    archive = os.path.join(root, "pack")
+    for source, name in ((st, "t/st"), (same, "t/gguf"), (f16, "t/f16"), (tuned, "t/tuned"), (other, "t/other"), (quant, "t/quant")):
+        code, out = pack(source, archive, name)
+        expect(f"{name} is packed", code == 0, out[-300:])
+    share, bases = stored(archive, "t/gguf")
+    expect(f"a GGUF of the same weights is coded against the safetensors: {share:.3%}", share < 0.01 and bases == ["t/st"], str(bases))
+    share, bases = stored(archive, "t/f16")
+    expect(f"an F16 GGUF of them is coded against a file holding them: {share:.2%}", share < 0.45 and bases, str(bases))
+    share, bases = stored(archive, "t/tuned")
+    expect(f"a GGUF fine-tune is coded against one: {share:.1%}", share < 0.45 and bases, str(bases))
+    share, bases = stored(archive, "t/other")
+    expect(f"unrelated weights of the same shapes are stored without a base: {share:.1%}", not bases, str(bases))
+    share, bases = stored(archive, "t/quant")
+    expect("quantized tensors do not look for a base in another format", not bases, str(bases))
+    code, out = tool("verify", archive)
+    expect("the pack verifies", code == 0, out[-300:])
+    for name, source, file in (("t/gguf", same, "m.bf16.gguf"), ("t/f16", f16, "m.f16.gguf")):
+        dest = os.path.join(root, "out_" + name[2:])
+        code, out = tool("restore", archive, name, dest)
+        with open(os.path.join(dest, file), "rb") as a, open(os.path.join(source, file), "rb") as b:
+            expect(f"{name} restores bit for bit", code == 0 and a.read() == b.read(), out[-300:])
+
+    archive2 = os.path.join(root, "pack2")
+    code, out = pack(same, archive2, "t/gguf")
+    code2, out2 = pack(st, archive2, "t/st")
+    share, bases = stored(archive2, "t/st")
+    expect(f"the other way round, safetensors against a GGUF: {share:.3%}", code == 0 == code2 and share < 0.01 and bases == ["t/gguf"], out2[-300:])
+
+    archive3 = os.path.join(root, "pack3")
+    pack(same, archive3, "t/gguf", "--no-base")
+    pack(st, archive3, "t/st", "--no-base")
+    code, out = tool("rebase", archive3, "t/gguf")
+    share, bases = stored(archive3, "t/gguf")
+    expect(f"rebase finds it too: {share:.3%}", code == 0 and share < 0.01 and bases == ["t/st"], out[-300:])
+    code, out = tool("verify", archive3)
+    expect("and that pack verifies", code == 0, out[-300:])
+
+    zipped = os.path.join(root, "two.oczip")
+    code, out = tool("pack", st, same, zipped)
+    code2, out2 = tool("verify", zipped)
+    expect("a new pack file does it too, and verifies", code == 0 == code2 and os.path.getsize(zipped) < 0.75 * sum(os.path.getsize(os.path.join(d, n)) for d, n in ((st, "model.safetensors"),)), (out + out2)[-300:])
+    shutil.rmtree(root, ignore_errors=True)
+
+
+QUANT_TYPES = {"Q8_0": (8, "ggml_type_8"), "Q4_K": (12, "ggml_type_12"), "Q5_K": (13, "ggml_type_13"), "Q6_K": (14, "ggml_type_14")}
+
+
+def weights_for_quant(blocks, width):
+    """Float32 weights with what quantizing meets: ordinary values, all-zero blocks, subnormals, large values."""
+    x = (rng.standard_normal((blocks, width)) * 0.02).astype(np.float32)
+    x[::17] = 0
+    x[1::19] = x[1::19] * np.float32(1e-40)
+    x[2::23] = x[2::23] * np.float32(1e6)
+    return x
+
+
+def quantize(x, dtype, miss=0.0):
+    """The bytes of a tensor quantized from x as a quantizer would, with some values off (a quantizer's own rounding)."""
+    width, size = la.QUANT_BLOCKS[dtype]
+    amax = np.abs(x).max(axis=1)
+    half = lambda v: np.frombuffer(v.astype(np.float16).tobytes(), np.uint8).reshape(-1, 2)  # noqa: E731
+    if dtype == la.Q8_0:
+        side = np.zeros((len(x), 2), np.uint8)
+    elif dtype == la.Q6_K:
+        side = np.concatenate([np.full((len(x), 16), 100, np.uint8), half(amax / np.float32(31 * 100))], axis=1)
+    else:  # every sub-block's scale 60 and minimum 63, in the packing of six bits each, so that the steps span the block
+        top = 15 if dtype == la.Q4_K else 31
+        packed = np.tile(np.array([0xFC, 0xFC, 0xFC, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC, 0xFC, 0xFC, 0xFC], np.uint8), (len(x), 1))
+        side = np.concatenate([half(amax * np.float32(2) / np.float32(top * 60)), half(amax / np.float32(63)), packed], axis=1)
+    q, guessed = la.quant_predict(x, side, dtype)
+    if guessed is not None:
+        side = guessed
+    if miss:
+        q = q.copy()
+        hit = rng.random(q.shape) < miss
+        q[hit] = (q[hit] + 1) & (0xFF if dtype == la.Q8_0 else {la.Q4_K: 15, la.Q5_K: 31, la.Q6_K: 63}[dtype])
+    return bytes(la.quant_join(q, side, dtype))
+
+
+def in_process(*argv):
+    """(exit code, last error event's code, stdout) of the tool run in this process, whose functions a test has replaced."""
+    import contextlib
+    import io
+    saved, out = sys.argv, io.StringIO()
+    sys.argv = ["llm_archive.py", *map(str, argv), "--json"]
+    code = 0
+    try:
+        with contextlib.redirect_stdout(out):
+            la.main()
+    except SystemExit as e:
+        code = e.code if isinstance(e.code, int) else 1
+    finally:
+        sys.argv = saved
+        la.forget_cached_reads()
+        la._INEXACT["accept"] = False
+        la.JSON_OUT = False
+    lines = [json.loads(line) for line in out.getvalue().splitlines() if line.startswith("{")]
+    errors = [e.get("code") for e in lines if e.get("event") == "error"]
+    return code, errors[-1] if errors else None, out.getvalue()
+
+
+def check_quant():
+    """Quantized tensors rebuilt from a parent: the fast path against exact fractions on every type and parent, payloads
+    round trip and refuse damage, whole packs in every way a parent is found; and when a prediction does not hold, what
+    restore does at each step."""
+    print("quantized tensors from a parent")
+    bad = []
+    for name, dtype in (("Q8_0", la.Q8_0), ("Q4_K", la.Q4_K), ("Q5_K", la.Q5_K), ("Q6_K", la.Q6_K)):
+        width, size = la.QUANT_BLOCKS[dtype]
+        data = rng.integers(0, 256, 3 * size, dtype=np.uint8).tobytes()
+        if bytes(la.quant_join(*la.quant_split(data, dtype), dtype)) != data:
+            bad.append(name)
+    expect("every type's bytes split into values and side bytes and join back", not bad, str(bad))
+
+    wrong = []
+    blocks = 40
+    for dtype in la.QUANT_BLOCKS:
+        width = la.QUANT_BLOCKS[dtype][0]
+        x = weights_for_quant(blocks, width)
+        data = quantize(x, dtype, 0.01)
+        parents = {"BF16": bf(x.reshape(-1)), "F16": x.reshape(-1).astype(np.float16).tobytes(), "F32": x.reshape(-1).tobytes()}
+        for parent_dtype in la.QUANT_BLOCKS:
+            pw = la.QUANT_BLOCKS[parent_dtype][0]
+            if (blocks * width) % pw == 0:
+                parents[parent_dtype] = quantize(x.reshape(-1, pw), parent_dtype)
+        for parent_dtype, parent in parents.items():
+            fast = la.quant_parent_values(parent, parent_dtype).reshape(-1)
+            exact = la.exact_parent_values(parent, parent_dtype)
+            if any(Fraction(float(a)) != b for a, b in zip(fast, exact)):
+                wrong.append(f"parent {parent_dtype}")
+            q, side = la.quant_split(data, dtype)
+            predicted, guessed = la.quant_predict(fast.reshape(q.shape), side, dtype)
+            exact_q, exact_guess = la.quant_predict_exact(exact, side, dtype)
+            if not np.array_equal(predicted, exact_q) or (guessed is not None and not np.array_equal(guessed, exact_guess)):
+                wrong.append(f"{dtype} from {parent_dtype}")
+            payload = la.quant_encode(data, parent, dtype, parent_dtype)
+            for use_exact in (False, True):
+                if bytes(la.quant_decode(payload, len(data), parent, dtype, parent_dtype, use_exact)) != data:
+                    wrong.append(f"round trip {dtype} from {parent_dtype}, exact {use_exact}")
+    expect("the fast path gives what exact fractions give, on every type and parent, and both round trip", not wrong, ", ".join(wrong[:6]))
+
+    noise = rng.integers(0, 256, 40 * 34, dtype=np.uint8).tobytes()
+    odd = np.frombuffer(rng.integers(0, 256, 32 * 40 * 4, dtype=np.uint8).tobytes(), np.float32).copy()
+    parent = odd.tobytes()  # NaNs and infinities among them
+    payload = la.quant_encode(noise, parent, la.Q8_0, "F32")
+    expect("noise against a parent of any bits round trips", bytes(la.quant_decode(payload, len(noise), parent, la.Q8_0, "F32")) == noise
+           and bytes(la.quant_decode(payload, len(noise), parent, la.Q8_0, "F32", True)) == noise)
+    for what, broken in (("stream count", bytes([3]) + payload[1:]), ("truncated", payload[:-1]), ("one byte longer", payload + b"\0"), ("unknown coding", payload[:1] + bytes([9]) + payload[2:])):
+        try:
+            la.quant_decode(broken, len(noise), parent, la.Q8_0, "F32")
+            ok = False
+        except Exception:
+            ok = True
+        expect(f"a damaged quant payload ({what}) is refused", ok)
+    expect("this thread's arithmetic is what the fast path needs", not la.ieee_problem())
+
+    region = {"offset": 0, "length": 34, "kind": "quant", "dtype": la.Q8_0, "base_dtype": "BF16", "base": [0, 0]}
+    head = lambda r: {"original_size": r["length"], "sha256": "0" * 64, "regions": [r], "bases": [{"sha256": "1" * 64, "size": 1 << 20}]}  # noqa: E731
+    expect("a sound quant region passes the header check", la.container_header_problem(head(region)) is None)
+    for what, change in (("part of a block", {"length": 33}), ("an unknown type", {"dtype": "ggml_type_6"}), ("a parent of no known type", {"base_dtype": "I8"}), ("a list as its parent", {"base_dtype": ["BF16"]}), ("no parent type", {"base_dtype": None})):
+        expect(f"a quant region with {what} is refused", la.container_header_problem(head({**region, **change})) is not None)
+    expect("a quant region reading past its base is refused", la.container_header_problem(head({**region, "base": [0, (1 << 20) - 1]})) is not None)
+
+    root = os.path.join(scratch, "quant")
+    shutil.rmtree(root, ignore_errors=True)
+    os.makedirs(root)
+    rows, cols = 64, 1024
+    tensors = {f"blk.{i}.w.weight": (rng.standard_normal(rows * cols) * 0.02).astype(np.float32) for i in range(3)}
+
+    def folder(name, file, write):
+        where = os.path.join(root, name)
+        os.makedirs(where)
+        write(os.path.join(where, file))
+        return where
+
+    def as_type(path, kind, dtype, miss=0.005):
+        width = la.QUANT_BLOCKS[dtype][0]
+        write_gguf(path, {n: (kind, [rows, cols], quantize(w.reshape(-1, width), dtype, miss)) for n, w in tensors.items()})
+
+    float_gguf = folder("float", "m.bf16.gguf", lambda p: write_gguf(p, {n: (30, [rows, cols], bf(w)) for n, w in tensors.items()}))
+    safetensors = folder("st", "model.safetensors", lambda p: write_safetensors(p, {f"model.layers.{n.split('.')[1]}.q.weight": ("BF16", [rows, cols], bf(w)) for n, w in tensors.items()}))
+    made = {name: folder(name, f"m.{name}.gguf", lambda p, k=kind, d=dtype: as_type(p, k, d)) for name, (kind, dtype) in QUANT_TYPES.items()}
+
+    def blob(archive, model):
+        la.forget_cached_reads()
+        p = la.open_pack(archive)
+        try:
+            e = models(archive)[model]["files"][0]
+            info = la.blob_info(p, e["sha256"])
+            return info["stored"] / e["size"], info["method"], [b.get("model") for b in info["bases"]]
+        finally:
+            la.forget_cached_reads()
+
+    def same_file(a, b):
+        with open(a, "rb") as x, open(b, "rb") as y:
+            return x.read() == y.read()
+
+    archive = os.path.join(root, "by_name")
+    pack(float_gguf, archive, "t/float")
+    for name, source in made.items():
+        code, out = pack(source, archive, f"t/{name}")
+        share, method, bases = blob(archive, f"t/{name}")
+        expect(f"{name} is coded against the float GGUF: {share:.1%}", code == 0 and share < 0.5 and "quant" in method and bases == ["t/float"], out[-300:])
+    code, out = tool("verify", archive)
+    expect("that pack verifies", code == 0, out[-300:])
+    for name, source in made.items():
+        dest = os.path.join(root, "out_" + name)
+        code, out = tool("restore", archive, f"t/{name}", dest)
+        expect(f"{name} restores bit for bit", code == 0 and same_file(os.path.join(dest, f"m.{name}.gguf"), os.path.join(source, f"m.{name}.gguf")), out[-300:])
+
+    archive2 = os.path.join(root, "across")
+    pack(safetensors, archive2, "t/st")
+    code, out = pack(made["Q5_K"], archive2, "t/q5")
+    share, method, bases = blob(archive2, "t/q5")
+    expect(f"a quantized GGUF finds its parent in a safetensors file: {share:.1%}", code == 0 and share < 0.5 and "quant" in method and bases == ["t/st"], out[-300:])
+    code, out = tool("verify", archive2)
+    expect("that pack verifies", code == 0, out[-300:])
+
+    archive3 = os.path.join(root, "quantized_parent")
+    pack(made["Q8_0"], archive3, "t/q8")
+    code, out = pack(made["Q5_K"], archive3, "t/q5")
+    share, method, bases = blob(archive3, "t/q5")
+    expect(f"a quantized tensor can be the parent: {share:.1%}", code == 0 and share < 0.75 and "quant" in method and bases == ["t/q8"], out[-300:])
+    code, out = tool("verify", archive3)
+    expect("that pack verifies", code == 0, out[-300:])
+
+    archive4 = os.path.join(root, "xor")
+    pack(float_gguf, archive4, "t/float")
+    code, out = pack(made["Q5_K"], archive4, "t/q5", "--delta-codec", "xor")
+    expect("--delta-codec xor does not rebuild", code == 0 and "quant" not in blob(archive4, "t/q5")[1], out[-300:])
+    archive5 = os.path.join(root, "off")
+    pack(float_gguf, archive5, "t/float")
+    code, out = pack(made["Q5_K"], archive5, "t/q5", "--no-quant")
+    share, method, bases = blob(archive5, "t/q5")
+    expect("--no-quant stores it without its parent", code == 0 and "quant" not in method and not bases, out[-300:])
+    code, out = tool("rebase", archive5, "t/q5", "--no-quant")
+    expect("rebase --no-quant leaves it so", code == 0 and "quant" not in blob(archive5, "t/q5")[1], out[-300:])
+    code, out = tool("rebase", archive5, "t/q5")
+    share, method, bases = blob(archive5, "t/q5")
+    expect(f"without it, on by default, rebase then rebuilds it: {share:.1%}", code == 0 and "quant" in method and bases == ["t/float"], out[-300:])
+    code, out = tool("rebase", archive5, "t/q5", "--no-base")
+    share, method, bases = blob(archive5, "t/q5")
+    expect("rebase --no-base stores a rebuilt file without it again", code == 0 and "quant" not in method and not bases, out[-300:])
+    code, out = tool("verify", archive5)
+    expect("that pack verifies", code == 0, out[-300:])
+
+    zipped = os.path.join(root, "two.oczip")
+    code, out = tool("pack", float_gguf, made["Q4_K"], zipped)
+    code2, out2 = tool("verify", zipped)
+    expect("a new pack file does it too, and verifies", code == 0 == code2 and "quant" in out, (out + out2)[-300:])
+
+    print("  when a prediction does not hold")
+    name = "Q5_K"
+    file = f"m.{name}.gguf"
+    original = os.path.join(made[name], file)
+    fast, exact, problem = la.quant_predict, la.quant_predict_exact, la.ieee_problem
+    plain_note = f"{file}.not-exact.txt"
+    next_note = f"{file}.not-exact (1).txt"
+    noted = os.path.join(root, "noted")  # a model with a file of its own where a note would go
+    os.makedirs(noted)
+    shutil.copyfile(original, os.path.join(noted, file))
+    with open(os.path.join(noted, plain_note), "wb") as f:
+        f.write(b"the model's own file")
+    pack(noted, archive, "t/noted")
+    scattered = os.path.join(root, "scattered")  # the same, in folders: with --flat, two of them would share that name
+    for folder, source, name_there in (("a", original, file), ("b", os.path.join(noted, plain_note), plain_note), ("c", os.path.join(noted, plain_note), plain_note)):
+        os.makedirs(os.path.join(scattered, folder))
+        shutil.copyfile(source, os.path.join(scattered, folder, name_there))
+    pack(scattered, archive, "t/scattered")
+
+    def read(path):
+        with open(path, "rb") as f:
+            return f.read()
+
+    def is_note(path):
+        return os.path.isfile(path) and read(path).startswith(b"This file is NOT the original")
+
+    def beside(dest, content=b"the user's own note"):
+        os.makedirs(dest)
+        with open(os.path.join(dest, plain_note), "wb") as f:
+            f.write(content)
+        return os.path.join(dest, plain_note)
+
+    def off(predict):
+        def wrong_result(*args):
+            q, guess = predict(*args)
+            return (q ^ 1), guess
+        return wrong_result
+
+    try:
+        la.quant_predict = off(fast)
+        dest = os.path.join(root, "o1")
+        code, error, out = in_process("restore", archive, "t/Q5_K", dest)
+        expect("the fast path wrong: worked out again exactly, and restored", code == 0 and same_file(os.path.join(dest, file), original) and '"exact"' in out, out[-300:])
+        code, error, out = in_process("verify", archive, "t/Q5_K")
+        expect("verify gets through the same way", code == 0, out[-300:])
+        la.quant_predict = fast
+        calls = {"n": 0}
+
+        def wrong_once(*args):
+            calls["n"] += 1
+            q, guess = fast(*args)
+            return (q ^ 1 if calls["n"] == 1 else q), guess
+        la.quant_predict = wrong_once
+        dest = os.path.join(root, "o2")
+        code, error, out = in_process("restore", archive, "t/Q5_K", dest)
+        expect("wrong only once (a core that errs at times): the second try holds, no exact path", code == 0 and same_file(os.path.join(dest, file), original) and '"exact"' not in out, out[-300:])
+        la.quant_predict = fast
+        la.ieee_problem = lambda: True
+        dest = os.path.join(root, "o3")
+        code, error, out = in_process("restore", archive, "t/Q5_K", dest)
+        expect("arithmetic not as it should be: straight to the exact path", code == 0 and same_file(os.path.join(dest, file), original) and '"exact"' in out, out[-300:])
+        la.ieee_problem = problem
+
+        la.quant_predict, la.quant_predict_exact = off(fast), off(exact)
+        dest = os.path.join(root, "o4")
+        code, error, out = in_process("restore", archive, "t/Q5_K", dest)
+        expect("both wrong: nothing written, and the code says it is not damage", code != 0 and error == "inexact" and not os.path.exists(os.path.join(dest, file)), out[-300:])
+        code, error, out = in_process("verify", archive, "t/Q5_K")
+        expect("verify says the same, and that the blob at fault is intact", code != 0 and error == "inexact" and '"intact": true' in out and '"intact": false' not in out, out[-300:])
+        code, error, out = in_process("restore", archive, "t/Q5_K", dest, "--accept-inexact")
+        written = os.path.join(dest, file)
+        note = written + ".not-exact.txt"
+        sized = os.path.exists(written) and os.path.getsize(written) == os.path.getsize(original)
+        expect("--accept-inexact writes it all the same, with a note, and still ends with that code", code != 0 and error == "inexact" and sized and os.path.exists(note) and not same_file(written, original), out[-300:])
+        if sized:
+            with open(written, "rb") as a, open(original, "rb") as b:
+                x, y = np.frombuffer(a.read(), np.uint8), np.frombuffer(b.read(), np.uint8)
+            expect(f"and only the rebuilt values differ: {(x != y).mean():.1%} of its bytes", (x != y).any() and x[:64].tobytes() == y[:64].tobytes())
+
+        dest = os.path.join(root, "o6")
+        mine = beside(dest)
+        code, error, out = in_process("restore", archive, "t/Q5_K", dest, "--accept-inexact")
+        expect("a file already where the note goes is kept: the note takes the next name, and says so", error == "inexact" and read(mine) == b"the user's own note"
+               and is_note(os.path.join(dest, next_note)) and os.path.exists(os.path.join(dest, file)) and f'"note": "{next_note}"' in out and next_note in out, out[-300:])
+        code, error, out = in_process("restore", archive, "t/Q5_K", dest, "--accept-inexact", "--overwrite")
+        expect("--overwrite replaces it, as it does a file restored", error == "inexact" and is_note(mine) and f'"note": "{plain_note}"' in out, out[-300:])
+
+        dest = os.path.join(root, "o7")
+        os.makedirs(os.path.join(dest, plain_note, "inside"))
+        code, error, out = in_process("restore", archive, "t/Q5_K", dest, "--accept-inexact", "--overwrite")
+        expect("a folder where the note goes stays, --overwrite or not", error == "inexact" and os.path.isdir(os.path.join(dest, plain_note, "inside")) and is_note(os.path.join(dest, next_note)), out[-300:])
+
+        dest = os.path.join(root, "o8")
+        os.makedirs(dest)
+        outside = os.path.join(root, "outside.txt")
+        with open(outside, "wb") as f:
+            f.write(b"outside")
+        try:
+            os.symlink(outside, os.path.join(dest, plain_note))
+        except OSError:
+            print("  skip a link where the note goes (no symlinks here)")
+        else:
+            code, error, out = in_process("restore", archive, "t/Q5_K", dest, "--accept-inexact", "--overwrite")
+            expect("a link where the note goes is neither followed nor replaced", error == "inexact" and os.path.islink(os.path.join(dest, plain_note)) and read(outside) == b"outside" and is_note(os.path.join(dest, next_note)), out[-300:])
+
+        dest = os.path.join(root, "o9")
+        code, error, out = in_process("restore", archive, "t/noted", dest, "--accept-inexact")
+        expect("the model's own file of that name is restored, and the note takes the next name", error == "inexact" and read(os.path.join(dest, plain_note)) == b"the model's own file" and is_note(os.path.join(dest, next_note)), out[-300:])
+        dest = os.path.join(root, "o10")
+        code, error, out = in_process("restore", archive, "t/noted", dest, "--accept-inexact", "--file", file)
+        expect("also when only the other file is restored: that place stays free for it", error == "inexact" and not os.path.exists(os.path.join(dest, plain_note)) and is_note(os.path.join(dest, next_note)), out[-300:])
+        dest = os.path.join(root, "o10f")
+        code, error, out = in_process("restore", archive, "t/noted", dest, "--accept-inexact", "--flat", "--file", file)
+        expect("and with --flat", error == "inexact" and not os.path.exists(os.path.join(dest, plain_note)) and is_note(os.path.join(dest, next_note)) and f'"note": "{next_note}"' in out, out[-300:])
+        code, error, out = in_process("restore", archive, "t/noted", dest, "--accept-inexact", "--flat", "--file", plain_note)
+        expect("so the other file can follow into its place", code == 0 and read(os.path.join(dest, plain_note)) == b"the model's own file", out[-300:])
+        code, error, out = in_process("restore", archive, "t/noted", dest, "--accept-inexact", "--flat", "--file", file, "--overwrite")
+        expect("--flat --overwrite does not replace it when it is there", error == "inexact" and read(os.path.join(dest, plain_note)) == b"the model's own file" and is_note(os.path.join(dest, next_note)), out[-300:])
+        dest = os.path.join(root, "o10l")
+        listed = os.path.join(root, "chosen.txt")
+        with open(listed, "w", encoding="utf-8") as f:
+            f.write(file + "\n")
+        code, error, out = in_process("restore", archive, "t/noted", dest, "--accept-inexact", "--flat", "--files-from", listed)
+        expect("and with --files-from", error == "inexact" and not os.path.exists(os.path.join(dest, plain_note)) and is_note(os.path.join(dest, next_note)), out[-300:])
+        dest = os.path.join(root, "o10a")
+        code, error, out = in_process("restore", archive, "t/noted", dest, "--accept-inexact", "--flat", "--overwrite")
+        expect("--flat with every file: the model's own stays too", error == "inexact" and read(os.path.join(dest, plain_note)) == b"the model's own file" and is_note(os.path.join(dest, next_note)), out[-300:])
+        dest = os.path.join(root, "o10s")
+        second_next = f"{file}.not-exact (2).txt"
+        code, error, out = in_process("restore", archive, "t/scattered", dest, "--accept-inexact", "--flat", "--file", f"a/{file}")
+        expect("--flat keeps the places of files that --flat would number, unchosen", error == "inexact" and os.path.exists(os.path.join(dest, file)) and is_note(os.path.join(dest, second_next))
+               and not os.path.exists(os.path.join(dest, plain_note)) and not os.path.exists(os.path.join(dest, next_note)), out[-300:])
+
+        dest = os.path.join(root, "o11")
+        mine = beside(dest)
+        lexists = os.path.lexists
+        os.path.lexists = lambda path: False  # as if the file appeared after the look at the destination
+        try:
+            code, error, out = in_process("restore", archive, "t/Q5_K", dest, "--accept-inexact")
+        finally:
+            os.path.lexists = lexists
+        expect("placing the note is one step: what appears meanwhile is not replaced", error == "inexact" and read(mine) == b"the user's own note" and is_note(os.path.join(dest, next_note)), out[-300:])
+
+        dest = os.path.join(root, "o12")
+        note_writer = la.not_exact_note
+
+        def no_room(*args):
+            raise OSError(errno.ENOSPC, "no room")
+        la.not_exact_note = no_room
+        try:
+            code, error, out = in_process("restore", archive, "t/Q5_K", dest, "--accept-inexact")
+        finally:
+            la.not_exact_note = note_writer
+        expect("no room for the note: the file is not written either, nor is that success", error == "no_room" and code != 0 and not os.path.exists(os.path.join(dest, file)), out[-300:])
+
+        la.quant_predict, la.quant_predict_exact = fast, exact
+        dest = os.path.join(root, "o13")
+        mine = beside(dest)
+        code, error, out = in_process("restore", archive, "t/Q5_K", dest, "--accept-inexact")
+        expect("a restore that comes out right leaves such a file alone and writes no note", code == 0 and read(mine) == b"the user's own note" and same_file(os.path.join(dest, file), original) and not os.path.exists(os.path.join(dest, next_note)), out[-300:])
+    finally:
+        la.quant_predict, la.quant_predict_exact, la.ieee_problem = fast, exact, problem
+
+    with open(original, "rb") as f:
+        whole = bytearray(f.read())
+    la.forget_cached_reads()
+    p = la.open_pack(archive)
+    sha = models(archive)["t/Q5_K"]["files"][0]["sha256"]
+    span = p.blob_span(sha)
+    la.forget_cached_reads()
+    with open(span[0], "r+b") as f:
+        f.seek(span[1] + span[2] // 2)
+        byte = f.read(1)
+        f.seek(span[1] + span[2] // 2)
+        f.write(bytes([byte[0] ^ 1]))
+    code, out = tool("restore", archive, "t/Q5_K", os.path.join(root, "o5"), "--accept-inexact", "--json")
+    expect("a damaged blob is damage, whatever is accepted: nothing written", code != 0 and '"code": "damaged"' in out and not os.path.exists(os.path.join(root, "o5", file)), out[-300:])
+    code, out = tool("verify", archive, "t/Q5_K", "--json")
+    expect("verify does not call it intact", code != 0 and '"code": "damaged"' in out and '"intact": false' in out and '"intact": true' not in out, out[-300:])
+    del whole
+    shutil.rmtree(root, ignore_errors=True)
+
+
+def abliterate(w, rows, cols):
+    """w as a rows x cols matrix with one direction of its rows taken out, as abliteration does: W - r r^T W."""
+    r = rng.standard_normal(rows)
+    r /= np.linalg.norm(r)
+    m = w.reshape(rows, cols).astype(np.float64)
+    return (m - np.outer(r, r @ m)).astype(np.float32).reshape(-1)
+
+
+def check_rank1():
+    """A change of one direction: the fast prediction against exact fractions, what is tried and what is not, payloads
+    round trip and refuse damage, whole packs; and when a prediction does not hold, what restoring does at each step."""
+    print("a change of one direction")
+    rows, cols = 16, 32
+    tiny = (rng.standard_normal(rows * cols) * 0.02).astype(np.float32)
+    tiny[::7] = 0
+    tiny[3::11] *= np.float32(1e-38)
+    for dtype, bits in (("BF16", la.convert_bits(tiny.view(np.uint32), "F32", "BF16")), ("F16", tiny.astype(np.float16).view(np.uint16))):
+        u, v = (rng.standard_normal(rows) * 0.01).astype(np.float32), (rng.standard_normal(cols) * 0.5).astype(np.float32)
+        u[1] = np.float32(1e-30)
+        fast, exact = la.rank1_predict(bits, u, v, dtype), la.rank1_predict_exact(bits, u, v, dtype)
+        expect(f"{dtype}: the fast prediction is what exact fractions give", np.array_equal(fast, exact), str(int((fast != exact).sum())))
+
+    rows, cols = 200, 1000
+    w = (rng.standard_normal(rows * cols) * 0.02).astype(np.float32)
+    edited = abliterate(w, rows, cols)
+    base, target = la.convert_bits(w.view(np.uint32), "F32", "BF16"), la.convert_bits(edited.view(np.uint32), "F32", "BF16")
+    plain = la.ans16_encode(base, target, "BF16")
+    payload = la.rank1_encode(base, target, "BF16", cols, plain)
+    expect(f"an abliterated matrix: {len(plain)} -> {len(payload) if payload else None} bytes", payload is not None and len(payload) < len(plain) / 2)
+    expect("it round trips", payload is not None and np.array_equal(la.rank1_decode(base, payload, "BF16"), target))
+    expect("and so does a prefix", np.array_equal(la.rank1_decode(base, payload, "BF16", 1234), target[:1234]))
+    noise = (w + (rng.standard_normal(w.size) * 1e-3).astype(np.float32)).astype(np.float32)
+    bits = la.convert_bits(noise.view(np.uint32), "F32", "BF16")
+    expect("a change in no one direction is not tried", la.rank1_factors(base, bits, "BF16", cols) is None)
+    expect("nor no change", la.rank1_factors(base, base.copy(), "BF16", cols) is None)
+    expect("nor a matrix too small", la.rank1_factors(base[:320], target[:320], "BF16", 32) is None and la.rank1_factors(base[:160], target[:160], "BF16", 10) is None)
+    expect("nor a width that does not divide it", la.rank1_factors(base, target, "BF16", 999) is None)
+    for what, broken in (("too short", payload[:4]), ("rows", struct.pack("<II", 100, cols) + payload[8:]), ("no room for the factors", struct.pack("<II", 1 << 20, 1) + payload[8:]), ("a cut stream", payload[:-3])):
+        try:
+            la.rank1_decode(base, broken, "BF16")
+            ok = False
+        except Exception:
+            ok = True
+        expect(f"a damaged rank1 payload ({what}) is refused", ok)
+    with_noise = la.rank1_parts(payload, base.size)
+    expect("its stream decodes whatever the prediction comes to", la.ans16_decode(base, bytes(with_noise[2]), "BF16", predicted=np.zeros(base.size, np.uint16)).size == base.size)
+
+    print("  when a prediction does not hold")
+    small_rows, small_cols = 24, 64
+    small = (rng.standard_normal(small_rows * small_cols) * 0.02).astype(np.float32)
+    small_edit = abliterate(small, small_rows, small_cols)
+    small_base, small_target = la.convert_bits(small.view(np.uint32), "F32", "BF16"), la.convert_bits(small_edit.view(np.uint32), "F32", "BF16")
+    factors = la.rank1_factors(small_base, small_target, "BF16", small_cols)
+    head = la.RANK1_HEAD.pack(small_rows, small_cols) + factors[0].astype("<f4").tobytes() + factors[1].astype("<f4").tobytes()
+    coded = head + la.ans16_encode(small_base, small_target, "BF16", predicted=la.rank1_predict(small_base, *factors, "BF16"))
+    crc = zlib.crc32(small_target.tobytes())
+    region = {"offset": 0, "length": small_target.size * 2, "dtype": "BF16"}
+    fast, exact = la.rank1_predict, la.rank1_predict_exact
+
+    def off(predict):
+        return lambda *args: predict(*args) ^ 1
+
+    try:
+        la.rank1_predict = off(fast)
+        chunk, inexact = la.rank1_region(coded, small_base, region, crc, "here")
+        expect("the fast path wrong: worked out again exactly", chunk == small_target.tobytes() and not inexact)
+        la.rank1_predict_exact = off(exact)
+        try:
+            la.rank1_region(coded, small_base, region, crc, "here")
+            ok = False
+        except la.InexactRegion as e:
+            ok = la.PREDICTION_DISAGREES in str(e)
+        expect("both wrong: refused, as not damage", ok)
+        la._INEXACT["accept"], la._INEXACT["regions"] = True, []
+        chunk, inexact = la.rank1_region(coded, small_base, region, crc, "here")
+        expect("accepted: written, and it says so", inexact and chunk != small_target.tobytes() and len(chunk) == small_target.size * 2 and la._INEXACT["regions"] == [(0, region["length"])])
+    finally:
+        la.rank1_predict, la.rank1_predict_exact = fast, exact
+        la._INEXACT["accept"], la._INEXACT["regions"] = False, []
+
+    root = os.path.join(scratch, "rank1")
+    shutil.rmtree(root, ignore_errors=True)
+    os.makedirs(root)
+    layers = {f"model.layers.{i}.mlp.weight": (rng.standard_normal(rows * cols) * 0.02).astype(np.float32) for i in range(3)}
+    layers["model.other.weight"] = (rng.standard_normal(rows * cols) * 0.02).astype(np.float32)
+
+    def folder(name, tensors):
+        where = os.path.join(root, name)
+        os.makedirs(where)
+        write_safetensors(os.path.join(where, "model.safetensors"), tensors)
+        return where
+
+    original = folder("base", {n: ("BF16", [rows, cols], bf(w)) for n, w in layers.items()})
+    edited = {n: (abliterate(w, rows, cols) if "layers" in n else w) for n, w in layers.items()}
+    changed = folder("edited", {n: ("BF16", [rows, cols], bf(w)) for n, w in edited.items()})
+    as_half = folder("half", {n: ("F16", [rows, cols], w.astype(np.float16).tobytes()) for n, w in edited.items()})
+
+    def stored(archive, model):
+        la.forget_cached_reads()
+        p = la.open_pack(archive)
+        try:
+            e = models(archive)[model]["files"][0]
+            span = p.blob_span(e["sha256"])
+            with open(span[0], "rb") as f:
+                _, frames = la.read_container(f, span[1], span[2])
+            return span[2] / e["size"], {fr[0] & ~la.STANDALONE for fr in frames if fr}
+        finally:
+            la.forget_cached_reads()
+
+    archive = os.path.join(root, "on")
+    pack(original, archive, "t/base")
+    code, out = pack(changed, archive, "t/edited")
+    with_rank1, codecs = stored(archive, "t/edited")
+    expect(f"abliterated weights pack against their original: {with_rank1:.2%}", code == 0 and la.CODEC_RANK1 in codecs and with_rank1 < 0.2, out[-300:])
+    code, out = tool("verify", archive)
+    expect("that pack verifies", code == 0, out[-300:])
+    dest = os.path.join(root, "out")
+    code, out = tool("restore", archive, "t/edited", dest)
+    with open(os.path.join(dest, "model.safetensors"), "rb") as a, open(os.path.join(changed, "model.safetensors"), "rb") as b:
+        expect("and restores bit for bit", code == 0 and a.read() == b.read(), out[-300:])
+    code, out = pack(as_half, archive, "t/half")
+    code2, out2 = tool("verify", archive)
+    expect("an F16 export of them too, and verifies", code == 0 == code2, (out + out2)[-300:])
+
+    off_pack = os.path.join(root, "off")
+    pack(original, off_pack, "t/base")
+    code, out = pack(changed, off_pack, "t/edited", "--no-rank1")
+    without, codecs = stored(off_pack, "t/edited")
+    expect(f"--no-rank1 does not use it: {without:.2%}", code == 0 and la.CODEC_RANK1 not in codecs and without > with_rank1 * 2, out[-300:])
+    code, out = tool("rebase", off_pack, "t/edited", "--no-rank1")
+    expect("rebase --no-rank1 leaves it so", code == 0 and la.CODEC_RANK1 not in stored(off_pack, "t/edited")[1], out[-300:])
+
+    zipped = os.path.join(root, "two.oczip")
+    code, out = tool("pack", original, changed, zipped)
+    code2, out2 = tool("verify", zipped)
+    expect("a new pack file does it too, and verifies", code == 0 == code2 and os.path.getsize(zipped) < 1.2 * os.path.getsize(os.path.join(original, "model.safetensors")), (out + out2)[-300:])
+    shutil.rmtree(root, ignore_errors=True)
+
+
 def check_unused_base():
     """A base a delta would read for (almost) nothing is not kept, in a pack folder and in a new pack file; a
     safetensors file is recognised by its content whatever its name (ComfyUI's .sft)."""
@@ -831,7 +1478,7 @@ def check_output():
     root = os.path.join(scratch, "output")
     shutil.rmtree(root, ignore_errors=True)
     code, out = tool("--version")
-    ok = code == 0 and out.startswith("OverCompressing CLI 0.") and out.rstrip().endswith("format 4")
+    ok = code == 0 and out.startswith("OverCompressing CLI 0.") and out.rstrip().endswith("format 5")
     expect("--version: the tool's version (and build, where it can tell) and the format it writes", ok, out[-200:])
     kit = os.path.join(scratch, "output-kit-tools")
     shutil.rmtree(kit, ignore_errors=True)
@@ -1822,6 +2469,64 @@ def check_pack_files():
         expect("restore of an ans16 delta run as the window runs it (stdin left open): it does not stall", ok,
                "" if ok else f"{code} {''.join(chunks)[-300:]}")
         run.stdin.close()
+        window = types.SimpleNamespace(marks=None)
+        damage = {"faults": [{"sha256": "a", "intact": True}, {"sha256": "b", "intact": False}],
+                  "lost": [{"model": "m", "path": "x", "own": True, "causes": ["a"]}, {"model": "m", "path": "z", "own": True, "causes": ["a"]},
+                           {"model": "n", "path": "y", "own": False, "causes": ["b"]}]}
+        gui.App.remember(window, {"argv": ["verify", single]}, damage)
+        marks = window.marks
+        expect("the window marks what verify found lost, and which of it only does not rebuild here", set(marks["lost"]) == {("m", "x"), ("m", "z"), ("n", "y")} and marks["here"] == {("m", "x"), ("m", "z")}, marks)
+        gui.App.remember(window, {"argv": ["verify", single, "m", "--file=x"]})
+        expect("a verify that finds one file sound takes only its mark away", set(marks["lost"]) == {("m", "z"), ("n", "y")} and marks["here"] == {("m", "z")}, marks)
+        gui.App.remember(window, {"argv": ["verify", single, "n"]}, {"faults": [], "lost": []})
+        expect("so does one of a model, even if another fault was found", set(marks["lost"]) == {("m", "z")}, marks)
+        gui.App.remember(window, {"argv": ["verify", single]})
+        expect("a verify of the whole pack that finds it sound takes them all away", not marks["lost"] and not marks["here"], marks)
+        plain = gui.plain_text(gui.TEXT)
+        fields = lambda text: sorted(re.findall(r"\{\w+\}", text))  # noqa: E731
+        odd = [k for k, v in plain.items() if not v.isascii() or fields(v) != fields(gui.TEXT[k]) or not v.strip() and gui.TEXT[k].strip()]
+        expect("where a Tk cannot draw symbols, the window's text is all ASCII, with what it fills in", not odd, odd)
+        expect("  a sign stands where a symbol says something, none where it goes before a word", plain["up"] == "Up" and plain["extract"] == "Extract to" and plain["mark_file"] == "! failed verify"
+               and plain["name_hint"].startswith("Bases are") and len(plain["spinner"]) == len(gui.TEXT["spinner"]), plain["name_hint"])
+        ask = lambda result: types.SimpleNamespace(tk=types.SimpleNamespace(call=result))  # noqa: E731
+
+        def no_query(*_):
+            raise gui.tk.TclError("no such command")
+        expect("  only X11's core fonts count as that", gui.no_xft(ask(lambda *_: "x11")) and not gui.no_xft(ask(lambda *_: "xft")) and not gui.no_xft(ask(no_query)))
+        places = os.path.join(root, "places")
+        named = os.path.join(places, "a")
+        os.makedirs(named)
+        with open(os.path.join(named, la.MARKER), "w", encoding="utf-8") as f:
+            f.write("{}")
+        marks_tried = []
+        for mark in (gui.TEXT["in_model"], plain["in_model"]):
+            saved, gui.TEXT["in_model"] = gui.TEXT["in_model"], mark
+            try:
+                typed = f"{named} {mark} b"
+                as_model = gui.place_from_text(typed)
+                ok = as_model is not None and as_model.path == named and as_model.model == "b"
+                ok = ok and gui.place_from_text(f"{places} {mark} b") is None
+                ok = ok and (mark.isascii() or gui.place_from_text(f"{named} {mark} ").path == named)  # (">" needs a name after it)
+                try:
+                    os.makedirs(typed)
+                except OSError:  # (">" on Windows)
+                    expect(f"a model is named with {ascii(mark)}, and only in a pack", ok)
+                    continue
+                as_folder = gui.place_from_text(typed)
+                marks_tried.append(mark)
+                expect(f"a model is named with {ascii(mark)}, but a folder of that name is that folder", ok and as_folder is not None and as_folder.model is None and as_folder.path == os.path.normpath(typed), ascii(as_folder))
+                shutil.rmtree(typed)
+            finally:
+                gui.TEXT["in_model"] = saved
+        expect("  (seen with a real folder at least once)", marks_tried, ascii(marks_tried))
+        started = subprocess.run([sys.executable, "-I", "-c", "import os, sys, types\n"
+                                  "sys.path.insert(0, sys.argv[1])\n"
+                                  "import llm_archive_gui as gui\n"
+                                  "gui.tk.Tk = lambda: types.SimpleNamespace(tk=types.SimpleNamespace(call=lambda *_: 'x11'), mainloop=lambda: None)\n"
+                                  "gui.App = lambda _, start: print(start and (start.path, start.model))\n"
+                                  "sys.argv = ['gui', sys.argv[2] + ' > b']\n"
+                                  "gui.main()\n", os.path.dirname(gui.__file__), named], capture_output=True, encoding="utf-8", errors="replace")
+        expect("where symbols are not drawn, a model given at the start is read with the plain mark", started.returncode == 0 and started.stdout.strip() == repr((named, "b")), started.stdout + started.stderr[-300:])
     # no worker is forked from the tool, whose progress thread runs meanwhile: Python warns of that fork (3.12+), and
     # the warning made an error stops the run where it happens (Linux before 3.14); Windows spawns them anyway
     dest = os.path.join(root, "no-fork")
@@ -2055,7 +2760,47 @@ def check_planes():
         print(f"  {'ok  ' if not bad else 'FAIL'} {dtype:<8} {len(lengths) * len(contents)} round trips" + (f": {bad[:5]}" if bad else ""))
     data = bf16_bytes(1_500_000)
     size = len(la.planes_encode(data, "BF16")) / len(data)
-    expect(f"BF16 weights shrink to {size:.1%} (exponents entropy-coded)", size < 0.70)
+    expect(f"BF16 weights shrink to {size:.1%}", size < 0.70)
+    edges = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1}  # around the plane sizes where the Huffman sample changes
+    bad = []
+    for dtype, width in edges.items():
+        for plane in ((1 << 20) - 1, 1 << 20, (4 << 20) - 1, 4 << 20, (1 << 20) + 65537):
+            for what, make in contents.items():
+                data = make(plane * width + 1)
+                if la.planes_decode(la.planes_encode(data, dtype), len(data), dtype) != data:
+                    bad.append(f"{dtype}/{what}/{plane}")
+    expect("planes around the sample's size edges round trip", not bad, ", ".join(bad[:5]))
+    u16 = rng.integers(0, 1 << 16, 1000, dtype=np.uint16)
+    u32 = rng.integers(0, 1 << 32, 1000, dtype=np.uint32)
+    planes, _ = la.byte_planes(u16.tobytes(), "BF16")
+    r16 = (u16.astype(np.uint32) << 3 | u16.astype(np.uint32) >> 13) & 0xFFFF
+    expect("BF16 planes are the rotated element's bytes", (planes[0] == r16 >> 8).all() and (planes[1] == (r16 & 0xFF)).all())
+    planes, _ = la.byte_planes(u32.tobytes(), "F32")
+    top = u32 >> 16
+    r32 = (top << 3 | top >> 13) & 0xFFFF
+    expect("F32 planes are its rotated top 16 bits, then its low bytes", (planes[0] == r32 >> 8).all() and (planes[1] == (r32 & 0xFF)).all()
+           and (planes[2] == (u32 >> 8 & 0xFF)).all() and (planes[3] == (u32 & 0xFF)).all())
+    planes, _ = la.byte_planes(u16.tobytes(), "F16")
+    expect("F16 planes are its high and low bytes", (planes[0] == u16 >> 8).all() and (planes[1] == (u16 & 0xFF)).all())
+    skewed = np.minimum(rng.geometric(0.3, 8 << 20) - 1, 255).astype(np.uint8)  # LZ matching costs zstd about 2 % here
+    alone = la.code_plane(skewed)
+    zstd_size = len(zstandard.ZstdCompressor(level=1).compress(skewed))
+    expect("a plane where Huffman coding saves enough uses it", alone[0] == la.PLANE_DEFLATE and zstd_size - len(alone[1]) > len(skewed) * la.HUFFMAN_GAIN,
+           f"coding {alone[0]}, {len(alone[1])} bytes against zstd's {zstd_size}")
+    noise = rng.integers(0, 256, 8 << 20, dtype=np.uint8)
+    expect("a plane of noise is stored", la.code_plane(noise)[0] == la.PLANE_STORED)
+    expect("a plane of zeros goes to zstd", la.code_plane(np.zeros(8 << 20, np.uint8))[0] == la.PLANE_ZSTD)
+    unsized = zstandard.ZstdCompressor(level=1, write_content_size=False).compress(bytes(1000))
+    expect("a zstd frame that does not say its size decodes", la.zstd_bounded(unsized, 1000) == bytes(1000))
+    for what, frame, limit in (("declares more than its region holds", zstandard.ZstdCompressor(level=1).compress(bytes(1000)), 999),
+                               ("does not say its size and holds more", unsized, 999),
+                               ("has bytes after it", unsized + b"\0", 1000)):
+        try:
+            la.zstd_bounded(frame, limit)
+            ok = False
+        except ValueError:
+            ok = True
+        expect(f"a zstd frame that {what} is refused", ok)
     payload = la.planes_encode(data, "BF16")
     damaged = {
         "stream count": bytes([3]) + payload[1:],
@@ -2185,6 +2930,9 @@ def main():
     check_damage()
     check_kept_bases()
     check_unused_base()
+    check_cross_format()
+    check_quant()
+    check_rank1()
     check_rebase_files()
     check_output()
     check_safety()

@@ -56,7 +56,7 @@ public partial class GraphPanel : PanelContainer
             var b = new System.Text.StringBuilder();
             b.Append($"[b]{Esc(r.Name)}[/b]\n");
             if (r.Damaged)
-                b.Append($"[color=#{Ui.Damaged.ToHtml(false)}]{Esc(T.Get("mark_file"))}[/color]\n");
+                b.Append($"[color=#{Ui.Damaged.ToHtml(false)}]{Esc(r.Mark.Length > 0 ? r.Mark : T.Get("mark_file"))}[/color]\n");
             b.Append(Head("Stored"));
             b.Append($"{Esc(T.Count(r.Files ?? 0, "file"))}  ·  {Esc(T.SizeText(r.Size))} → {Esc(T.SizeText(r.Stored))}  {Dim("(" + r.Ratio + ")")}\n");
             if (r.Packed is not null)

@@ -1,6 +1,6 @@
-# OverCompressing pack format, version 4
+# OverCompressing pack format, version 5
 
-Written by `llm_archive.py` (tool version 5). This spec is enough to restore the data without the tool: you need a
+Written by `llm_archive.py` (CLI 0.6). This spec is enough to restore the data without the tool: you need a
 JSON reader, a DEFLATE decoder (zlib, RFC 1951), a zstd decoder, SHA-256, a few bit operations (byte planes), and for
 ans16 deltas the rANS decoder described below.
 
@@ -10,7 +10,7 @@ A pack is a folder (a *pack folder*) or the same tree in one ZIP file (a *pack f
 
 ```
 <pack>/
-  ocpack.json               {"format": "overcompressing-pack", "format_version": 4, "changed": "<time>"}: what
+  ocpack.json               {"format": "overcompressing-pack", "format_version": 5, "changed": "<time>"}: what
                             makes the folder a pack; rewritten last by every change (pack, remove, rename, rebase,
                             export --delete), with `changed` the UTC time in ISO 8601, so its time stamp tells a
                             watcher once per complete change (readers check only `format` and `format_version`)
@@ -18,7 +18,7 @@ A pack is a folder (a *pack folder*) or the same tree in one ZIP file (a *pack f
     <Org__Name>.json        one manifest per model; "/" in the model's name becomes "__" (Qwen/Qwen2.5-7B ->
                             models/Qwen__Qwen2.5-7B.json)
   blobs/
-    <ab>/<sha256>.ocz       one blob per distinct file: an OCZ4 container named by the SHA-256 of the ORIGINAL
+    <ab>/<sha256>.ocz       one blob per distinct file: an OCZ5 container named by the SHA-256 of the ORIGINAL
                             file (64 lowercase hex digits; <ab> is its first two), shared by every model that has
                             that file
   _kit/                     optional: a portable copy of the tool (its Python and tools), which the tool never
@@ -55,9 +55,9 @@ changed; extracting it with any ZIP tool gives a pack folder.
 
 | field | meaning |
 |---|---|
-| `format`, `format_version` | `"overcompressing-model"`, `4` |
+| `format`, `format_version` | `"overcompressing-model"`, `5` |
 | `name`, `revision` | the model's name in the pack (`--name`), and an optional free-text note (`--revision`) |
-| `tool`, `created` | the tool that wrote the manifest, its version and build (e.g. `llm_archive 0.5 (2026-10-22 1a2b3c4)`); UTC time of the pack |
+| `tool`, `created` | the tool that wrote the manifest, its version and build (e.g. `llm_archive 0.6 (2026-10-31 1a2b3c4)`); UTC time of the pack |
 | `base_choice` | how the bases were chosen: `auto`, `forced` (`--base`) or `none` (`--no-base`); `rebase --all` re-chooses only `auto`; if absent, read as `auto`. Not needed to restore |
 | `files[].path` | the file's path inside the model folder it was packed from |
 | `files[].size`, `sha256` | size and SHA-256 of the **original** file; the SHA-256 names its blob |
@@ -67,16 +67,16 @@ changed; extracting it with any ZIP tool gives a pack folder.
 The manifest's file name must be `repo_dir_name(name) + ".json"`. Two names that would give one file name where case
 is ignored are not allowed in one pack.
 
-## OCZ4 container (a blob)
+## OCZ5 container (a blob)
 
 All integers are little-endian.
 
 ```
-"OCZ4"                       4 bytes magic
+"OCZ5"                       4 bytes magic
 u32 header_len
 header_len bytes of JSON:    {"original_size", "sha256", "method", "regions": [...], "bases": [...]}
 one frame per region, in order:
-  u8  codec                  low 7 bits: 0 = raw, 1 = byte planes, 2 = zstd, 3 = ans16; bit 7 (0x80) = STANDALONE
+  u8  codec                  low 7 bits: 0 = raw, 1 = byte planes, 2 = zstd, 3 = ans16, 4 = quant, 5 = rank1; bit 7 (0x80) = STANDALONE
   u64 raw_len                bytes this frame restores to (= region length)
   u64 payload_len
   u32 crc32                  zlib CRC-32 of the restored ORIGINAL bytes of the region
@@ -107,22 +107,22 @@ never has a partial blob: storing the file again replaces it with a whole one.
 |---|---|---|
 | `float` | a float tensor, `dtype` one of BF16, F16, F32, F8_E4M3, F8_E5M2 | 1 (byte planes of that dtype), else 2 or 0 |
 | `zstd` | header, metadata, text; with a `dtype` tag: a quantized/integer tensor | 2, else 0 |
-| `auto` | unknown binary | 1 (byte planes as BF16) or 2 or 0, whichever was smallest |
+| `auto` | unknown binary | 1 (byte planes as F16: plain byte columns) or 2 or 0, whichever was smallest |
 
 Codec 0: the payload is the data. Codec 2: one standard zstd frame. Codec 1: byte planes, below.
 
 ### Byte planes (codec 1)
 
-For a region of dtype `d` (the region's `dtype`; BF16 for kind `auto`) with element size `s` (BF16, F16: 2; F32: 4;
+For a region of dtype `d` (the region's `dtype`; F16 for kind `auto`) with element size `s` (BF16, F16: 2; F32: 4;
 F8_E4M3, F8_E5M2: 1), the `n = raw_len // s` whole elements (little-endian unsigned integers `u`) are split into
-byte planes, one byte per element each, so that the exponents, the only part of a weight with little information,
-sit together:
+byte planes, one byte per element each. For BF16 and F32, the top 16 bits of each element are rotated left by 3 bits
+first, `r = ((t << 3) | (t >> 13)) & 0xFFFF`:
 
 | dtype | planes |
 |---|---|
-| BF16 | `p0 = (u >> 7) & 0xFF` (exponent); `p1 = ((u >> 8) & 0x80) \| (u & 0x7F)` (sign, mantissa) |
+| BF16 | with `t = u`: `p0 = r >> 8`; `p1 = r & 0xFF` |
 | F16 | `p0 = u >> 8` (sign, exponent, 2 mantissa bits); `p1 = u & 0xFF` |
-| F32 | `p0 = (u >> 23) & 0xFF` (exponent); `p1 = ((u >> 24) & 0x80) \| ((u >> 16) & 0x7F)`; `p2 = (u >> 8) & 0xFF`; `p3 = u & 0xFF` |
+| F32 | with `t = u >> 16`: `p0 = r >> 8`; `p1 = r & 0xFF`; `p2 = (u >> 8) & 0xFF`; `p3 = u & 0xFF` |
 | F8_E4M3, F8_E5M2 | `p0` = the byte |
 
 The `raw_len % s` bytes after the last whole element form a tail stream. The payload is:
@@ -133,12 +133,13 @@ count x { u8 coding, u64 length } coding 0 = stored, 1 = raw DEFLATE (RFC 1951, 
 the coded streams, in order       each plane decodes to exactly n bytes, the tail (stored) to raw_len % s bytes
 ```
 
-Rebuild each element from its plane bytes (BF16: `((p1 & 0x80) << 8) | (p0 << 7) | (p1 & 0x7F)`; F16:
-`(p0 << 8) | p1`; F32: `((p1 & 0x80) << 24) | (p0 << 23) | ((p1 & 0x7F) << 16) | (p2 << 8) | p3`), write the elements
-little-endian, then the tail. A decoder must refuse a payload whose stream count, lengths or decoded sizes do not
-fit exactly. The writer codes each plane with whichever is smallest: DEFLATE with Huffman coding only (as zlib's
-`Z_HUFFMAN_ONLY` produces; it comes close to the order-0 entropy of the exponent plane), a zstd frame, or the plane
-as it is. The byte-grouping idea is ZipNN's (Hershcovitch et al., 2024); this coding of it is this format's own.
+Rebuild each element from its plane bytes (with `r = (p0 << 8) | p1` and `t = (r >> 3) | ((r << 13) & 0xFFFF)`, BF16:
+`t`; F16: `(p0 << 8) | p1`; F32: `(t << 16) | (p2 << 8) | p3`), write the elements little-endian, then the tail. A
+decoder must refuse a payload whose stream count, lengths or decoded sizes do not fit exactly, and must accept any of
+the three codings for any plane. The writer codes each plane with zstd level 1 or as it is, whichever is smaller,
+unless DEFLATE with Huffman coding only (as zlib's `Z_HUFFMAN_ONLY` produces) saves over 0.5 % of the plane; from 1 MiB
+up, it tries that on the whole plane only if pieces of it (64 KiB each, 4 of them spread over the plane, 16 from 4 MiB
+up) say it would. The byte-grouping idea is ZipNN's (Hershcovitch et al., 2024); this form of it is this format's own.
 
 How files are split: safetensors by its JSON header; GGUF (v2/v3) by its tensor table (F32/F16/BF16 tensors are
 float, quantized ones are tagged `ggml_type_<n>` and run up to the next tensor); anything else in 64 MiB `auto`
@@ -151,17 +152,21 @@ Tensors of the file that also exist in the base model, in any of its files, beco
 with the same name and either the same dtype and byte size, the same element count in another float dtype (see
 `base_dtype` below), or, for float tensors, the same shape except the first dimension: then only the leading rows
 both have are coded against the base (e.g. an embedding after vocabulary extension), and the target's extra rows
-form a following standalone region. Restore each base file first (from its own blob, which may itself be a delta)
+form a following standalone region. In a base file of another format (a GGUF against a safetensors file), where names
+differ, the writer finds a float tensor's match by shape and content instead. A reader needs none of this: `offset`
+says where the base bytes are, in whatever format that file is. Restore each base file first (from its own blob, which may itself be a delta)
 and check its SHA-256 against `bases[i].sha256`. Then, per region:
 
 - no `base` key: decode standalone as above.
 - `base` and the STANDALONE flag set: decode standalone as above (storing it without the base was smaller).
 - kind `ans16`, codec 3: decode the ans16 payload below against the base bytes (`length / 2` weights at `offset`).
+- kind `quant`, codec 4: decode the quant payload below against its parent's bytes at `offset`.
+- kind `ans16`, codec 5: decode the rank1 payload below against the base bytes, as for codec 3.
 - otherwise (kind `xor`, or an `ans16` region that did not shrink): decode as above with the region's dtype, then XOR
   with the `length` base bytes at `offset`.
 
-Because matching is by tensor, a delta works across different file names, header sizes, shardings, tensor
-orders, float dtypes and vocabulary sizes. **A delta blob is unrecoverable without the blobs it lists as bases**;
+Because matching is by tensor, a delta works across different file formats, file names, header sizes, shardings,
+tensor orders, float dtypes and vocabulary sizes. **A delta blob is unrecoverable without the blobs it lists as bases**;
 the tool keeps them as long as it is needed. A chain of bases is at most 32 blobs deep and never a cycle.
 
 #### Cross-dtype prediction (`base_dtype`)
@@ -178,6 +183,64 @@ reproduced exactly:
 3. Any NaN input becomes `0x7E00` (F16) or `0x7FC0` (BF16).
 
 BF16 -> F16 is exact for values in the F16 normal range, so an F16 export of BF16 weights predicts perfectly.
+
+### Rank1 payload (codec 5)
+
+An ans16 region (whose optional `cols`, the width of the tensor's rows, is the writer's and is not needed here) may hold whole rows
+of a matrix changed along one direction, as abliteration changes it. Its payload:
+
+```
+u32 rows, u32 cols              rows * cols = length / 2
+f32 u[rows], f32 v[cols]        finite
+an ans16 payload (below)
+```
+
+The ans16 payload is decoded as for codec 3, with its contexts from the base's exponents as ever, but `target[i] = (p[i] + r) mod 2^16`,
+where `p` replaces the base: with `x` the base's value at row `a`, column `b`, as binary32 (not finite: 0), `p` is `x + u[a] * v[b]`,
+the product and then the sum each an IEEE 754 binary32 result (exact value, rounded to nearest, ties to even, subnormals kept),
+converted to the region's dtype as under "Cross-dtype prediction". Since the stream does not depend on `p`, a region whose CRC fails
+though the blob's SHA-256 holds has not been damaged: work `p` out again in exact arithmetic.
+
+### Quant regions (codec 4)
+
+A quantized GGUF tensor is a function of the weights it was made from, so it may be coded against a parent with the
+same shape: a float tensor, or a coarser or finer quantized one. The region has kind `quant`, `dtype` its own type and
+`base_dtype` the parent's: BF16, F16, F32, or one of the types below. It covers whole blocks of both; the parent's bytes
+start at `offset`, and hold as many elements. Blocks, little-endian, values `v`, `half` an IEEE binary16:
+
+| dtype | block | a value stands for |
+|---|---|---|
+| `ggml_type_8` (Q8_0), 32 elements | `half d`, `int8 v[32]` | `v * d` |
+| `ggml_type_12` (Q4_K), 256 | `half d`, `half dmin`, `u8 scales[12]`, `u8 qs[128]` | `v * step - floor` |
+| `ggml_type_13` (Q5_K), 256 | as Q4_K, with `u8 hh[32]` before `qs[128]` | `v * step - floor` |
+| `ggml_type_14` (Q6_K), 256 | `u8 ql[128]`, `u8 qh[64]`, `int8 scale[16]`, `half d` | `(v - 32) * step` |
+
+Q4_K, Q5_K: sub-block `j` (8 of 32 elements) has `step = s[j] * d`, `floor = m[j] * dmin`, with `s[j]`, `m[j]` six bits each:
+for `j < 4`, `s[j] = scales[j] & 63`, `m[j] = scales[j + 4] & 63`; otherwise `s[j] = (scales[j + 4] & 15) | ((scales[j - 4] >> 2) & 0x30)`,
+`m[j] = (scales[j + 4] >> 4) | ((scales[j] >> 2) & 0x30)`. Values, `p` in 0..3, `l` in 0..31: element `64p + l` is the low
+nibble of `qs[32p + l]`, element `64p + 32 + l` its high nibble; Q5_K adds bit `2p` of `hh[l]` as bit 4 of the first and
+bit `2p + 1` as bit 4 of the second. Q6_K: sub-block `j` (16 of 16 elements) has `step = scale[j] * d`; with `g` in 0..1, `l` in
+0..31, at `a = 128g`, `b = 64g`, `c = 32g`: elements `a + l`, `a + 32 + l`, `a + 64 + l`, `a + 96 + l` have as low four bits the low nibble of
+`ql[b + l]`, of `ql[b + 32 + l]`, the high nibble of `ql[b + l]`, of `ql[b + 32 + l]`, and as top two bits, in that order, bits 0-1, 2-3, 4-5, 6-7 of `qh[c + l]`.
+
+The payload is two streams, framed as in byte planes (`u8 count` = 2, `count x { u8 coding, u64 length }`, the streams):
+the side bytes of each block (Q8_0 `d`, XOR the prediction of it below; Q4_K, Q5_K the first 16 bytes; Q6_K `scale` and
+`d`), then each element's stored value minus its prediction, mod 256 (Q8_0's as two's complement, Q6_K's `v` as stored).
+
+**The prediction must be reproduced exactly.** Every step below is the IEEE 754 binary32 result: the exact value, rounded to
+nearest with ties to even, subnormals kept. A binary16 that is not finite counts as 0; so does a parent's value, once rebuilt, that is
+not finite.
+
+1. The parent's values `x`: a float tensor's, as binary32 (exact); a quantized tensor's by the table above, each product,
+   then the subtraction, a binary32 result (`step`, `floor` too).
+2. Q8_0: `d = max|x| / 127`; `i = 1 / d`, or 0 if `d` is 0 or `i` is not finite; `t = x * i`; `v = trunc(t + 0.5)` for `t >= 0`,
+   `trunc(t - 0.5)` otherwise, clipped to -128..127. Its `d` is predicted as `d` converted to binary16, round to nearest, ties to even.
+3. Q4_K, Q5_K: `v = rint((x + floor) / step)`, ties to even, or 0 if `step` is 0, clipped to 0..15, 0..31.
+4. Q6_K: `v = rint(x / step)`, or 0 if `step` is 0, clipped to -32..31, plus 32.
+
+A region whose CRC does not hold though the blob's SHA-256 does has not been damaged: its prediction did not come out the same.
+Work it out again in exact arithmetic, as above, without the machine's floating point. The writer stores a region this way only if
+that decodes back, and if not smaller keeps the STANDALONE alternatives.
 
 ### ans16 payload (codec 3)
 

@@ -24,6 +24,7 @@ public sealed class Row
     public int? Files;
     public string? Parent;  // by base: the model this one sits under
     public bool Damaged;
+    public string Mark = "";  // the ⚠ note of a damaged row (MainWindow.Mark)
     public ModelSummary? Summary;  // a model row
     public FileSummary? File;  // a file row
     public Dictionary<string, long> Blobs = new();  // a model row: sha -> stored, to sum a selection counting each once

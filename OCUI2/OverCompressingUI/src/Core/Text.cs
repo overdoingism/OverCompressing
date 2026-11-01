@@ -11,7 +11,7 @@ namespace OverCompressingUI.Core;
 /// </summary>
 public static class T
 {
-    public const string GuiVersion = "0.5.5";
+    public const string GuiVersion = "0.6";
 
     private static readonly Dictionary<string, string> Texts = new()
     {
@@ -103,6 +103,8 @@ public static class T
         ["need_target"] = "Choose where to pack.",
         ["target_oczip"] = "That is a pack file: choose “A new pack file (.oczip)” to make one.",
         ["name_hint"] = "Δ bases are chosen automatically. Other options: llm_archive.py (docs/usage.md).",
+        ["quant_tick"] = "Δ Code quantized weights against the weights they came from",
+        ["quant_note"] = "Usually far smaller, but restoring works them out again from those weights. Untick to store them without that.",
         ["replace_q"] = "{name} is already in this pack folder ({files}).\n\nReplace it with these files?",
         ["export_title"] = "⤓ Save .oczip",
         ["export_all"] = "every model",
@@ -155,6 +157,10 @@ public static class T
         ["done_rename"] = "✔ Renamed {old} to {new}.",
         ["pack_kind"] = "pack",
         ["overwrite_q"] = "{dest} already has some of these files, with other contents.\n\nReplace them?",
+        ["inexact_q"] = "{name}: the stored bytes are intact, but they do not rebuild on this machine, which may be at fault: another machine may restore them exactly.\n\nWrite the file all the same? Some of its values may be off, so it will not be the original; a note goes beside it.",
+        ["not_exact_title"] = "⚠ Not the original",
+        ["exact_slow"] = "Slow step: regions are worked out exactly, without floating point arithmetic ({regions} so far). That can take many minutes; the percentage moves on when the file is done.",
+        ["not_exact"] = "Some values may be off, so these files are not the originals; another machine may restore them exactly. Beside each is a note:\n\n{notes}",
         ["failed"] = "✕ Failed",
         ["cancelled"] = "✕ Cancelled.",
         ["into_folder_note"] = "For upkeep: each file stored once, Δ deltas where smaller",
@@ -173,6 +179,9 @@ public static class T
         ["damage_heading"] = "{files} lost: what, why, and what to do",
         ["damage_heading_other"] = "Verify failed: what, why, and what to do",
         ["damage_note"] = "Copy the report to keep it, or to ask someone (or an AI) what to do. Its commands store a lost file again or give it up; verify again afterwards.",
+        ["damage_heading_here"] = "{files} not rebuilt on this machine: what, why, and what to do",
+        ["damage_note_here"] = "The stored bytes are intact, so the report's \"lost\" need not be final: verify on another machine first. ⤒ Extract to can write such a file all the same, as not the original.",
+        ["clean_off_here"] = "− Clean up is off: some of these files may restore on another machine. Verify there first.",
         ["copy"] = "⧉ Copy",
         ["copied"] = "✔ Copied",
         ["clean_up"] = "− Clean up",
@@ -197,6 +206,8 @@ public static class T
         ["mark_model"] = "⚠ {files} failed verify",
         ["mark_file"] = "⚠ failed verify",
         ["mark_file_base"] = "⚠ failed verify (its base)",
+        ["mark_model_here"] = "⚠ {files} not rebuilt here",
+        ["mark_file_here"] = "⚠ not rebuilt here",
         ["rebase"] = "⇄ Rebase",
         ["rebase_title"] = "⇄ Rebase",
         ["rebase_one"] = "Rebase {name}",

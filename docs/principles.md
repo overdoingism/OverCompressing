@@ -2,9 +2,9 @@
 
 > **中文重點**
 > - 一般壓縮器（zip、zstd）壓不動權重，是因為 BF16 的 16 個位元裡，7 位尾數幾乎是純雜訊；真正可壓的只有分佈很集中的指數。
-> - 單一模型：逐 tensor 解析檔案，浮點 tensor 拆成位元平面（讓指數集中成一條串流，這是 ZipNN 提出的作法），再用 zlib 的 Huffman 編碼，實測 66.4%，距離理論下限 66.2% 只差 0.2 個百分點。整個工具只用 NumPy、zlib、zstd，沒有自己的編譯程式碼。
+> - 單一模型：逐 tensor 解析檔案，浮點 tensor 分組成位元平面（分組的概念來自 ZipNN；BF16、F32 會先把高 16 位元循環左移 3 位），每個平面用 zstd，Huffman 省得夠多才改用它，實測 66.1%，order-0 熵約 65.8%。整個工具只用 NumPy、zlib、zstd，沒有自己的編譯程式碼。
 > - 同家族模型：把微調模型存成「和 base 的差」。每個權重的殘差用 ans16（自寫的 rANS 熵編碼器）壓縮，並用 base 權重的指數當上下文；base 本身就是預測器，不需要另外訓練網路。
-> - 依 tensor 名稱配對，所以檔名、分片、順序、dtype（BF16/F16/F32）、詞彙表大小不同都能共用。
+> - 依 tensor 名稱配對，所以檔名、分片、順序、dtype（BF16/F16/F32）、詞彙表大小不同都能共用；GGUF 與 safetensors 名稱不同，改依形狀與內容配對。
 > - base 自動挑選：每個檔案對歸檔中所有可配對的模型抽樣試算，選壓得最小的；也可用 `--base` 指定。
 > - 每一層都有 SHA-256 / CRC 驗證；打包時一定從磁碟解回比對才算完成。修復交給外部方案（見 protection.md）。
 
@@ -18,8 +18,9 @@ takes only a few dozen values, while the mantissa is close to random. Measured o
 | sign | 1 | 1.000 |
 | exponent | 8 | 2.639 (only 38 distinct values) |
 | mantissa | 7 | 6.957 |
-| **total** | **16** | **10.596 → floor ≈ 66.2 %** |
+| **total** | **16** | **10.596 → 66.2 %, the fields coded separately** |
 
+Coded together, the 16 bits take 10.52 bits (65.8 %): a weight's exponent and its top mantissa bits are not independent.
 Byte-oriented compressors see the exponent split across two bytes and mixed with mantissa noise: `zstd -19` only
 reaches 75.9 %. No coder can beat the entropy of the mantissa, so ~66 % is the practical limit for one BF16 model on
 its own.
@@ -28,19 +29,25 @@ its own.
 
 safetensors headers and GGUF tensor tables are parsed, and every tensor becomes its own region:
 
-- **float tensors** (BF16, F16, F32, FP8) → **byte planes**: the bits of each weight are regrouped so that the
-  exponents form a byte stream of their own, the byte grouping proposed by [ZipNN](https://github.com/zipnn/zipnn)
-  (IBM). That plane is entropy-coded with DEFLATE in Huffman-only mode (zlib); the sign and mantissa planes, close to
-  random, are kept as they are or zstd-coded when that helps. Qwen2.5-0.5B: **66.4 %**, 0.2 points above the floor.
+- **float tensors** (BF16, F16, F32, FP8) → **byte planes**: each weight's bytes are grouped into streams, the byte
+  grouping proposed by [ZipNN](https://github.com/zipnn/zipnn) (IBM). For BF16 and F32 the top 16 bits are first
+  rotated left by 3 bits, which measured smallest across model families; F16 and FP8 keep their bytes. Each plane is
+  coded with zstd level 1, or with DEFLATE in Huffman-only mode (zlib) where a sample says that saves over 0.5 % of
+  the plane, or kept as it is. Qwen2.5-0.5B: **66.1 %**.
+- **quantized tensors with their weights in the pack** (Q8_0, Q4_K, Q5_K, Q6_K) → rebuilt: a quantized value is the nearest
+  step to its weight, so only the scales and the rare differences are stored. Every step of that arithmetic is an IEEE 754
+  binary32 result, so it comes out the same on any machine, and restoring can redo it in exact fractions if it must.
 - **quantized and integer tensors** (GGUF Q4_K, Q8_0, …; int8) and metadata → zstd. Quantized data is already near
   its entropy, so expect 95–97 %.
-- **unknown binaries** (PyTorch `.bin`, …) → 64 MiB chunks, each stored with whichever of BF16 byte planes and zstd
-  is smaller.
+- **unknown binaries** (PyTorch `.bin`, …) → 64 MiB chunks, each stored with whichever of plain byte columns and
+  zstd is smaller.
 
-Only the entropy coding of the exponents matters: the LZ matching of a general compressor finds nothing to reuse in
-them (zstd at fast levels is 3–4 points worse than plain Huffman coding). ZipNN's own code is not used: the byte
+On a plane holding the exponents alone, the LZ matching of a general compressor finds nothing to reuse (zstd at fast
+levels is 3–4 points worse than plain Huffman coding). On the rotated planes, whose bits are less skewed, zstd level 1
+comes within 0.07 points on Qwen2.5-0.5B and codes and decodes faster, so it is the default; where it falls short, as on
+XOR deltas (53.2 % against 51.4 %), the plane goes to Huffman coding. ZipNN's own code is not used: the byte
 planes are a few NumPy bit operations, and zlib and zstd do the coding, so the tool has no compiled code of its own
-([benchmarks](benchmarks.md#the-float-codec-byte-planes-vs-zipnn) compare the two). The gains beyond this come from
+([benchmarks](benchmarks.md#byte-planes-against-zipnn-format-4) compare the two). The gains beyond this come from
 families of models.
 
 ## 3. Families: fine-tunes as deltas (ans16)
@@ -64,7 +71,7 @@ Entropy of the Qwen2.5-0.5B-Instruct delta against its base, in bits per weight 
 | XOR | 8.10 (50.6 %) | 8.09 (50.6 %) | 7.47 (46.7 %) |
 | **SUB (what ans16 codes)** | 7.67 (47.9 %) | 7.66 (47.9 %) | **7.02 (43.9 %)** |
 
-ans16 reaches **44.2 %** in practice (the XOR with the base, in byte planes: 53.6 %). Light fine-tunes, where most weights did not move,
+ans16 reaches **44.2 %** in practice (the XOR with the base, in byte planes: 51.4 %). Light fine-tunes, where most weights did not move,
 shrink to a few percent (see [benchmarks](benchmarks.md)).
 
 This is the "compress a model with a model" idea in its useful form: instead of training a network to predict the
@@ -80,8 +87,11 @@ new file is looked up in **all** files of the base repo by name:
 | exact | same name, dtype and size | ans16 (16-bit floats) or the XOR with the base, in byte planes or zstd |
 | converted | same name and element count, other float dtype (BF16 ↔ F16, F32 → BF16/F16) | base values converted with IEEE round-to-nearest-even, then as above |
 | leading rows | same name, same shape except the first dimension (vocabulary extended or trimmed) | shared rows as above, extra rows standalone |
+| by content | in a file of the other format (GGUF, safetensors), where names differ: float tensors of the same shape, those with the same numbers in their names first, and among them the one whose first 4096 elements differ least | as exact or converted |
+| one direction | a matrix whose change from the same-named base matrix is mostly one column times one row, as abliteration's is | those two vectors, and ans16 of what they leave, with its contexts still the base's |
+| rebuilt | a quantized tensor (Q8_0, Q4_K, Q5_K, Q6_K) and, by name or by content, its weights, or the same tensor at another quantization | its scales, and its values minus what arithmetic predicts from the parent |
 
-So a delta still works across different file names, header sizes, shardings, tensor orders, float dtypes and
+So a delta still works across different file formats, file names, header sizes, shardings, tensor orders, float dtypes and
 vocabulary sizes. A region is also coded standalone whenever its delta is not clearly smaller (every XOR delta, an
 ans16 delta above half the original size), and the smaller is kept, so a weak base costs nothing.
 

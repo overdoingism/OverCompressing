@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading.Tasks;
 
 namespace OverCompressingUI.Core;
 
@@ -14,7 +15,7 @@ public sealed class Job
     public string Title = "";
     public List<string> Models = new();
     public int ModelsAt;
-    public Func<Job, ToolEvent?, List<string>?>? Retry;  // the arguments to run a failed job again with (given its error event), or null
+    public Func<Job, ToolEvent?, Task<List<string>?>>? Retry;  // the arguments to run a failed job again with (given its error event, asking the user), or null
 
     public Job(IEnumerable<string> argv, string title)
     {
@@ -47,26 +48,29 @@ public sealed class JobRunner
     public List<ToolEvent> Events { get; } = new();  // the hints and summaries of the job running (or that ran last)
     public DamageReport? Damage { get; private set; }
     public ToolEvent? Error { get; private set; }  // the error event that ended the job, with its code
+    public int ExactRegions { get; private set; }  // "exact" events of the job running: regions worked out the slow way
     public StringBuilder Output { get; } = new();
+    public List<string> NotExact { get; } = new();  // the notes beside files written that are not the originals (restore --accept-inexact), this batch
 
     public Action<string, string?>? OnLog;  // text, tag ("command" or null)
     public Action<string>? OnLine;  // the last line printed (for the busy window and the status line)
     public Action<ToolEvent>? OnProgress;
     public Action<Job>? OnJobStarted;
-    public Action<bool, Job?, int, string, DamageReport?>? OnFinished;  // ok, the job that failed, its exit code, its output, damage
+    public Action<int>? OnExact;  // a region is being worked out exactly (slow): how many so far in this job
+    public Action<Job>? OnJobDone;  // a job that ran through (exit 0, or an inexact restore the user asked for): the next one follows
+    public Action<bool, Job?, int, string, DamageReport?>? OnFinished;  // ok, the job that failed, its exit code, its output, damage; the window runs its `done` on ok
     public Action? OnCancelled;
 
     private readonly Queue<Job> _jobs = new();
     private CliProcess? _proc;
     private readonly List<string> _listFiles = new();
-    private Action? _done;
 
-    public void Start(IEnumerable<Job> jobs, Action done)
+    public void Start(IEnumerable<Job> jobs)
     {
         _jobs.Clear();
         foreach (var j in jobs)
             _jobs.Enqueue(j);
-        _done = done;
+        NotExact.Clear();
         JobNumber = 0;
         JobTotal = _jobs.Count;
         Cancelling = false;
@@ -85,6 +89,7 @@ public sealed class JobRunner
         Events.Clear();
         Damage = null;
         Error = null;
+        ExactRegions = 0;
         Progress = null;
         JobNumber++;
         StartedAt = DateTime.Now;
@@ -151,6 +156,10 @@ public sealed class JobRunner
                 Damage = DamageReport.From(e);
             if (e.Event == "error")
                 Error = e;
+            if (e.Event == "exact")
+                OnExact?.Invoke(++ExactRegions);
+            if (e.Event == "inexact" && Current is { } cur && cur.Argv.Count > 3)  // restore: the note's path in the destination
+                NotExact.Add(Path.Combine(new[] { cur.Argv[3] }.Concat((e.Str("note") ?? "").Split('/')).ToArray()));
             if (e.Event is "hint" or "summary")
                 Events.Add(e);
             if (e.Event == "progress")
@@ -184,22 +193,33 @@ public sealed class JobRunner
             OnCancelled?.Invoke();
             return;
         }
-        if (code != 0)
-        {
-            var retry = Current?.Retry?.Invoke(Current, Error);
-            if (retry is null)
-            {
-                Finish(false, Current, code, output, Damage);
-                return;
-            }
-            var again = new Job(retry, Current!.Title) { Models = Current.Models, ModelsAt = Current.ModelsAt, Retry = Current.Retry };
-            var rest = _jobs.ToList();
-            _jobs.Clear();
-            _jobs.Enqueue(again);
-            foreach (var j in rest)
-                _jobs.Enqueue(j);
-            JobNumber--;
+        var job = Current!;
+        if (code != 0 && !(Error?.Str("code") == "inexact" && job.Argv.Contains("--accept-inexact")))  // the latter the user
+        {   // asked for: it did what it could, and what follows runs (the window says which files are not the originals)
+            _ = Retry(job, code, output, Damage);
+            return;
         }
+        OnJobDone?.Invoke(job);
+        NextJob();
+    }
+
+    /// <summary>A failed job's second chance: its Retry hook asks the user (a question, on the main thread) and gives
+    /// the arguments to run it again with; the job then goes back to the front of the queue, what follows it kept.</summary>
+    private async Task Retry(Job job, int code, string output, DamageReport? damage)
+    {
+        var retry = job.Retry is null ? null : await job.Retry(job, Error);
+        if (retry is null)
+        {
+            Finish(false, job, code, output, damage);
+            return;
+        }
+        var again = new Job(retry, job.Title) { Models = job.Models, ModelsAt = job.ModelsAt, Retry = job.Retry };
+        var rest = _jobs.ToList();
+        _jobs.Clear();
+        _jobs.Enqueue(again);
+        foreach (var j in rest)
+            _jobs.Enqueue(j);
+        JobNumber--;  // the same job, once more
         NextJob();
     }
 
@@ -207,10 +227,7 @@ public sealed class JobRunner
     {
         _jobs.Clear();
         Cancelling = false;
-        var done = _done;
         OnFinished?.Invoke(ok, failed, code, output, damage);
-        if (ok)
-            done?.Invoke();
     }
 
     /// <summary>Cancel after the current step (the runner stops as on Ctrl+C); the second time, stop now.</summary>

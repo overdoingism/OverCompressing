@@ -14,7 +14,13 @@ namespace OverCompressingUI.UI;
 ///   --wait=&lt;seconds&gt;    how long to wait before the screenshot (default 2.5)
 ///   --view=list|base|graph  the pack view to switch to first
 ///   --select=&lt;n&gt;        select the first n rows first
-///   --dialog=&lt;name&gt;     open a dialog first: pack, extract, export, rebase, rename, settings, remove, damage
+///   --dialog=&lt;name&gt;     open a dialog first: pack, extract, export, rebase, rename, settings, remove, damage, damage-here
+///   --tool=&lt;path&gt;       run this llm_archive.py instead of the one found (a test copy that fakes "does not rebuild here")
+///   --answer=yes,no,...  the next dialogs answer themselves, in this order (a question of a job, say); the rest stay
+///   --script=&lt;file&gt;     steps, one per line, run one after another before the screenshot: "cmd|arg|arg" (a job of the
+///                        tool, waited for), "answer:yes,no" (queued for the dialogs to come), "cancel:&lt;s&gt;" (the next
+///                        job is cancelled after s seconds), "flag:on|off" (an OFF file beside the --tool copy, read by
+///                        it), "shot:&lt;png&gt;", "wait:&lt;s&gt;", "go:&lt;place&gt;"; "#" starts a comment
 ///   --stay               do not quit after the screenshot
 /// </summary>
 public static class DevHooks
@@ -80,6 +86,8 @@ public static class DevHooks
         }
         if (!args.ContainsKey("shot"))
             return;
+        if (args.TryGetValue("answer", out var answers))
+            Answers(answers);
         double wait = args.TryGetValue("wait", out var w) && double.TryParse(w, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var ws) ? ws : 2.5;
         await window.ToSignal(window.GetTree().CreateTimer(wait), SceneTreeTimer.SignalName.Timeout);
         if (args.TryGetValue("view", out var view))
@@ -88,6 +96,8 @@ public static class DevHooks
             window.DevSelectFirst(n);
         if (args.TryGetValue("job", out var job))  // "--job=verify|<pack>" : the tool's arguments, | separated
             window.DevStartJob(job.Split('|'));
+        if (args.TryGetValue("script", out var script))
+            await RunScript(window, script, args.GetValueOrDefault("tool", ""));
         if (args.TryGetValue("go", out var go))  // go to another place after the wait (the board slides in)
         {
             window.DevGo(go);
@@ -147,6 +157,75 @@ public static class DevHooks
             Input.SetCustomMouseCursor(null, Input.CursorShape.Arrow);
             Input.SetCustomMouseCursor(null, Input.CursorShape.Ibeam);
             window.GetTree().Quit();
+        }
+    }
+
+    private static async Task RunScript(MainWindow window, string path, string tool)
+    {
+        foreach (var raw in File.ReadAllLines(path))
+        {
+            var line = raw.Trim();
+            if (line.Length == 0 || line.StartsWith("#"))
+                continue;
+            GD.Print($"script: {line}");
+            var colon = line.IndexOf(':');
+            var (op, arg) = colon > 0 && !line.Contains('|') ? (line[..colon], line[(colon + 1)..].Trim()) : ("", line);
+            switch (op)
+            {
+                case "answer":
+                    Answers(arg);
+                    break;
+                case "cancel":
+                    _ = CancelLater(window, double.Parse(arg, System.Globalization.CultureInfo.InvariantCulture));
+                    break;
+                case "flag":
+                {
+                    var flag = Path.Combine(Path.GetDirectoryName(tool) ?? ".", "OFF");
+                    if (arg == "on")
+                        File.WriteAllText(flag, "");
+                    else if (File.Exists(flag))
+                        File.Delete(flag);
+                    break;
+                }
+                case "shot":
+                    await Shot(window, arg);
+                    break;
+                case "wait":
+                    await window.ToSignal(window.GetTree().CreateTimer(double.Parse(arg, System.Globalization.CultureInfo.InvariantCulture)), SceneTreeTimer.SignalName.Timeout);
+                    break;
+                case "go":
+                    window.DevGo(arg);
+                    await Idle(window);
+                    break;
+                default:  // one job, or several in one batch: "cmd|arg && cmd|arg"
+                    window.DevStartJobs(arg.Split("&&").Select(j => j.Trim().Split('|')).ToList());
+                    await window.ToSignal(window.GetTree().CreateTimer(0.5), SceneTreeTimer.SignalName.Timeout);
+                    await Idle(window);
+                    break;
+            }
+        }
+    }
+
+    /// <summary>"yes,no@shot.png,...": the answers queued for the dialogs to come, each with a screenshot to take first.</summary>
+    private static void Answers(string text)
+    {
+        foreach (var a in text.Split(',', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var at = a.IndexOf('@');
+            var word = (at >= 0 ? a[..at] : a).Trim().ToLowerInvariant();
+            OcDialog.DevAnswers.Enqueue((word is "yes" or "ok" or "y", at >= 0 ? a[(at + 1)..].Trim() : null));
+        }
+    }
+
+    /// <summary>Wait until nothing runs and no dialog is open, and that has held for a second (a report opens a moment
+    /// after a job ends).</summary>
+    private static async Task Idle(MainWindow window)
+    {
+        double quiet = 0;
+        while (quiet < 1.0)
+        {
+            await window.ToSignal(window.GetTree(), SceneTree.SignalName.ProcessFrame);
+            quiet = window.DevIdle ? quiet + window.GetProcessDeltaTime() : 0;
         }
     }
 

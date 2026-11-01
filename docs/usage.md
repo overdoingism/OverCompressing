@@ -69,6 +69,7 @@ The `code` of an error tells programs what failed; the text is for people and ma
 | `busy` | the pack folder is in use by another command | run again when it has finished |
 | `no_room` | not enough free space, found before writing or while writing | free space, or point `OC_TMP` elsewhere |
 | `damaged` | a blob is damaged or missing: verify found it, or another command met it (restore, export, rebase, remove) | run `verify` for the full report; verify itself gives it first, as a `damage` event (the others do not) |
+| `inexact` | a tensor's stored bytes are intact but do not rebuild against its base on this machine (restore, verify), or `--accept-inexact` wrote a file that is not the original | try another machine; restore: `--accept-inexact` writes it all the same |
 | `cancelled` | stopped by Ctrl+C, or by the window's Cancel | — |
 | `other` | anything else | read the text |
 
@@ -132,7 +133,8 @@ changed); every other button acts on what is selected, so it is off while nothin
 - **In a folder:** **+ Pack to** packs the selected folder, or the selected files of this folder (they then make up
   the model on their own; one file is named after itself by default), into a pack folder you choose (remembered for
   the next pack) or into a new pack file (`.oczip`); a name the pack folder holds already is replaced only after you
-  agree. **↻ Refresh**. **− Remove** moves the selection to the Recycle Bin (on Linux, the desktop trash), after
+  agree. Its dialog has **Δ Code quantized weights against the weights they came from**, ticked each time: unticked is
+  `--no-quant` (section 2), as in **+ Pack in** and under Find better bases in **⇄ Rebase**. **↻ Refresh**. **− Remove** moves the selection to the Recycle Bin (on Linux, the desktop trash), after
   asking, and never deletes anything for good: where the bin would not take it (a network or removable drive, a bin
   set to delete at once, or one too small for it) it is refused, and you delete it yourself if you mean to. Inside a
   pack folder's own folders (`blobs/`, `models/`), Pack to and Remove are off: a pack changes only through its own
@@ -162,12 +164,17 @@ In a pack file, which is read-only, Pack in, Add file, Remove and Rename are off
 is on.
 
 When ✔ Verify finds damage, its **damage report** opens (section 4): **⧉ Copy** puts it on the clipboard, to keep or
-to ask someone (or an AI) what to do; its commands store a lost file again or give it up. Until the pack changes, the
-list marks what was lost in Needs (`⚠ failed verify`, `(its base)` for a file lost through what it is coded against;
+to ask someone (or an AI) what to do; its commands store a lost file again or give it up. Until the pack changes or a
+later verify finds it sound, the list marks what was lost in Needs (`⚠ failed verify`, `(its base)` for a file lost through what it is coded against;
 `⚠ 2 files failed verify` on a model), in red. In a pack folder, **− Clean up** removes what was lost at the level you
 type, each shown with what it removes and its risk: **ERASE** only the lost files (a model left with none goes);
 **ERASE MOD** the models with lost files, whole; **ERASE FULL** those and the models that need data of them. It runs
 only while the pack is as it was verified; verify again afterwards.
+
+A file whose stored bytes are intact but do not rebuild on this machine (`inexact`, section 5) is not treated as lost:
+the list marks it `⚠ not rebuilt here`, and − Clean up stays off while any blob at fault is like that, since another
+machine may restore it. ⤒ Extract to asks before writing such a file. If you agree, it goes on with what else you
+chose to extract, then lists the notes beside the files that are not the originals.
 
 The list updates itself: every 5 seconds, and at once when you move the mouse over the window or click in it after
 that long, it looks at one time stamp (of the pack folder's `ocpack.json`, of the pack file, or of the folder shown) and
@@ -178,12 +185,13 @@ Each action runs `llm_archive.py` exactly as below and shows its output (a comma
 list file, `--models-from` or `--files-from`, deleted after). While it runs, a window in front shows what
 runs, its last line, the step and how far it is (`37% · 5.6 GiB / 15.1 GiB`, when the tool can tell) and the time so
 far beside a turning ◐, and holds the rest of the window; **✕ Cancel** there, or closing it, stops the run as Ctrl+C
-would, so nothing half-done stays in the pack. The run has below-normal priority (`nice` 10 on Linux): it uses every
+would, so nothing half-done stays in the pack. If a file has to be rebuilt the slow, exact way (section 5), a note there says
+so, as the percentage then stands still for minutes. The run has below-normal priority (`nice` 10 on Linux): it uses every
 core left idle and gives way to what you are doing meanwhile. Delta bases are always chosen automatically; `--base`,
-`rebase` and the other options are on the command line only. The window's text is English and symbols, whatever the system language.
+`rebase` and the other options are on the command line only. The window's text is English and symbols, whatever the system language; where its Tk has no Xft (a portable copy on Linux), it cannot draw those symbols, so the text is plain ASCII there.
 Started from a portable copy kept in a pack folder as `_kit` (see Portable copy), it opens that pack. Its title shows its own version and that of `llm_archive.py`, each
 with its build (the date and commit the file was last changed in; `edited` if it differs from that commit), e.g.
-`OverCompressing GUI 0.5 (2026-10-22 1a2b3c4) · CLI 0.5 (2026-10-22 1a2b3c4)`: give both when reporting a problem.
+`OverCompressing GUI 0.6 (2026-11-01 1a2b3c4) · CLI 0.6 (2026-11-01 1a2b3c4)`: give both when reporting a problem.
 `llm_archive.py --version` prints the second.
 
 ## 1. `pack` — compress folders into a pack
@@ -220,6 +228,8 @@ there, and export again.
 | `--base MODEL` | use this model (of the pack, or packed in the same command) as the base of every file instead of choosing one per file |
 | `--no-base` | store every new file without a delta base |
 | `--delta-codec ans16\|xor` | for 16-bit float tensors: ans16 (default, smaller) or the XOR with the base in byte planes (faster) |
+| `--no-quant` | do not code quantized tensors against the weights they came from (section 2): by default they are, where that is smaller. It holds for this command, and changes nothing already stored; `rebase MODEL --no-base` stores a file without a base again |
+| `--no-rank1` | do not look for a change of one direction in matrices (section 2), as abliteration makes: by default it is used where smaller. It holds for this command, and changes nothing already stored |
 | `--zstd-level N` | zstd level 1–22 for headers, metadata and text (default 19) |
 | `--zstd-tensor-level N` | zstd level 1–22 for quantized tensors and unknown binaries (default 9) |
 | `--workers N` | worker processes for ans16, 1–1024, at most 61 on Windows (default: `OC_WORKERS`, else the CPUs it may use) |
@@ -267,9 +277,10 @@ allow (e.g. a Linux file called `a\b.txt`) is recorded as it is, and `restore` a
 
 Without `--base`, every new file picks its own base among the other models of the pack:
 
-1. **Candidates**: every model with tensors that match this file's by name (same format; same dtype and size,
-   another float dtype, or the same leading rows; see [How it works](principles.md#4-matching-tensors-not-files)).
-   Only manifests are read; nothing is decompressed.
+1. **Candidates**: every model with tensors that match this file's by name (same dtype and size, another float
+   dtype, or the same leading rows; see [How it works](principles.md#4-matching-tensors-not-files)), and every model
+   with a file in the other format (safetensors, GGUF) whose float tensors have the shapes of at least half of this
+   file's tensor bytes. Only manifests are read; nothing is decompressed.
 2. **Trial**: 16 windows of the file (512 KiB each, spread over its tensors) are coded against each candidate with
    fast estimates and compared with storing them standalone. Only the parts of a candidate those windows need are
    decoded.
@@ -277,6 +288,16 @@ Without `--base`, every new file picks its own base among the other models of th
    file gets no base. A delta that, once coded, reads its base for less than 1 % of the file (storing the rest
    without it came out smaller) is stored standalone instead, so that no model needs another for nothing; this also
    holds for `--base`.
+
+So a GGUF of the same weights as a safetensors model in the pack, or the other way round, is stored in almost nothing
+beyond its own metadata, whatever the order they are packed in. A quantized tensor (Q8_0, Q4_K, Q5_K, Q6_K) can also be
+coded against the weights it was quantized from, in either format, or against the same tensor at another quantization:
+what is stored is its scales and where the values differ from what arithmetic predicts. It is on by default; `--no-quant` (or
+`--delta-codec xor`) turns it off for that command.
+
+A matrix changed along one direction, as abliteration changes it, is stored as two vectors and what they leave unexplained, far
+smaller than the differences one by one. It is on by default where smaller, and costs other models a little time; `--no-rank1`
+turns it off for that command. Restoring such a region falls back as for quantized tensors (section 5).
 
 Files of one folder may pick different bases (e.g. a BF16 GGUF picks a BF16 GGUF, a Q4_K_M one a Q4_K_M), so a model
 may need several models, and several models may need one: what needs what is a graph that grows as you pack, never a
@@ -342,8 +363,8 @@ blobs at fault; the files lost (`its own blob`, or `through` the file whose blob
 with lost files, how many of their weight files among them; the models that need data of those; and, for each blob at
 fault, its file's SHA-256 and how many lost files storing that original again would heal
 (`pack <folder holding it> <pack> --name MODEL --add --file PATH`, which heals everything coded against it too), or
-how to give a lost file up (`remove <pack> MODEL --file PATH`). With `--json` it is one `damage` event (`faults`,
-`lost`, `models`, `affected`, `heal`, `manifests`). `--file PATH` (repeatable, with one model named) checks only
+how to give a lost file up (`remove <pack> MODEL --file PATH`). With `--json` it is one `damage` event (`faults`, each
+with `intact` if its stored bytes are intact and only do not rebuild here; `lost`, `models`, `affected`, `heal`, `manifests`). `--file PATH` (repeatable, with one model named) checks only
 those files of it, their paths as the pack lists them. Prints `ALL VERIFIED (<n> files)` or each failure with its
 cause, and exits with a non-zero code on any failure, and also when it verified nothing (no pack there, or no models
 in it). A missing or damaged blob, and a manifest that cannot be read or holds an unsafe path or name, are reported
@@ -352,7 +373,7 @@ like any other failure; the rest is still checked. Run it after copying a pack a
 ## 5. `restore`
 
 ```bash
-python -I tools/llm_archive.py restore <pack> MODEL <dest_dir> [--overwrite] [--file PATH ...] [--files-from FILE] [--flat] [--no-lock]
+python -I tools/llm_archive.py restore <pack> MODEL <dest_dir> [--overwrite] [--file PATH ...] [--files-from FILE] [--flat] [--accept-inexact] [--no-lock]
 ```
 
 Writes the original files of a model, byte-identical, and checks each SHA-256. ans16 deltas first restore the base
@@ -362,6 +383,16 @@ straight into `<dest_dir>`, without the model's folders; of two files of one nam
 (with `--file`, only the files named count). Restore checks what it writes (each file against its SHA-256, and the
 blobs it needs), not the rest of the pack: it can give back the intact files of a pack that `verify` finds faults in,
 and a restore that succeeds says nothing of the other models. `verify` checks the pack as a whole.
+
+A quantized tensor stored against a parent, or a matrix stored as a change of one direction, is rebuilt by arithmetic that gives the same result on any sound machine. If a
+region does not come out right though its stored bytes are intact, restore tries again, then works it out without the
+machine's floating point (slow), which restores the original exactly; only if that fails too does it stop, with code
+`inexact`. That is not damage, and another machine may restore the file. `--accept-inexact` then writes the file all the same,
+with `<file>.not-exact.txt` beside it, and still ends with that code: some values of those regions may be off, so
+the file is not the original. It changes nothing for a blob that is damaged. The note never replaces anything without
+`--overwrite`, nor a folder or a link or a file of the model even with it: it then takes the next name
+(`<file>.not-exact (1).txt`), given in the output (`note` in the `inexact` event). If the note cannot be written, neither is
+the file. A later restore that comes out right leaves an old note in place: delete it yourself.
 
 Before writing anything, every path in the manifest is checked: it must be relative, without `..`, and land inside
 `<dest_dir>`; restore never writes through a link, so if a folder on the way below `<dest_dir>` is a symlink or a
@@ -444,7 +475,7 @@ bases deeper than 32.
 | `--base MODEL` | re-pack every file against this model, even if it gets larger (a file that model needs, directly or not, stays as it is) |
 | `--no-base` | re-pack every file without a delta base, even if it gets larger |
 | `--dry-run` | show what would change; change nothing |
-| `--delta-codec`, `--zstd-level`, `--zstd-tensor-level`, `--workers`, `--chunk-mib` | as for `pack` |
+| `--delta-codec`, `--no-quant`, `--no-rank1`, `--zstd-level`, `--zstd-tensor-level`, `--workers`, `--chunk-mib` | as for `pack` |
 
 Every file that could change gets a line (unchanged, or how it is stored now and what that replaces), then the
 model's stored size before and after (with `--file`, that of the files named: `rebasing b.safetensors of org/model`,
@@ -558,6 +589,7 @@ from the repository. A `_kit/` of that kind in an older pack still works as its 
 | `its blob is damaged` / `… is missing from the pack` | replace the pack from another copy; if you still have the original files, packing them again stores a damaged file again |
 | out of disk during restore/verify of a delta, or `not enough room to rebase` | set `OC_TMP` to a folder with more space |
 | out of memory | set `OC_WORKERS` to 4 or less |
+| `a pack of format version 4: this tool reads version 5` | the pack was written by CLI 0.5 or earlier, whose format this version does not read: restore its models with that version (commit 802b0f0), then pack them again |
 | leftover `oc-base-*.bin` or `oc-rebase-*` in the temp folder after a killed run | delete it |
 | leftover `.oc-*.part` after a killed run | delete it, or let the next `pack`, `remove` or `rebase` do it |
 | `already exist … with other contents` (restore) | restore into an empty folder, or add `--overwrite` |
@@ -644,6 +676,7 @@ python -I tools/llm_archive.py pack models/Qwen2.5-7B Qwen2.5-7B.oczip
 | `busy` | pack 資料夾正被另一個指令使用 | 等它結束再跑 |
 | `no_room` | 空間不足，寫入前或寫入途中發現 | 清出空間，或把 `OC_TMP` 指到別處 |
 | `damaged` | 有 blob 損毀或遺失：verify 發現，或其他指令（restore、export、rebase、remove）途中遇到 | 執行 `verify` 取得完整報告；只有 verify 自己會先輸出它（`damage` 事件），其他指令不會 |
+| `inexact` | tensor 儲存的資料完好，但在這台機器上無法依基底重建（restore、verify），或 `--accept-inexact` 寫出了不是原檔的檔案 | 換一台機器試；restore：`--accept-inexact` 仍會寫出 |
 | `cancelled` | 被 Ctrl+C 或視窗的 Cancel 中止 | — |
 | `other` | 其他所有情況 | 看文字 |
 
@@ -693,7 +726,8 @@ pack 檔）會開成**模型清單**：列出每個模型的打包時間、檔�
 
 - **在一般資料夾：** **+ Pack to** 把選取的資料夾，或這個資料夾中選取的檔案（這些檔案自成一個模型；只選一個檔案時，預設以檔名
   命名），壓縮進你指定的 pack 資料夾（下次壓縮會記住），或壓成一個新的 pack 檔（`.oczip`）；pack 資料夾裡已有同名模型時，經你
-  同意才會取代。**↻ Refresh** 重新整理。**− Remove** 先詢問，再把選取的項目移到資源回收筒（Linux 上是桌面的垃圾桶），絕不會
+  同意才會取代。對話框裡有 **Δ Code quantized weights against the weights they came from**，每次都預設勾選；不勾就是 `--no-quant`（第 2 節），
+  **+ Pack in** 與 **⇄ Rebase** 的 Find better bases 底下也一樣。**↻ Refresh** 重新整理。**− Remove** 先詢問，再把選取的項目移到資源回收筒（Linux 上是桌面的垃圾桶），絕不會
   永久刪除：資源回收筒收不下的（網路磁碟或卸除式磁碟、設定成直接刪除的資源回收筒，或空間不夠時）一律拒絕，真要刪除請自己動手。
   在 pack 資料夾內部的資料夾（`blobs/`、`models/`）裡，Pack to 與 Remove 會停用：pack 只能在它自己的畫面裡修改。
 - **在 pack 裡：** **+ Pack in** 詢問要打包哪個資料夾，打包進這個 pack 資料夾，或存成一個新的 pack 檔：另存成一個獨立的 pack，
@@ -715,11 +749,15 @@ pack 檔）會開成**模型清單**：列出每個模型的打包時間、檔�
 在 pack 檔裡（唯讀），Pack in、Add file、Remove 與 Rename 會停用，所以沒有選取時，沒有任何按鈕可按。
 
 ✔ Verify 發現損毀時，會開啟它的**損毀報告**（第 4 節）：**⧉ Copy** 把整份報告複製到剪貼簿，可以留存，或拿去問人（或 AI）
-該怎麼處理；報告裡的指令可以把遺失的檔案重新存回，或放棄它。在 pack 改變之前，清單會在 Needs 欄以紅字標出遺失的項目
+該怎麼處理；報告裡的指令可以把遺失的檔案重新存回，或放棄它。在 pack 改變或之後的驗證確認完好之前，清單會在 Needs 欄以紅字標出遺失的項目
 （檔案標 `⚠ failed verify`，因所依據的檔案壞掉而遺失的再加註 `(its base)`；模型標 `⚠ 2 files failed verify`）。在 pack 資料夾中，
 **− Clean up** 依你輸入的等級移除遺失的部分，每一級都會先列出會移除什麼與風險：**ERASE** 只移除遺失的檔案（檔案全被移除的模型
 也一併移除）；**ERASE MOD** 把有遺失檔案的模型整個移除；**ERASE FULL** 再加上需要這些模型資料的其他模型。只有在 pack 與驗證時
 相同時才會執行；完成後請再驗證一次。
+
+儲存的資料完好、只是在這台機器上重建不出來的檔案（`inexact`，第 5 節）不算遺失：清單標為 `⚠ not rebuilt here`；只要出問題的 blob 中
+有這種情況，− Clean up 就保持關閉，因為換一台機器可能就能還原。⤒ Extract to 寫出這種檔案前會先詢問；同意後會繼續解開其他選取的項目，
+最後列出那些非原檔旁邊的說明檔。
 
 清單會自己更新：每 5 秒，以及滑鼠在視窗上移動或點擊時（距上次超過 5 秒），檢查一個時間戳（pack 資料夾的 `ocpack.json`、pack 檔，
 或目前資料夾本身），有變才重新列出，並保留選取。按 **F5**（Force refresh）立即重新整理。視窗最小化或有工作正在執行時，不做檢查。快捷鍵說明在過濾框
@@ -727,10 +765,11 @@ pack 檔）會開成**模型清單**：列出每個模型的打包時間、檔�
 
 每個動作都是照下文的方式執行 `llm_archive.py`，並顯示它的輸出（命令列太長時，改用清單檔 `--models-from` 或 `--files-from` 傳遞，結束後刪除）。執行期間會有一個置前的視窗，顯示正在做什麼、最後一行輸出、
 目前步驟與進度（工具能計量時，例如 `37% · 5.6 GiB / 15.1 GiB`），以及轉動的 ◐ 旁的已執行時間，主視窗則暫時無法操作；在那個
-視窗按 **✕ Cancel** 或關掉它，效果等同按 Ctrl+C，pack 裡不會留下做一半的東西。執行的優先權是「低於標準」（Linux 上為
+視窗按 **✕ Cancel** 或關掉它，效果等同按 Ctrl+C，pack 裡不會留下做一半的東西。如果檔案必須用精確但很慢的方式重建（第 5 節），
+視窗會顯示提示，因為此時百分比會停住好幾分鐘。執行的優先權是「低於標準」（Linux 上為
 `nice` 10）：閒置的核心都會用上，你同時在用電腦時則讓給你的程式。差異基底一律自動選擇；`--base`、`rebase`
-等其他選項只能用命令列。介面文字只有英文與符號，與系統語系無關。從放在 pack 資料夾裡的可攜版（`_kit`，見「可攜版」）啟動時，會直接開啟那個 pack。視窗標題會顯示它自己和 `llm_archive.py` 的版本，各附 build（該檔案最後一次變更的
-commit 日期與編號；與該 commit 不同時加註 `edited`），例如 `OverCompressing GUI 0.5 (2026-10-22 1a2b3c4) · CLI 0.5 (2026-10-22 1a2b3c4)`。
+等其他選項只能用命令列。介面文字只有英文與符號，與系統語系無關；Tk 沒有 Xft 的環境（Linux 的可攜版）畫不出這些符號，所以那裡的文字全用 ASCII。從放在 pack 資料夾裡的可攜版（`_kit`，見「可攜版」）啟動時，會直接開啟那個 pack。視窗標題會顯示它自己和 `llm_archive.py` 的版本，各附 build（該檔案最後一次變更的
+commit 日期與編號；與該 commit 不同時加註 `edited`），例如 `OverCompressing GUI 0.6 (2026-11-01 1a2b3c4) · CLI 0.6 (2026-11-01 1a2b3c4)`。
 回報問題時請附上這兩個版本。`llm_archive.py --version` 會印出後者。
 
 ## 1. `pack`：把資料夾打包進 pack
@@ -763,6 +802,8 @@ python -I tools/llm_archive.py pack <來源資料夾> [<來源資料夾> ...] <p
 | `--base 模型` | 所有檔案都以這個模型（pack 中已有的，或同一個指令中打包的）為 base，不再逐檔自動挑選 |
 | `--no-base` | 所有新檔案都不使用 base |
 | `--delta-codec ans16\|xor` | 16-bit 浮點 tensor 的差異方式：ans16（預設，較小）或與 base 的 XOR 以位元平面壓縮（較快） |
+| `--no-quant` | 不以量化前的權重為基底儲存量化 tensor（第 2 節）：預設會，只要比較小。只對這個指令有效，不改變已儲存的內容；`rebase 模型 --no-base` 可把檔案改回不用 base |
+| `--no-rank1` | 不在矩陣中尋找沿單一方向的改動（第 2 節，abliteration 會產生這種改動）：預設在比較小時使用。只對這個指令有效，不改變已儲存的內容 |
 | `--zstd-level N` | 標頭、metadata、文字檔的 zstd 等級，1–22（預設 19） |
 | `--zstd-tensor-level N` | 量化 tensor 與未知二進位檔的 zstd 等級，1–22（預設 9） |
 | `--workers N` | ans16 平行程序數，1–1024，Windows 上最多 61（預設為 `OC_WORKERS`，未設定則為可使用的 CPU 數） |
@@ -803,12 +844,20 @@ Qwen/Qwen2.5-7B: org/fine-tune (rebase them to find out)`。這只比對 manifes
 
 不指定 `--base` 時，每個新檔案會各自從 pack 中的其他模型挑選 base：
 
-1. **候選**：所有 tensor 能依名稱與此檔配對的模型（同格式；dtype 與大小相同、其他浮點 dtype，或前段列相同，詳見
-   [原理](principles.md#4-matching-tensors-not-files)）。只讀 manifest，不解壓任何東西。
+1. **候選**：所有 tensor 能依名稱與此檔配對的模型（dtype 與大小相同、其他浮點 dtype，或前段列相同，詳見
+   [原理](principles.md#4-matching-tensors-not-files)），以及含另一種格式（safetensors、GGUF）檔案、其浮點 tensor 的形狀
+   涵蓋此檔至少一半 tensor 資料的模型。只讀 manifest，不解壓任何東西。
 2. **試算**：從檔案的 tensor 中平均取 16 段（每段 512 KiB），用快速估算對每個候選試壓，並與單獨壓縮比較。候選模型只解開
    這些片段需要的部分。
 3. **決定**：估算最小者勝出，但必須比單獨壓縮至少省下 1%，否則不用 base。實際編碼後，若 delta 只有不到檔案 1% 的部分
    真正用到 base（其餘不用 base 反而更小），就改成單獨存放，免得某個模型平白依賴另一個；指定 `--base` 時也一樣。
+
+所以與 pack 中某個 safetensors 模型相同權重的 GGUF（或反過來），不論打包順序，除了自己的 metadata 幾乎不占空間。量化 tensor
+（Q8_0、Q4_K、Q5_K、Q6_K）也能以它量化前的權重（兩種格式皆可）或其他量化版本的同一 tensor 為基底：只存 scale，以及數值與算術預測
+不同的地方。預設開啟；`--no-quant`（或 `--delta-codec xor`）可在該指令關閉。
+
+沿單一方向改動的矩陣（abliteration 就是如此）會存成兩條向量加上它們解釋不了的部分，比逐一存差值小得多。預設在比較小時使用，對其他模型只多花一點時間；
+`--no-rank1` 可在該指令關閉。還原這類區域時的退路和量化 tensor 相同（第 5 節）。
 
 同一個資料夾裡的不同檔案可以選不同的 base（例如 BF16 GGUF 選 BF16 GGUF，Q4_K_M 選 Q4_K_M），所以一個模型可能需要好幾個模型，
 好幾個模型也可能需要同一個：誰需要誰是一張隨著打包自然長出來的圖，不會有循環（blob 絕不以需要它的 blob 為基底），深度也不超過
@@ -864,7 +913,7 @@ blob 壞了而遺失」。不指定模型時驗證 pack 中的所有模型，並
 遺失的檔案（`its own blob` 是自己的 blob 壞了，`through` 是經由所依據的檔案）；有遺失檔案的模型，以及其中有幾個權重檔；需要
 這些模型資料的其他模型；以及每個出問題的 blob 對應檔案的 SHA-256、把那個原檔重新存回去能救回幾個遺失的檔案
 （`pack <放原檔的資料夾> <pack> --name 模型 --add --file 路徑`，以它為基礎的檔案也會一起恢復），或如何放棄遺失的檔案
-（`remove <pack> 模型 --file 路徑`）。加上 `--json` 時，報告是一個 `damage` 事件（`faults`、`lost`、`models`、`affected`、
+（`remove <pack> 模型 --file 路徑`）。加上 `--json` 時，報告是一個 `damage` 事件（`faults`，儲存的資料完好、只是在這裡重建不出來時其 `intact` 為真；`lost`、`models`、`affected`、
 `heal`、`manifests`）。`--file 路徑`（可重複，須指定一個模型）只驗證該模型的這些
 檔案，路徑照 pack 列出的寫法。結果為 `ALL VERIFIED (<n> files)`，
 或逐一列出失敗原因；有任何失敗時結束碼不為 0；什麼都沒驗證到時（那裡沒有 pack，或裡面沒有模型）結束碼也不為 0。缺少或損毀的
@@ -874,7 +923,7 @@ blob，以及無法讀取、或含有不安全路徑或名稱的 manifest，都�
 ## 5. `restore`：還原
 
 ```bash
-python -I tools/llm_archive.py restore <pack> 模型 <目的資料夾> [--overwrite] [--file 路徑 ...] [--files-from 檔案] [--flat] [--no-lock]
+python -I tools/llm_archive.py restore <pack> 模型 <目的資料夾> [--overwrite] [--file 路徑 ...] [--files-from 檔案] [--flat] [--accept-inexact] [--no-lock]
 ```
 
 寫回模型的原始檔案，逐 byte 相同，並核對 SHA-256。ans16 差異檔會先把用到的 base 檔還原到 `OC_TMP`。`--file 路徑`（可重複
@@ -895,6 +944,13 @@ python -I tools/llm_archive.py restore <pack> 模型 <目的資料夾> [--overwr
 「放上檔案」是同一個步驟（用 hard link；檔案系統不支援時，改用遇到同名就失敗的改名）。少數兩者都不支援的檔案系統（某些 FUSE
 或網路掛載）上，沒加 `--overwrite` 的還原會停止並說明原因；這時請還原到空資料夾並加上 `--overwrite`。目的地若本身是 pack
 資料夾或在其中（包括 `_kit`），還原出的檔案會和 pack 自己的檔案混在一起，即使加上 `--overwrite` 也會拒絕：請還原到它旁邊。
+
+以基底儲存的量化 tensor，以及存成單一方向改動的矩陣，是靠算術重建的，在任何正常的機器上結果都相同。若某區域儲存的資料完好卻算不對，restore 會再試一次，接著改用
+不靠機器浮點運算的方式重算（很慢），這樣可以精確還原；只有這也失敗才會停止，錯誤碼為 `inexact`。這不是損毀，換一台機器可能就能還原。
+此時 `--accept-inexact` 仍會寫出檔案，並在旁邊附上 `<檔名>.not-exact.txt`，結束時仍回報該錯誤碼：這些區域的部分數值可能有誤差，所以它
+不是原檔。對真正損毀的 blob 沒有作用。這份說明檔沒有 `--overwrite` 就不會取代任何東西，即使有 `--overwrite` 也不會取代資料夾、連結或模型本身的檔案：
+遇到這些情況會改用下一個名稱（`<檔名>.not-exact (1).txt`），實際名稱會顯示在輸出中（`inexact` 事件的 `note`）。說明檔寫不出來時，檔案也不會寫出。
+之後若還原成功，舊的說明檔會留在原處，請自行刪除。
 
 ## 6. `remove` 與 `rename`
 
@@ -950,7 +1006,7 @@ base（其 blob 直接或間接以這個檔案為基底的模型）絕不會被�
 | `--base 模型` | 所有檔案都以這個模型為 base 重新打包，即使變大也照做（該模型直接或間接需要的檔案維持原樣） |
 | `--no-base` | 所有檔案都不使用 base 重新打包，即使變大也照做 |
 | `--dry-run` | 只顯示會改變什麼，不做任何更動 |
-| `--delta-codec`、`--zstd-level`、`--zstd-tensor-level`、`--workers`、`--chunk-mib` | 同 `pack` |
+| `--delta-codec`、`--no-quant`、`--no-rank1`、`--zstd-level`、`--zstd-tensor-level`、`--workers`、`--chunk-mib` | 同 `pack` |
 
 每個可能改變的檔案各有一行（未改變，或現在的儲存方式與它取代了什麼），最後是該模型儲存大小的前後對照（用 `--file` 時，是所指名檔案的：`rebasing b.safetensors of org/model`、
 `b.safetensors of org/model: stored …`）。以下是比 0.5B Instruct
@@ -1048,6 +1104,7 @@ pack 檔必須放在 pack 資料夾之外（也不能在其他 pack 資料夾裡
 | `its blob is damaged` / `… is missing from the pack` | 從其他副本換回 pack；若還有原始檔案，重新打包它們即可把損毀的檔案重新存入 |
 | 還原或驗證差異檔時磁碟空間不足，或出現 `not enough room to rebase` | 將 `OC_TMP` 指到空間較大的資料夾 |
 | 記憶體不足 | 將 `OC_WORKERS` 設為 4 以下 |
+| `a pack of format version 4: this tool reads version 5` | 這個 pack 由 CLI 0.5 或更早的版本寫入，此版本讀不了它的格式：用該版本（commit 802b0f0）還原模型，再重新打包 |
 | 程式被強制中斷後，暫存資料夾留下 `oc-base-*.bin` 或 `oc-rebase-*` | 直接刪除 |
 | 程式被強制中斷後留下 `.oc-*.part` | 直接刪除，或讓下一次 `pack`、`remove`、`rebase` 處理 |
 | 還原時出現 `already exist … with other contents` | 還原到空資料夾，或加上 `--overwrite` |

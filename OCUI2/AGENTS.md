@@ -27,7 +27,7 @@ line, so the window could be built and checked without a hand on the mouse.
 | `build.ps1` / `run.ps1` | export `dist\OverCompressingUI.exe` and the release zip / build and run from the project |
 | `docs/` | screenshots, findings about the original project, third-party licenses |
 
-Not in the repository: `engine/` (downloaded), `dist/` (built), `.testpacks/` (local format-4 packs for testing),
+Not in the repository: `engine/` (downloaded), `dist/` (built), `.testpacks/` (local format-5 packs for testing),
 `.godot/`, `bin/`, `obj/`.
 
 ## Build, run, check
@@ -45,8 +45,10 @@ The window is checked by running it and reading a screenshot. From `OverCompress
 `engine\godot\...\Godot_v4.7.2-stable_mono_win64_console.exe --path . ++ <place> --shot=<png> --wait=<s>`. Everything
 after `++` is the window's (`DevHooks.cs`): a place to start in, then `--view=list|base|graph`, `--select=<n>`,
 `--dialog=pack|extract|export|rebase|rename|remove|verify|settings|busy|damage`, `--job=cmd|arg|arg`, `--cancel=<s>`,
-`--menu`, `--trash=<path>`, `--shot2=<png> --wait2=<s>`, `--scale=<f>`, `--go=<place>`, `--close`. Do that after every
-change, at 100 % and at a high display scale; drive dialogs through their buttons, not through keys.
+`--menu`, `--trash=<path>`, `--shot2=<png> --wait2=<s>`, `--scale=<f>`, `--go=<place>`, `--close`, `--tool=<llm_archive.py>` (a test
+copy of the tool, the settings untouched), `--answer=yes,no@shot.png,...` (the next dialogs answer themselves, after a screenshot each), `--script=<file>` (jobs,
+answers, cancels and screenshots one per line; the comment at the top of `DevHooks.cs` has the words). Do that after
+every change, at 100 % and at a high display scale; drive dialogs through their buttons or `--answer`, not through keys.
 
 There are no unit tests; `Core/` has no engine dependency and could take them.
 
@@ -64,7 +66,14 @@ free bandwidth on a dozen clones while every rebuild stayed in the history for g
 - Reading goes through the tool: `list <pack> --json` (one `pack` event, each model with `blobs`: sha256 → stored
   size), `list <pack> MODEL --json`, `remove --dry-run --json`, `--version`. Blobs are never parsed here; with an older
   tool the manifests are read instead. A failed run ends with an `error` event whose `code` (`exists`, `name_taken`,
-  `busy`, `no_room`, `damaged`, `cancelled`, `other`) is what the window acts on, never the text.
+  `busy`, `no_room`, `damaged`, `inexact`, `cancelled`, `other`) is what the window acts on, never the text: `exists` offers
+  a restore again with `--overwrite`, `inexact` (the bytes are intact but a quantized file does not rebuild on this
+  machine) with `--accept-inexact`, each flag once; a restore that ends `inexact` with that flag is no failure, and the
+  notes it wrote are listed when the batch ends. A failed job's question keeps the jobs after it in the queue.
+- An `exact` event (a region worked out the slow, exact way) puts a note on the busy card in the window's words
+  (`exact_slow`, with the count so far): the tool's progress stands still for minutes there, and a cut line is not enough.
+- Synced with upstream through format 5 (CLI 0.6). The Tkinter window (`../tools/llm_archive_gui.py`) is the
+  reference for behaviour and words; `inexact` is `code`, never text.
 - Every change runs `python -I -X utf8 -u -c <runner> <tools dir> <command...> --json --progress` in a child process
   at below-normal priority (`CliProcess`); the runner is the Tkinter window's `RUNNER`, verbatim: closing the child's
   stdin cancels as Ctrl+C would, "Stop now" is `taskkill /T /F`. Output is read on threads and drained each frame.
@@ -82,7 +91,13 @@ Add file always usable where the place can be changed; every other button acts o
 nothing is; nothing selected never means everything. The list watches one time stamp every 5 s and on mouse activity
 after that long, never while a job runs or a dialog is open; F5 lists again at once. − Remove in a folder goes to the
 Recycle Bin, never deletes for good. Verify's damage marks live in memory only and only while the pack's stamp is as
-it was verified; cleaning up is typed (`ERASE`, `ERASE MOD`, `ERASE FULL`).
+it was verified: a verify that ran through clears the marks of what it checked (its own argv: models, `--file=`) and
+marks what it found lost; a cancel or a failure without a report changes nothing; marks are of one pack at a time.
+What is lost only through blobs that are intact but do not rebuild here is marked "not rebuilt here", the report gets
+that heading, and − Clean up is off while any such blob is in it (it may restore on another machine). Cleaning up is
+typed (`ERASE`, `ERASE MOD`, `ERASE FULL`). + Pack in and ⇄ Rebase have a tick for coding quantized weights against
+the weights they came from, on every time (off: `--no-quant`). A typed path that exists is that path, whatever is in
+its name; only otherwise is `›` read as "<pack> › <model>".
 
 ## The look: decisions not to undo
 

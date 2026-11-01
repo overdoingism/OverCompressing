@@ -55,30 +55,38 @@ public sealed class Place
 
     public bool SamePlaceAs(Place? other) => other is not null && Text() == other.Text();
 
-    /// <summary>The place a typed path names (a folder, a pack, or "&lt;pack&gt; › &lt;model&gt;"), or null.</summary>
+    /// <summary>The place a typed path names (a folder, a pack, or "&lt;pack&gt; › &lt;model&gt;"), or null. A path that
+    /// exists is that path, whatever is in its name: the mark is read only otherwise, so a folder is never taken for
+    /// a model (found by the downstream team on the Tkinter window: "a > b" opened model b of pack a, with that
+    /// folder there).</summary>
     public static Place? FromText(string text)
     {
         text = text.Trim().Trim('"');
         if (text.Length == 0)
             return null;
-        string path = text, model = "";
+        if (Existing(text) is { } whole)
+            return new Place(whole, pack: IsPack(whole));
         int at = text.IndexOf('›');
-        if (at >= 0)
-        {
-            path = text[..at].Trim();
-            model = text[(at + 1)..].Trim();
-        }
+        if (at < 0)
+            return null;
+        var path = Existing(text[..at].Trim());
+        var model = text[(at + 1)..].Trim();
+        if (path is null)
+            return null;
+        if (model.Length > 0)
+            return IsPack(path) ? new Place(path, model: model) : null;
+        return new Place(path, pack: IsPack(path));
+    }
+
+    /// <summary>`path` as a full path if it is a folder or a pack file there, else null.</summary>
+    private static string? Existing(string path)
+    {
         if (OperatingSystem.IsWindows() && path.Length == 2 && path[1] == ':')
             path += "\\";
         if (path.StartsWith("~"))
             path = System.Environment.GetFolderPath(System.Environment.SpecialFolder.UserProfile) + path[1..];
         try { path = System.IO.Path.GetFullPath(path); } catch (Exception) { return null; }
-        bool dir = Directory.Exists(path), zip = IsOczip(path) && File.Exists(path);
-        if (!dir && !zip)
-            return null;
-        if (model.Length > 0)
-            return IsPack(path) ? new Place(path, model: model) : null;
-        return new Place(path, pack: IsPack(path));
+        return Directory.Exists(path) || (IsOczip(path) && File.Exists(path)) ? path : null;
     }
 
     public static bool IsOczip(string? path) => path is not null && path.EndsWith(Oczip, StringComparison.OrdinalIgnoreCase);

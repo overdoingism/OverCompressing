@@ -167,35 +167,47 @@ public sealed class PackSummary
 /// <summary>A verify's damage report (the "damage" event): the text for people, and the data the window uses.</summary>
 public sealed class DamageReport
 {
+    /// <summary>A blob at fault; intact: its bytes are sound and only do not rebuild on this machine.</summary>
+    public sealed record Fault(string Sha256, string Problem, string File, bool Intact);
+    /// <summary>A file lost; own: its own blob is at fault; causes: the blobs at fault it is lost through.</summary>
+    public sealed record LostItem(string Model, string Path, bool Own, long Size, bool Weights, List<string> Causes);
+
     public string Text = "";
     public string Pack = "";
-    public List<(string model, string path, bool own, long size, bool weights)> Lost = new();
+    public List<Fault> Faults = new();
+    public List<LostItem> Lost = new();
     public List<(string name, int files, int lost)> Models = new();
     public List<string> Affected = new();
+
+    /// <summary>Whether a blob at fault is intact and only does not rebuild here: nothing is given up yet then.</summary>
+    public bool AnyIntact => Faults.Any(f => f.Intact);
 
     public static DamageReport From(ToolEvent e)
     {
         var o = e.Fields!;
         var d = new DamageReport { Text = e.Text, Pack = o["pack"]?.ToString() ?? "", Affected = Json.Strings(o["affected"]) };
+        if (o["faults"] is JsonArray faults)
+            foreach (var f in faults.OfType<JsonObject>())
+                d.Faults.Add(new Fault(f["sha256"]?.ToString() ?? "", f["problem"]?.ToString() ?? "", f["file"]?.ToString() ?? "", Json.Bool(f["intact"])));
         if (o["lost"] is JsonArray lost)
             foreach (var item in lost.OfType<JsonObject>())
-                d.Lost.Add((item["model"]?.ToString() ?? "", item["path"]?.ToString() ?? "", item["own"]?.GetValue<bool>() ?? false,
-                    Json.Long(item["size"]) ?? 0, item["weights"]?.GetValue<bool>() ?? false));
+                d.Lost.Add(new LostItem(item["model"]?.ToString() ?? "", item["path"]?.ToString() ?? "", Json.Bool(item["own"]),
+                    Json.Long(item["size"]) ?? 0, Json.Bool(item["weights"]), Json.Strings(item["causes"])));
         if (o["models"] is JsonArray models)
-            foreach (var m in models.OfType<JsonObject>())
-                d.Models.Add((m["name"]?.ToString() ?? "", (int)(Json.Long(m["files"]) ?? 0), (int)(Json.Long(m["lost"]) ?? 0)));
+            foreach (var mo in models.OfType<JsonObject>())
+                d.Models.Add((mo["name"]?.ToString() ?? "", (int)(Json.Long(mo["files"]) ?? 0), (int)(Json.Long(mo["lost"]) ?? 0)));
         return d;
     }
 }
 
-/// <summary>What the last verify that failed found lost, kept for the ⚠ marks and for Clean up while the pack's stamp
-/// is as it was then.</summary>
+/// <summary>What verifies found lost and none has found sound since, kept for the ⚠ marks and for Clean up while the
+/// pack's stamp is as it was then (one pack at a time).</summary>
 public sealed class DamageMarks
 {
     public string Pack = "";  // normalized full path
     public (long mtime, long size)? Stamp;
     public Dictionary<(string model, string path), bool> Lost = new();  // -> own blob at fault
-    public Dictionary<string, int> Models = new();  // model -> lost files
+    public HashSet<(string model, string path)> Here = new();  // of those, lost only through blobs that are intact and do not rebuild here
 }
 
 internal static class Json
@@ -215,6 +227,8 @@ internal static class Json
         if (v.TryGetValue<long>(out var l)) return l;
         return null;
     }
+
+    public static bool Bool(JsonNode? n) => n is JsonValue v && v.TryGetValue<bool>(out var b) && b;
 
     public static List<string> Strings(JsonNode? n) => n is JsonArray a ? a.Select(x => x?.ToString() ?? "").ToList() : new List<string>();
 }

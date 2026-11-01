@@ -143,6 +143,8 @@ public partial class MainWindow : Control
                 }
                 found = ToolLocator.Find(_settings, Path.GetDirectoryName(OS.GetExecutablePath()) ?? ".");
             }
+            if (DevHooks.Args().TryGetValue("tool", out var devTool) && File.Exists(devTool))  // a test copy of the tool
+                found = new ToolLocator.Found(found.Python, devTool, "dev hook");  // with the Python found for the real one (a scratch copy has none)
             await UseTool(found.Python, found.Tool);
             var start = StartPlace();
             Go(start ?? new Place(System.Environment.CurrentDirectory, pack: Place.IsPack(System.Environment.CurrentDirectory)));
@@ -183,8 +185,15 @@ public partial class MainWindow : Control
             _status.Text = job.Title + " …";
             UpdateButtons();
         };
+        _runner.OnExact = n => _busy.SetNotice(T.Get("exact_slow", ("regions", T.Count(n, "region"))));  // else the card
+        // sits at the same percent for minutes with only a cut line to say why (the owner asked what it was doing)
+        _runner.OnJobDone = job =>
+        {
+            if (job.Argv[0] == "verify")
+                Remember(job, null);  // what it checked is sound: its marks go
+        };
         _runner.OnFinished = JobsFinished;
-        _runner.OnCancelled = () => Finish();
+        _runner.OnCancelled = () => { Finish(); _ = WarnNotExact(); };
         var (ok, text) = await _reader.VersionAsync();
         var cli = ok ? text.Replace("OverCompressing CLI", "CLI").Split(", format")[0] : "CLI ?";
         _versions = $"GUI {T.GuiVersion} (Godot {Engine.GetVersionInfo()["string"]}) · {cli}";
@@ -1358,7 +1367,8 @@ public partial class MainWindow : Control
 
     private async void GoToText()
     {
-        var place = Place.FromText(_path.Text);
+        bool same = _place is not null && _path.Text.Trim() == _place.Text();  // what is shown stays, even if a folder has
+        var place = same ? _place : Place.FromText(_path.Text);                 // its text as a name (Place.FromText)
         if (place is not null)
             Go(place);
         else
@@ -1368,8 +1378,8 @@ public partial class MainWindow : Control
         }
     }
 
-    /// <summary>⚠ in Needs (and the row in red) for what the last verify that failed found lost, while the pack is as
-    /// it was then: only the window remembers it (verify writes nothing into a pack).</summary>
+    /// <summary>⚠ in Needs (and the row in red) for what a verify found lost and none has found sound since (Remember),
+    /// while the pack is as it was then: only the window remembers it (verify writes nothing into a pack).</summary>
     private void Mark(List<Row> rows, Place place)
     {
         var m = _marks;
@@ -1383,12 +1393,20 @@ public partial class MainWindow : Control
         foreach (var r in rows)
         {
             string note;
-            if (place.View == "pack" && m.Models.TryGetValue(r.Id, out var lost))
-                note = T.Get("mark_model", ("files", T.Count(lost, "file")));
+            if (place.View == "pack")
+            {
+                var lost = m.Lost.Keys.Where(k => k.model == r.Id).ToList();
+                if (lost.Count == 0)
+                    continue;
+                note = T.Get(lost.All(m.Here.Contains) ? "mark_model_here" : "mark_model", ("files", T.Count(lost.Count, "file")));
+            }
+            else if (place.View == "model" && m.Here.Contains((place.Model!, r.Id)))
+                note = T.Get("mark_file_here");
             else if (place.View == "model" && m.Lost.TryGetValue((place.Model!, r.Id), out var own))
                 note = T.Get(own ? "mark_file" : "mark_file_base");
             else
                 continue;
+            r.Mark = note;
             r.Needs = note + (r.Needs.Length > 0 ? "  " + r.Needs : "");
             r.NeedsByBase = note + (r.NeedsByBase.Length > 0 ? "  " + r.NeedsByBase : "");
             r.Damaged = true;
@@ -1534,25 +1552,27 @@ public partial class MainWindow : Control
         });
     }
 
-    /// <summary>The arguments to run a failed restore again with --overwrite, if that is why it failed and the user
-    /// agrees. The runner asks synchronously; the question is asked on the next frame, and the job re-queued then.</summary>
-    private List<string>? OfferOverwrite(Job job, ToolEvent? error)
+    /// <summary>The arguments to run a failed restore again with --overwrite or --accept-inexact, if that is why it
+    /// failed (its error event's code, never its text) and the user agrees; each flag once. The runner keeps the jobs
+    /// after it in the queue (the busy card stays up behind the question).</summary>
+    private async Task<List<string>?> OfferOverwrite(Job job, ToolEvent? error)
     {
-        if (error?.Str("code") != "exists" || job.Argv.Contains("--overwrite"))  // the code, never the text
-            return null;
-        _pendingOverwrite = job;
+        var code = error?.Str("code");
+        if (code == "exists" && !job.Argv.Contains("--overwrite"))
+            return await OcDialog.Ask(this, T.Get("extract"), T.Get("overwrite_q", ("dest", T.Short(job.Argv[3])))) ? job.Argv.Append("--overwrite").ToList() : null;
+        if (code == "inexact" && !job.Argv.Contains("--accept-inexact"))
+            return await OcDialog.Ask(this, T.Get("extract"), T.Get("inexact_q", ("name", job.Argv[2]))) ? job.Argv.Append("--accept-inexact").ToList() : null;
         return null;
     }
 
-    private Job? _pendingOverwrite;
-
-    private async Task AskOverwriteAndRetry(Job job)
+    /// <summary>After a batch: the files written that are not the originals (restore --accept-inexact), with the
+    /// notes beside them, as the tool named them (the note's own name may carry " (1)").</summary>
+    private async Task WarnNotExact()
     {
-        if (await OcDialog.Ask(this, T.Get("extract"), T.Get("overwrite_q", ("dest", T.Short(job.Argv[3])))))
-        {
-            var again = new Job(job.Argv.Append("--overwrite"), job.Title) { Retry = job.Retry };
-            Start(new[] { again }, _done ?? (() => { }));
-        }
+        var notes = _runner.NotExact.ToList();
+        _runner.NotExact.Clear();
+        if (notes.Count > 0)
+            await OcDialog.Info(this, T.Get("not_exact_title"), T.Get("not_exact", ("notes", T.Lines(notes.Select(T.Short)))));
     }
 
     private async Task<(string dest, string layout)?> AskExtract(Dictionary<(string pack, string model), HashSet<string>?> plan)
@@ -1717,7 +1737,7 @@ public partial class MainWindow : Control
         var answer = await AskPack(name, T.Get("name_what", ("files", T.Count(count, "file")), ("size", T.SizeText(size))), source, files, here);
         if (answer is null)
             return;
-        var (model, mode, where, replace) = answer.Value;
+        var (model, mode, where, replace, rebuild) = answer.Value;
         if (here is null)
             _settings.PackMode = mode;
         if (mode == "folder")
@@ -1726,6 +1746,8 @@ public partial class MainWindow : Control
         argv.AddRange(files.Select(f => "--file=" + f));
         if (replace)
             argv.Add("--replace");
+        if (!rebuild)
+            argv.Add("--no-quant");
         Start(new[] { new Job(argv, T.Get("packing", ("name", model))) }, async () =>
         {
             if (mode == "file" && place.View == "folder" && Place.SamePath(place.Path!, Path.GetDirectoryName(where) ?? ""))
@@ -1738,10 +1760,10 @@ public partial class MainWindow : Control
         });
     }
 
-    /// <summary>(model name, "folder" or "file", the pack folder or new pack file, replace) the user enters, checked,
-    /// or null. here: the pack folder the list shows; the choice is then this pack folder (the default) or a new
-    /// pack file, a pack of its own.</summary>
-    private async Task<(string name, string mode, string where, bool replace)?> AskPack(string defaultName, string what, string source, List<string> files, string? here)
+    /// <summary>(model name, "folder" or "file", the pack folder or new pack file, replace, rebuild quantized weights)
+    /// the user enters, checked, or null. here: the pack folder the list shows; the choice is then this pack folder
+    /// (the default) or a new pack file, a pack of its own. The tick is on every time (not kept): off is --no-quant.</summary>
+    private async Task<(string name, string mode, string where, bool replace, bool rebuild)?> AskPack(string defaultName, string what, string source, List<string> files, string? here)
     {
         var d = new OcDialog(T.Get("name_title"));
         d.Body.AddChild(Ui.Heading(what));
@@ -1803,9 +1825,16 @@ public partial class MainWindow : Control
         });
         row.AddChild(browse);
         Lock();
+        d.Body.AddChild(Ui.Gap(8));
+        var rebuild = Ui.Check(T.Get("quant_tick"), true);
+        d.Body.AddChild(rebuild);
+        var quantNote = Ui.HBox(0);
+        quantNote.AddChild(new Control { CustomMinimumSize = new Vector2(Ui.Px(26), 0) });
+        quantNote.AddChild(Ui.Note(T.Get("quant_note")));
+        d.Body.AddChild(quantNote);
         d.Body.AddChild(Ui.Gap(4));
         d.Body.AddChild(Ui.Note(T.Get("name_hint") + (here is not null ? "\n" + T.Get("file_hint_here") : "")));
-        (string, string, string, bool)? result = null;
+        (string, string, string, bool, bool)? result = null;
         d.AcceptingAsync = async () =>
         {
             var model = name.Text.Trim();
@@ -1842,7 +1871,7 @@ public partial class MainWindow : Control
                         return false;
                 }
             }
-            result = (model, m, where, m == "folder" && held);
+            result = (model, m, where, m == "folder" && held, rebuild.ButtonPressed);
             return true;
         };
         d.FirstFocus = name;
@@ -2119,6 +2148,7 @@ public partial class MainWindow : Control
         var find = Ui.Radio(T.Get("rebase_find"), group, true);
         var alone = Ui.Radio(T.Get("rebase_alone"), group);
         CheckBox? also = null;
+        var rebuild = Ui.Check(T.Get("quant_tick"), true);  // not kept with a file: a rebase left on would rebuild one stored without it
         d.Body.AddChild(Ui.Gap(4));
         foreach (var (radio, key) in new[] { (find, "find"), (alone, "alone") })
         {
@@ -2134,6 +2164,17 @@ public partial class MainWindow : Control
                 row.AddChild(new Control { CustomMinimumSize = new Vector2(Ui.Px(26), 0) });
                 row.AddChild(also);
                 d.Body.AddChild(row);
+            }
+            if (key == "find")
+            {
+                var row = Ui.HBox(0);
+                row.AddChild(new Control { CustomMinimumSize = new Vector2(Ui.Px(26), 0) });
+                row.AddChild(rebuild);
+                d.Body.AddChild(row);
+                var note = Ui.HBox(0);
+                note.AddChild(new Control { CustomMinimumSize = new Vector2(Ui.Px(52), 0) });
+                note.AddChild(Ui.Note(T.Get("quant_note")));
+                d.Body.AddChild(note);
             }
         }
         d.Body.AddChild(Ui.Gap(4));
@@ -2160,6 +2201,8 @@ public partial class MainWindow : Control
         }
         if (makeAlone)
             argv.Add("--no-base");
+        else if (!rebuild.ButtonPressed)
+            argv.Add("--no-quant");
         Start(new[] { new Job(argv, T.Get("rebasing", ("what", what))) { Models = files ? new List<string>() : todo, ModelsAt = 2 } }, async () =>
         {
             var result = _runner.Events.LastOrDefault(e => e.Event == "summary")?.Text ?? "";
@@ -2213,25 +2256,52 @@ public partial class MainWindow : Control
 
     // ============================================================================================ damage
 
-    /// <summary>Keep what a verify found lost, for the ⚠ marks (Mark) and for cleaning up (CleanUp).</summary>
-    private void Remember(DamageReport damage)
+    /// <summary>What a verify job that ran through found, for the ⚠ marks (Mark) and for cleaning up (CleanUp): what it
+    /// checked loses its mark, what it found lost (damage, its report) gets one, the rest stays. The scope is read from
+    /// the job's own arguments (models, --file=; none: everything). Marks are of one pack at a time, as it is now: a
+    /// verify that found nothing leaves another pack's alone; one that failed takes over.</summary>
+    private void Remember(Job job, DamageReport? damage)
     {
-        var marks = new DamageMarks { Pack = Place.NormPath(damage.Pack), Stamp = Place.PackStamp(damage.Pack) };
-        foreach (var (model, path, own, _, _) in damage.Lost)
+        var pack = job.Argv[1];
+        var where = Place.NormPath(pack);
+        var stamp = Place.PackStamp(pack);
+        var m = _marks;
+        if (m is null || !Place.SamePath(m.Pack, where) || !Equals(m.Stamp, stamp))
         {
-            marks.Lost[(model, path)] = own;
-            marks.Models[model] = marks.Models.GetValueOrDefault(model) + 1;
+            if (damage is null)
+                return;
+            m = _marks = new DamageMarks { Pack = where, Stamp = stamp };
         }
-        _marks = marks;
+        var names = job.Argv.Skip(2).Where(a => !a.StartsWith("--")).ToList();
+        var paths = job.Argv.Skip(2).Where(a => a.StartsWith("--file=")).Select(a => a["--file=".Length..]).ToList();
+        foreach (var key in m.Lost.Keys.Where(k => (names.Count == 0 || names.Contains(k.model)) && (paths.Count == 0 || paths.Contains(k.path))).ToList())
+        {
+            m.Lost.Remove(key);
+            m.Here.Remove(key);
+        }
+        if (damage is null)
+            return;
+        var intact = damage.Faults.Where(f => f.Intact).Select(f => f.Sha256).ToHashSet();
+        foreach (var item in damage.Lost)
+        {
+            m.Lost[(item.Model, item.Path)] = item.Own;
+            if (item.Causes.Count > 0 && item.Causes.All(intact.Contains))
+                m.Here.Add((item.Model, item.Path));
+        }
     }
 
-    /// <summary>The damage report of a verify that failed, to read and copy; for a pack folder, Clean up.</summary>
-    private async Task ShowDamage(DamageReport damage)
+    /// <summary>The damage report of a verify that failed, to read and copy; for a pack folder, Clean up, unless a
+    /// blob at fault is intact and only does not rebuild here: it may well restore on another machine, so nothing is
+    /// given up yet. onlyHere: that is all that failed (the error's code).</summary>
+    private async Task ShowDamage(DamageReport damage, bool onlyHere = false)
     {
         var d = new OcDialog(T.Get("damage_title"), resizable: true);
         int lost = damage.Lost.Count;
-        d.Body.AddChild(Ui.Heading(lost > 0 ? T.Get("damage_heading", ("files", T.Count(lost, "file"))) : T.Get("damage_heading_other")));
-        var note = Ui.Note(T.Get("damage_note"));
+        if (onlyHere)
+            d.Body.AddChild(Ui.Heading(T.Get("damage_heading_here", ("files", T.Count(lost, "file")))));
+        else
+            d.Body.AddChild(Ui.Heading(lost > 0 ? T.Get("damage_heading", ("files", T.Count(lost, "file"))) : T.Get("damage_heading_other")));
+        var note = Ui.Note(T.Get(onlyHere ? "damage_note_here" : "damage_note"));
         note.CustomMinimumSize = new Vector2(Ui.Px(760), 0);
         d.Body.AddChild(note);
         var text = new TextEdit
@@ -2248,13 +2318,16 @@ public partial class MainWindow : Control
         text.AddThemeStyleboxOverride("focus", Ui.Flat(Ui.LogBg, 8, new Color(Ui.Accent, 0.5f), 1, 8));
         d.Body.AddChild(text);
         bool writable = !Place.IsOczip(damage.Pack);
+        bool intact = damage.AnyIntact;
         if (!writable)
             d.Body.AddChild(Ui.Note(T.Get("clean_read_only")));
+        else if (intact)
+            d.Body.AddChild(Ui.Note(T.Get("clean_off_here")));
         d.HideOk();
         d.CancelButton.Text = T.Get("close");
         bool clean = false;
         var cleanButton = d.AddButton(T.Get("clean_up"), () => { clean = true; d.CancelButton.EmitSignal(BaseButton.SignalName.Pressed); }, atLeft: true);
-        cleanButton.Disabled = !(writable && lost > 0);
+        cleanButton.Disabled = !(writable && lost > 0 && !intact);
         Button copyButton = null!;
         copyButton = d.AddButton(T.Get("copy"), () => { DisplayServer.ClipboardSet(damage.Text); copyButton.Text = T.Get("copied"); }, atLeft: true);
         await d.ShowAsync(this);
@@ -2269,8 +2342,8 @@ public partial class MainWindow : Control
     {
         var pack = damage.Pack;
         var byModel = new Dictionary<string, List<(string path, bool own)>>();
-        foreach (var (model, path, own, _, _) in damage.Lost)
-            byModel.GetOrAdd(model).Add((path, own));
+        foreach (var item in damage.Lost)
+            byModel.GetOrAdd(item.Model).Add((item.Path, item.Own));
         var filesOf = damage.Models.ToDictionary(m => m.name, m => m.files);
         var emptied = byModel.Where(kv => kv.Value.Count >= filesOf.GetValueOrDefault(kv.Key, kv.Value.Count + 1)).Select(kv => kv.Key).OrderBy(n => n, StringComparer.Ordinal).ToList();
         var damaged = byModel.Keys.OrderBy(n => n, StringComparer.Ordinal).ToList();
@@ -2354,32 +2427,30 @@ public partial class MainWindow : Control
         _done = done;
         foreach (var b in _buttons.Values)
             b.Disabled = true;
-        _runner.Start(jobs, done);
+        _runner.Start(jobs);
     }
 
     private void Start(IEnumerable<Job> jobs, Func<Task> done) => Start(jobs, (Action)(() => { _ = done(); }));
 
     private async void JobsFinished(bool ok, Job? failed, int code, string output, DamageReport? damage)
     {
-        var pending = _pendingOverwrite;
-        _pendingOverwrite = null;
+        bool onlyHere = _runner.Error?.Str("code") == "inexact";  // all that failed does not rebuild on this machine
+        if (damage is not null && failed is not null)
+            Remember(failed, damage);
         Finish();
         if (ok)
-        {
             Fx.Sfx.Done();
-            return;
-        }
-        Fx.Sfx.Error();
-        if (pending is not null)
+        else
+            Fx.Sfx.Error();
+        await WarnNotExact();
+        if (ok)
         {
-            await AskOverwriteAndRetry(pending);
+            _done?.Invoke();
             return;
         }
         if (damage is not null)
         {
-            Remember(damage);
-            Refresh();
-            await ShowDamage(damage);
+            await ShowDamage(damage, onlyHere);
             return;
         }
         var last = Enumerable.Reverse(output.Split('\n')).Select(l => l.Trim()).FirstOrDefault(l => l.Length > 0) ?? $"exit code {code}";
@@ -2696,9 +2767,15 @@ public partial class MainWindow : Control
         await OcDialog.Info(this, T.Get("remove_title"), problem ?? "✔ Moved to the Recycle Bin.");
     }
 
-    public void DevStartJob(string[] argv)
+    /// <summary>Dev hook: nothing runs and no dialog is open.</summary>
+    public bool DevIdle => !(_runner?.Running ?? false) && OcDialog.OpenCount == 0;
+
+    public void DevStartJob(string[] argv) => DevStartJobs(new List<string[]> { argv });
+
+    public void DevStartJobs(List<string[]> jobs)
     {
-        Start(new[] { new Job(argv, "▶ " + argv[0]) { Retry = argv[0] == "restore" ? OfferOverwrite : null } }, (Action)(() => { _ = OcDialog.Info(this, argv[0], "✔ Done."); }));
+        Start(jobs.Select(argv => new Job(argv, "▶ " + argv[0]) { Retry = argv[0] == "restore" ? OfferOverwrite : null }).ToList(),
+            (Action)(() => { _ = OcDialog.Info(this, jobs[0][0], "✔ Done."); }));
     }
 
     public void DevOpenDialog(string name)
@@ -2722,9 +2799,19 @@ public partial class MainWindow : Control
                 _ = ShowDamage(new Core.DamageReport
                 {
                     Pack = _place?.Path ?? "", Text = "DAMAGE REPORT\n  pack: " + (_place?.Path ?? "") + "\n  at fault (1 blob):\n    Qwen/Qwen2.5-0.5B: model.safetensors: its blob is missing\n  lost (2 files):\n    Qwen/Qwen2.5-0.5B: model.safetensors  942.3 MiB  weights  (its own blob)\n    mlx-community/Qwen2.5-0.5B-Instruct-bf16: model.safetensors  942.3 MiB  weights  (through Qwen/Qwen2.5-0.5B: model.safetensors)\n  intact: 2 models verified",
-                    Lost = { ("Qwen/Qwen2.5-0.5B", "model.safetensors", true, 1, true), ("mlx-community/Qwen2.5-0.5B-Instruct-bf16", "model.safetensors", false, 1, true) },
+                    Faults = { new("aa11", "is missing", "Qwen/Qwen2.5-0.5B: model.safetensors", false) },
+                    Lost = { new("Qwen/Qwen2.5-0.5B", "model.safetensors", true, 1, true, new List<string> { "aa11" }), new("mlx-community/Qwen2.5-0.5B-Instruct-bf16", "model.safetensors", false, 1, true, new List<string> { "aa11" }) },
                     Models = { ("Qwen/Qwen2.5-0.5B", 9, 1), ("mlx-community/Qwen2.5-0.5B-Instruct-bf16", 9, 1) },
                 });
+                break;
+            case "damage-here":  // intact, but not rebuilt on this machine: Clean up is off
+                _ = ShowDamage(new Core.DamageReport
+                {
+                    Pack = _place?.Path ?? "", Text = "DAMAGE REPORT\n  pack: " + (_place?.Path ?? "") + "\n  NOTE: some of these blobs are intact and only do not rebuild here: verify the pack on another machine before giving anything up; restore --accept-inexact writes such a file all the same\n  at fault (1 blob):\n    t/q1: a.gguf: its blob rebuilds 3 quantized tensor(s) with other values here: the prediction disagrees\n  lost (1 file):\n    t/q1: a.gguf  506.5 MiB  weights  (its own blob)\n  models with lost files (1):\n    t/q1  1 of 2 files lost (weight files: 1 of 2)\n  intact: 2 models verified",
+                    Faults = { new("bb22", "rebuilds 3 quantized tensor(s) with other values here: the prediction disagrees", "t/q1: a.gguf", true) },
+                    Lost = { new("t/q1", "a.gguf", true, 531068672, true, new List<string> { "bb22" }) },
+                    Models = { ("t/q1", 2, 1) },
+                }, onlyHere: true);
                 break;
         }
     }

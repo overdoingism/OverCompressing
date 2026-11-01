@@ -1,7 +1,7 @@
 # OverCompressing
 
-**Lossless archiving for open-weight LLMs — every file restored bit for bit, at half the size or less.**
-**開源大型語言模型的無損歸檔工具：每個檔案都能逐位元還原，體積減半甚至更小。**
+**Lossless archiving for open-weight LLMs — every file restored bit for bit, at about two-thirds of its size alone and far less beside its relatives.**
+**開源大型語言模型的無損歸檔工具：每個檔案都能逐位元還原，單獨存約為原本的三分之二，同家族一起存則小得多。**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Python 3.13](https://img.shields.io/badge/python-3.13-blue.svg)
@@ -9,12 +9,19 @@
 ![Linux tested](https://img.shields.io/badge/Linux-tested%20by%20GPT6-brightgreen.svg)
 
 Model weights hardly compress with zip or zstd, and quantizing them loses information. OverCompressing keeps the
-original files exactly, compresses each tensor with a codec suited to it, and stores fine-tunes as deltas against
-their base model. A portable copy of the tool (its own Python, packages and docs, in one folder) can travel with each
-pack, so it can be restored without internet access.
+original files exactly, compresses each tensor with a codec suited to it, stores fine-tunes as deltas against their
+base model, and rebuilds quantized GGUF files from the float weights they came from. A portable copy of the tool (its
+own Python, packages and docs, in one folder) can travel with each pack, so it can be restored without internet access.
 
 模型權重用 zip、zstd 幾乎壓不動，量化又會失真。OverCompressing 完整保留原檔，對每個 tensor 用最合適的方式壓縮，
-並把微調模型存成「和 base 的差異」。可攜版工具（自帶 Python、套件與文件的單一資料夾）可以跟著 pack 一起保存，沒有網路也能還原。
+把微調模型存成「和 base 的差異」，並由量化前的浮點權重重建量化 GGUF。可攜版工具（自帶 Python、套件與文件的單一資料夾）可以跟著 pack 一起保存，沒有網路也能還原。
+
+> [!IMPORTANT]
+> **This version cannot read packs of the previous one.** CLI 0.6 (format 5) refuses packs of format 4 (CLI 0.5 and
+> earlier), and there is no converter. To change versions, restore your models with the old tool, then pack them again
+> with the new one. **[What changed and how to move](docs/format-5.md)**
+>
+> **此版本與上一版不相容。** CLI 0.6（format 5）不讀 format 4 的 pack（CLI 0.5 及更早版本），也沒有轉換工具。要換版，必須先用舊版工具解壓還原，再用新版重新打包。
 
 ---
 
@@ -22,19 +29,21 @@ pack, so it can be restored without internet access.
 
 | what | result |
 |---|---|
-| one BF16 model (Qwen2.5-0.5B / 7B) | **66.4 %** of the original (zstd -19: 75.9 %; entropy floor ≈ 66.2 %) |
+| one BF16 model (Qwen2.5-0.5B / 7B) | **66.1 % / 66.2 %** of the original (zstd -19: 75.9 %; order-0 entropy ≈ 65.8 %) |
 | official Instruct as a delta of its Base | **44 %** (0.5B), **30 %** (7B) |
-| community fine-tunes (RL, abliteration, re-uploads) | **0.1 – 5 %** |
+| community fine-tunes (RL, re-uploads) · abliteration | **0.1 – 1.5 %** · **0.6 %** |
 | F16 GGUF against a BF16 base · vocab-extended draft model | **44 %** · **30 %** |
-| test archive: 6 repos, 34.3 GiB | **17.2 GiB (50.1 %)** |
-| speed, 8 cores: pack / restore a 7B BF16 model | **≈ 1.5 min / 30 s** (a 7B fine-tune as a delta: ≈ 5.5 min to pack) |
+| GGUF of the same weights as a safetensors model in the pack | **0.25 %** (948 MiB → 2.4 MiB) |
+| quantized GGUF with its float weights in the pack: Q8_0 · Q6_K · Q5_K_M, Q4_K_M | **0.27 %** · **1.64 %** · **≈ 46 %** (alone: 95–97 %) |
+| test archive: 6 repos, 34.3 GiB | **15.0 GiB (43.8 %)** |
+| speed, 8 cores: pack / restore a 7B BF16 model | **≈ 1.2 min / 34 s** (a 7B fine-tune as a delta: ≈ 7 min to pack) |
 
 All results are verified by decoding from disk and matching the original SHA-256 (for these tests, also the
 hashes Hugging Face publishes).
 
 ![A pack of 11 models as a graph: arrows from each base to the models stored as deltas against it, each circle the share of its own size a model takes](img/graph.jpg)
 
-A real pack, 11 models: 60.4 GiB of files in 37.9 GiB (drawn by [OCUI2](#ocui2--第二視窗)). Each arrow runs from a
+A real pack, 11 models, packed by an earlier version: 60.4 GiB of files in 37.9 GiB (drawn by [OCUI2](#ocui2--第二視窗)). Each arrow runs from a
 base to a model stored as a delta against it; each circle is what that model takes, as a share of its own size.
 Qwen2.5-0.5B-Instruct (selected) reads 99 % of Qwen2.5-0.5B and takes 44.0 % (953.3 MiB → 419.5 MiB); three community
 fine-tunes are stored against it in turn, at 0.4 – 5.3 %. A quantized GGUF with no relative in the pack
@@ -44,14 +53,19 @@ fine-tunes are stored against it in turn, at 0.4 – 5.3 %. A quantized GGUF wit
 
 ## How it works / 原理
 
-- **Per tensor.** safetensors and GGUF files are parsed. Float tensors are split into byte planes so that the
-  exponents sit together (the byte-grouping idea of [ZipNN](https://github.com/zipnn/zipnn)) and are entropy-coded
-  with zlib's Huffman coding; quantized tensors and metadata go to zstd. The whole tool is Python on NumPy, zlib and
-  zstd: no compiled code of its own, no PyTorch.
+- **Per tensor.** safetensors and GGUF files are parsed. Float tensors are grouped into byte planes (the
+  byte-grouping idea of [ZipNN](https://github.com/zipnn/zipnn), here with the top 16 bits of BF16 and F32 weights
+  rotated first) and coded with zstd, or zlib's Huffman coding where that saves enough; quantized tensors and metadata
+  go to zstd. The whole tool is Python on NumPy, zlib and zstd: no compiled code of its own, no PyTorch.
 - **Deltas with the base as predictor.** A fine-tune is stored as residuals against its base, coded by **ans16**, a
   context-modelled rANS coder written for this project. No neural network is trained: the base model *is* the
   predictor.
-- **Matched by tensor name** across file names, shardings, orders, float dtypes (BF16/F16/F32) and vocabulary sizes.
+- **Quantized weights rebuilt from their parent.** With the float weights in the pack, Q8_0, Q6_K, Q5_K and Q4_K
+  tensors are stored as what the quantization of those weights does not predict. An abliterated model is stored as one
+  direction taken out of its original. Restoring these relies on the machine's floating point arithmetic: if a machine
+  gets it wrong, the tool works it out the slow way, and says so if the file still does not match.
+- **Matched by tensor name** across file names, shardings, orders, float dtypes (BF16/F16/F32) and vocabulary sizes;
+  between GGUF and safetensors, where names differ, by shape and content.
 - **Base chosen automatically.** Each file is trial-coded against every matching model already in the pack and
   uses the one that compresses it best, or none; `--base` overrides.
 - **Verified at every step**; identical files are stored once. Damage is detected; for repair, pick a protection
@@ -64,7 +78,8 @@ fine-tunes are stored against it in turn, at 0.4 – 5.3 %. A quantized GGUF wit
 | works well | limited |
 |---|---|
 | BF16 / F16 / F32 / FP8 safetensors and GGUF | quantized files on their own (95–97 %) |
-| families: Base → Instruct → community fine-tunes | GGUF ↔ safetensors cross-format deltas (not yet) |
+| families: Base → Instruct → community fine-tunes | Q5_0, Q5_1, IQ and other quantized types: not rebuilt from their float weights |
+| a GGUF beside the safetensors of the same weights | across formats: weights reordered in conversion are not matched |
 | PyTorch `.bin` and other binaries (auto codec) | speed of deltas: their coder is pure NumPy (≈ 8 MB/s per core) |
 
 → **[Scope](docs/scope.md)**
@@ -148,7 +163,7 @@ tools/compare_tensors.py   how well a fine-tune lines up with a base
 tools/test_*.py            self-tests (ans16 coder, formats, conversions)
 requirements.txt           numpy and zstandard, for your own Python
 requirements-*.lock        the same, pinned and hash-checked: what the build guides install
-docs/                      principles, scope, benchmarks, usage, build guides, protection advice
+docs/                      principles, scope, benchmarks, what format 5 changed, usage, build guides, protection advice
 dev/                       experiments and measurement scripts used during development
 OCUI2/                     a second window, on the Godot engine (C#): its sources (see OCUI2 below)
 ```

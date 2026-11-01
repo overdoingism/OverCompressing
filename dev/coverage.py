@@ -233,7 +233,7 @@ def describe(path, key, sizes, bases):
             out["fallback"] = gguf_problem(path, size, header_only)
         elif path.endswith(".safetensors") or head[8:9] == b"{":
             out["fallback"] = safetensors_problem(path, size, header_only)
-        out["coded_as"] = "zstd (text)" if fmt == "zstd" else "auto: per 64 MiB, the smaller of BF16 byte planes and zstd"
+        out["coded_as"] = "zstd (text)" if fmt == "zstd" else "auto: per 64 MiB, the smaller of plain byte columns and zstd"
         return out
     rows = {}
     for name, dtype, start, end, shape in tensors:

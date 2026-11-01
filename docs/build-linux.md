@@ -69,7 +69,7 @@ pip line.
 "$out/python/bin/python3" -I "$out/tools/test_formats.py" /tmp/oc-test
 ```
 
-The first prints `OverCompressing CLI 0.5 (<date> <commit>), format 4`; both test suites end with `ALL PASSED` (the
+The first prints `OverCompressing CLI 0.6 (<date> <commit>), format 5`; both test suites end with `ALL PASSED` (the
 second takes several minutes; on Linux it also covers FIFOs and broken links in a source folder, which Windows cannot
 create).
 
@@ -169,7 +169,7 @@ pip 會把 numpy 與 zstandard 裝進可攜版自己的 Python，每個 wheel �
 "$out/python/bin/python3" -I "$out/tools/test_formats.py" /tmp/oc-test
 ```
 
-第一行會印出 `OverCompressing CLI 0.5 (<日期> <commit>), format 4`；兩個測試都必須以 `ALL PASSED` 結束（第二個需要幾分鐘；
+第一行會印出 `OverCompressing CLI 0.6 (<日期> <commit>), format 5`；兩個測試都必須以 `ALL PASSED` 結束（第二個需要幾分鐘；
 在 Linux 上還會額外測試來源資料夾中的 FIFO 與失效連結，Windows 無法建立這兩種檔案）。
 
 ## 6. 使用

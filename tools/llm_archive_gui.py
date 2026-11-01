@@ -27,7 +27,7 @@ from tkinter import filedialog, messagebox, ttk
 from tkinter import font as tkfont
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "0.5"  # of this window (llm_archive.py, the command-line tool, has its own); raised by hand
+VERSION = "0.6"  # of this window (llm_archive.py, the command-line tool, has its own); raised by hand
 sys.path.insert(0, HERE)
 import llm_archive as la  # noqa: E402
 
@@ -69,7 +69,6 @@ WEIGHT_SUFFIXES = (".safetensors", ".sft", ".gguf", ".bin", ".pt", ".pth", ".ckp
 COLORS = {"folder": "#fff3c4", "drive": "#fff3c4", "pack": "#e6def8", "oczip": "#d9e8fb", "model": "#dcf1e2",
           "weights": "#fde0dc"}  # row backgrounds by kind; other files keep the list's own
 LEGEND = (("folder", "Folder"), ("pack", "Pack folder"), ("oczip", "Pack file"), ("model", "Model"), ("weights", "Weights"))
-SPINNER = "◐◓◑◒"
 COLUMNS = {  # name: (heading key, width, anchor); the name itself is the tree column; width: a FITTED column's least
     "files": ("col_files", 50, "e"), "size": ("col_size", 90, "e"), "stored": ("col_stored", 90, "e"),
     "ratio": ("col_ratio", 64, "e"), "type": ("col_type", 150, "w"), "needs": ("col_needs", 220, "w"),
@@ -89,7 +88,15 @@ WRAP = 460  # pixels (at 100%): the width of a dialog's text
 ARGS_LIMIT = 8000  # characters: past it, models and files go in list files (--models-from, --files-from); Windows: 32,767
 BELOW = "\0below"  # a drag begun under the last row of the list
 
-TEXT = {  # all of the window's text: symbols (Unicode BMP, which every Tk renders) where they say it, else English
+TEXT = {  # all of the window's text: symbols (Unicode BMP) where they say it, else English; plain_text where a Tk cannot draw them
+    "dot": "·",
+    "more": "…",
+    "dash": "—",
+    "bar": "│",
+    "in_model": "›",
+    "sorted_down": "▼",
+    "sorted_up": "▲",
+    "spinner": "◐◓◑◒",
     "up": "↑",
     "drives": "Drives",
     "pack_to": "+ Pack to",
@@ -177,6 +184,8 @@ TEXT = {  # all of the window's text: symbols (Unicode BMP, which every Tk rende
     "need_target": "Choose where to pack.",
     "target_oczip": "That is a pack file: choose “A new pack file (.oczip)” to make one.",
     "name_hint": "Δ bases are chosen automatically. Other options: llm_archive.py (docs/usage.md).",
+    "quant_tick": "Δ Code quantized weights against the weights they came from",
+    "quant_note": "Usually far smaller, but restoring works them out again from those weights. Untick to store them without that.",
     "replace_q": "{name} is already in this pack folder ({files}).\n\nReplace it with these files?",
     "export_title": "⤓ Save .oczip",
     "export_all": "every model",
@@ -218,6 +227,8 @@ TEXT = {  # all of the window's text: symbols (Unicode BMP, which every Tk rende
     "renaming": "▶ Renaming {name}",
     "everything": "everything in {pack}",
     "cancelling": "■ Cancelling after the current step…",
+    "exact_slow": "Slow step: regions are worked out exactly, without floating point arithmetic ({regions} so far). That "
+                  "can take many minutes; the percentage moves on when the file is done.",
     "force_q": "Still finishing the current step. Stopping now may leave .oc-*.part files behind (they can be "
                "deleted).\n\nStop now?",
     "quit_q": "Something is still running.\n\nCancel it and quit?",
@@ -230,6 +241,12 @@ TEXT = {  # all of the window's text: symbols (Unicode BMP, which every Tk rende
     "done_rename": "✔ Renamed {old} to {new}.",
     "pack_kind": "pack",
     "overwrite_q": "{dest} already has some of these files, with other contents.\n\nReplace them?",
+    "inexact_q": "{name}: the stored bytes are intact, but they do not rebuild on this machine, which may be at fault: "
+                 "another machine may restore them exactly.\n\nWrite the file all the same? Some of its values may be off, "
+                 "so it will not be the original; a note goes beside it.",
+    "not_exact_title": "⚠ Not the original",
+    "not_exact": "Some values may be off, so these files are not the originals; another machine may restore them exactly. "
+                 "Beside each is a note:\n\n{notes}",
     "failed": "✕ Failed",
     "cancelled": "✕ Cancelled.",
     "into_folder_note": "For upkeep: each file stored once, Δ deltas where smaller",
@@ -248,6 +265,9 @@ TEXT = {  # all of the window's text: symbols (Unicode BMP, which every Tk rende
     "damage_heading": "{files} lost: what, why, and what to do",
     "damage_heading_other": "Verify failed: what, why, and what to do",
     "damage_note": "Copy the report to keep it, or to ask someone (or an AI) what to do. Its commands store a lost file again or give it up; verify again afterwards.",
+    "damage_heading_here": "{files} not rebuilt on this machine: what, why, and what to do",
+    "damage_note_here": "The stored bytes are intact, so the report's \"lost\" need not be final: verify on another machine first. ⤒ Extract to can write such a file all the same, as not the original.",
+    "clean_off_here": "− Clean up is off: some of these files may restore on another machine. Verify there first.",
     "copy": "⧉ Copy",
     "copied": "✔ Copied",
     "clean_up": "− Clean up",
@@ -272,6 +292,8 @@ TEXT = {  # all of the window's text: symbols (Unicode BMP, which every Tk rende
     "mark_model": "⚠ {files} failed verify",
     "mark_file": "⚠ failed verify",
     "mark_file_base": "⚠ failed verify (its base)",
+    "mark_model_here": "⚠ {files} not rebuilt here",
+    "mark_file_here": "⚠ not rebuilt here",
     "rebase": "⇄ Rebase",
     "rebase_title": "⇄ Rebase",
     "rebase_one": "Rebase {name}",
@@ -292,6 +314,36 @@ TEXT = {  # all of the window's text: symbols (Unicode BMP, which every Tk rende
 
 def t(key, **values):
     return TEXT[key].format(**values)
+
+
+def no_xft(root):
+    """Whether this Tk draws text through X11's core fonts, not Xft: as python-build-standalone's on Linux, where many
+    symbols come out as boxes or as other signs, whatever fonts are installed (found by the downstream team)."""
+    try:
+        return root.tk.call("tk::pkgconfig", "get", "fontsystem") == "x11"
+    except tk.TclError:  # no such query there (Windows' Tk 8.6): it draws them
+        return False
+
+
+def plain_text(text):
+    """The window's text in ASCII: a symbol that goes before a word goes, one that says something has its plain sign."""
+    plain = {}
+    for key, value in text.items():
+        new = value
+        for symbol in "⤓⤒✔−✎↻✕☰⑂⌕⧉▶■⇄Δ":
+            new = new.replace(symbol + " ", "")
+        for symbol, sign in (("✕", "x"), ("↑", "Up"), ("⚠", "!"), ("→", "->"), ("·", "-"), ("…", "..."), ("—", "-"), ("│", "|"), ("›", ">"), ("▼", "v"),
+                             ("▲", "^"), ("“", '"'), ("”", '"'), ("◐", "|"), ("◓", "/"), ("◑", "-"), ("◒", "\\")):
+            new = new.replace(symbol, sign)
+        plain[key] = new if new[:1] == value[:1] else new[:1].upper() + new[1:]
+    return plain
+
+
+def fit_text(root):
+    """The window's text for this Tk, plain if it must be; again changes nothing. Before anything reads the text: the
+    place given at the start is read with its mark."""
+    if no_xft(root):
+        TEXT.update(plain_text(TEXT))
 
 
 def count(n, what):
@@ -337,9 +389,9 @@ def shorten(path, fits):
     head, tail = parts[:2 if len(parts) > 3 else 1], parts[2 if len(parts) > 3 else 1:]
     while len(tail) > 1:
         tail = tail[1:]
-        if fits(sep.join(head + ["…"] + tail)):
+        if fits(sep.join(head + [t("more")] + tail)):
             break
-    return sep.join(head + ["…"] + tail)
+    return sep.join(head + [t("more")] + tail)
 
 
 def short(path):
@@ -421,7 +473,7 @@ class Place:
     def text(self):
         if self.path is None:
             return t("drives")
-        return f"{self.path} › {self.model}" if self.model is not None else self.path
+        return f"{self.path} {t('in_model')} {self.model}" if self.model is not None else self.path
 
     def parent(self):
         if self.path is None:
@@ -444,15 +496,25 @@ class Place:
 
 
 def place_from_text(text):
-    """The place a typed path names (a folder, a pack, or "<pack> › <model>"), or None."""
+    """The place a typed path names (a folder, a pack, or "<pack> › <model>"), or None. A path that exists is that path,
+    whatever is in its name: the mark is read only otherwise, so a folder is never taken for a model (found by the
+    downstream team: "a > b" opened model b of pack a, with that folder there)."""
+    def existing(path):
+        if os.name == "nt" and len(path) == 2 and path[1] == ":":
+            path += "\\"
+        path = os.path.normpath(os.path.expanduser(path))
+        return path if os.path.isdir(path) or (la.is_oczip(path) and os.path.isfile(path)) else None
+
     text = text.strip().strip('"')
     if not text:
         return None
-    path, _, model = (part.strip() for part in text.partition("›"))
-    if os.name == "nt" and len(path) == 2 and path[1] == ":":
-        path += "\\"
-    path = os.path.normpath(os.path.expanduser(path))
-    if not (os.path.isdir(path) or (la.is_oczip(path) and os.path.isfile(path))):
+    path = existing(text)
+    if path:
+        return Place(path, pack=is_pack(path))
+    mark = t("in_model")
+    path, _, model = (part.strip() for part in text.partition(f" {mark} " if mark.isascii() else mark))  # (">" may be in a name)
+    path = existing(path)
+    if not path:
         return None
     if model:
         return Place(path, model=model) if is_pack(path) else None
@@ -541,7 +603,7 @@ def list_pack(place):
         where += t("where_unused", size=size_text(summary["unused"]["size"]))
     if problems:
         where = t("bad_manifests", count=count(len(problems), "manifest"), first=f"{problems[0][0]}: {problems[0][1]}") + \
-            " · " + where
+            f" {t('dot')} " + where
     return rows, where
 
 
@@ -707,6 +769,7 @@ def linux_trash(paths):
 class App:
     def __init__(self, root, start):
         self.root = root
+        fit_text(root)
         self.place, self.rows, self.listing = None, {}, []  # rows: tree item -> row shown; listing: every row
         self.matched, self.quiet = set(), False  # ids the filter lets through; quiet: the filter is being reset
         self.seen, self.looked, self.inside_pack = None, 0.0, False  # the place's stamp, when it was looked at
@@ -718,10 +781,12 @@ class App:
         self.job_damage = self.job_error = self.marks = None  # the damage report and error event of the job running;
         # what the last one found lost
         self.events = []  # the hints and summaries of the job running (or that ran last)
+        self.not_exact = []  # the notes of files written that are not the originals (restore --accept-inexact)
+        self.exact_regions = 0  # regions of the job running worked out the slow, exact way (the "exact" events)
         self.lines = queue.Queue()  # output of the running process; None when it has ended
         self.cancelling = self.quit_after = False
         self.scale = root.winfo_fpixels("1i") / 96
-        self.versions = " · ".join((la.version_text("GUI", VERSION, __file__), la.version_text("CLI", la.VERSION, la.__file__)))
+        self.versions = f" {t('dot')} ".join((la.version_text("GUI", VERSION, __file__), la.version_text("CLI", la.VERSION, la.__file__)))
         root.title(f"OverCompressing {self.versions}")
         root.geometry(f"{self.px(1120)}x{self.px(720)}")
         root.minsize(self.px(760), self.px(460))
@@ -1002,7 +1067,7 @@ class App:
         self.mode_note.configure(text=t("mode_in_file") if place.view == "model" and place.read_only else "")
         self.seen, self.looked = self.stamp(), time.monotonic()
         self.path.set(place.text())
-        self.root.title(f"OverCompressing {self.versions} — {place.text()}")
+        self.root.title(f"OverCompressing {self.versions} {t('dash')} {place.text()}")
         if place.view == "pack":
             self.views.pack(side="right", before=self.hint, padx=(self.px(12), 0))
         else:
@@ -1048,7 +1113,7 @@ class App:
             texts = [(r["name"] if column == "#0" else self.cell(r, column), depth.get(r["id"], 0)) for r in self.listing]
             longest = sorted(texts, key=lambda x: len(x[0]) + 3 * x[1], reverse=True)[:50]  # measuring them all is slow
             font, pad = tkfont.nametofont("TkDefaultFont"), self.px(16 + (24 if column == "#0" else 0))  # + the indicator
-            heading = tkfont.nametofont("TkHeadingFont").measure(t("col_name" if column == "#0" else COLUMNS[column][0]) + " ▼")
+            heading = tkfont.nametofont("TkHeadingFont").measure(t("col_name" if column == "#0" else COLUMNS[column][0]) + " " + t("sorted_down"))
             self.naturals[key] = max([heading] + [font.measure(s) + self.px(20) * d for s, d in longest]) + pad
         return self.naturals[key]
 
@@ -1180,10 +1245,10 @@ class App:
         if keep:
             self.tree.selection_set(keep)
             self.tree.see(keep[0])
+        sorted_by = " " + t("sorted_down" if self.descending else "sorted_up")
         for name, (key_, _, _) in COLUMNS.items():
-            mark = (" ▼" if self.descending else " ▲") if name == self.sort_by else ""
-            self.tree.heading(name, text=t(key_) + mark)
-        self.tree.heading("#0", text=t("col_name") + ((" ▼" if self.descending else " ▲") if self.sort_by == "name" else ""))
+            self.tree.heading(name, text=t(key_) + (sorted_by if name == self.sort_by else ""))
+        self.tree.heading("#0", text=t("col_name") + (sorted_by if self.sort_by == "name" else ""))
 
     def sort(self, column):
         self.descending = not self.descending if column == self.sort_by else False
@@ -1196,12 +1261,12 @@ class App:
             return
         text = self.where or count(len(self.listing), "item")
         if self.filter.get().strip():
-            text = t("filtered", shown=len(self.matched), total=len(self.listing)) + " · " + text
+            text = t("filtered", shown=len(self.matched), total=len(self.listing)) + f" {t('dot')} " + text
         if self.place.read_only:
-            text += f" · {t('read_only')}"
+            text += f" {t('dot')} {t('read_only')}"
         rows = self.chosen()
         if rows:
-            text = self.sum_up(rows) + "   │   " + text
+            text = self.sum_up(rows) + f"   {t('bar')}   " + text
         self.status.configure(text=text)
 
     def sum_up(self, rows):
@@ -1280,7 +1345,9 @@ class App:
                 self.go(up, os.path.basename(self.place.path) or self.place.path)  # a drive's row is named "C:\"
 
     def go_to_text(self):
-        place = place_from_text(self.path.get())
+        same = self.place is not None and self.path.get().strip() == self.place.text()  # what is shown stays, even if
+        # a folder has its text as a name (place_from_text)
+        place = self.place if same else place_from_text(self.path.get())
         if place:
             self.go(place)
         else:
@@ -1292,17 +1359,20 @@ class App:
             self.open_row(self.tree.identify_row(event.y))
 
     def mark(self, rows, place):
-        """⚠ in Needs (and the row in red) for what the last verify that failed found lost, while the pack is as it
-        was then: only the window remembers it (verify writes nothing into a pack)."""
+        """⚠ in Needs (and the row in red) for what a verify found lost and none has found sound since (remember), while
+        the pack is as it was then: only the window remembers it (verify writes nothing into a pack)."""
         m = self.marks
-        if not m or not place.pack or os.path.normcase(os.path.abspath(place.path)) != os.path.normcase(m["pack"]):
+        if not m or not place.pack or os.path.normcase(os.path.abspath(place.path)) != m["pack"]:
             return
         if pack_stamp(m["pack"]) != m["stamp"]:
             self.marks = None
             return
         for r in rows:
-            if place.view == "pack" and r["id"] in m["models"]:
-                note = t("mark_model", files=count(m["models"][r["id"]], "file"))
+            lost = [k for k in m["lost"] if k[0] == r["id"]] if place.view == "pack" else []
+            if lost:
+                note = t("mark_model_here" if m["here"].issuperset(lost) else "mark_model", files=count(len(lost), "file"))
+            elif place.view == "model" and (place.model, r["id"]) in m["here"]:
+                note = t("mark_file_here")
             elif place.view == "model" and (place.model, r["id"]) in m["lost"]:
                 note = t("mark_file" if m["lost"][(place.model, r["id"])] else "mark_file_base")
             else:
@@ -1377,11 +1447,14 @@ class App:
                    and open_folder(dest))
 
     def offer_overwrite(self, job, error):
-        """The arguments to run a failed restore again with --overwrite, if that is why it failed (its error event's
-        code, never its text) and the user agrees."""
+        """The arguments to run a failed restore again with --overwrite or --accept-inexact, if that is why it failed
+        (its error event's code, never its text) and the user agrees."""
         if error.get("code") == "exists" and "--overwrite" not in job["argv"] and messagebox.askyesno(
                 t("extract"), t("overwrite_q", dest=short(job["argv"][3])), parent=self.front()):
             return job["argv"] + ["--overwrite"]
+        if error.get("code") == "inexact" and "--accept-inexact" not in job["argv"] and messagebox.askyesno(
+                t("extract"), t("inexact_q", name=job["argv"][2]), parent=self.front()):
+            return job["argv"] + ["--accept-inexact"]
         return None
 
     def ask_extract(self, plan):
@@ -1418,8 +1491,9 @@ class App:
         ttk.Label(frame, text=t("layout")).pack(anchor="w", pady=(self.px(12), self.px(4)))
         layout = tk.StringVar(value=next(k for k in (self.extract_layout, "last", "full") if usable[k]))
         named = next((n for n in names if "/" in n), names[0]).split("/")  # one that shows the difference, if any
-        for key, shown in (("full", os.path.join("…", *named, "…")), ("last", os.path.join("…", named[-1], "…")),
-                           ("files", os.path.join("…", "…"))):
+        more = t("more")
+        for key, shown in (("full", os.path.join(more, *named, more)), ("last", os.path.join(more, named[-1], more)),
+                           ("files", os.path.join(more, more))):
             ttk.Radiobutton(frame, text=f"{t('path_' + key)}     {shown}", value=key, variable=layout,
                             state="normal" if usable[key] else "disabled").pack(anchor="w")
         notes = [t("last_off", name=clash)] * (not usable["last"]) + [t("files_off")] * (not usable["files"])
@@ -1493,11 +1567,12 @@ class App:
                                source, files, here)
         if not answer:
             return
-        name, mode, where, replace = answer
+        name, mode, where, replace, rebuild = answer
         self.pack_mode = mode if here is None else self.pack_mode
         if mode == "folder":
             self.pack_target = where
-        argv = ["pack", source, where, f"--name={name}", *[f"--file={f}" for f in files], *["--replace"] * replace]
+        argv = ["pack", source, where, f"--name={name}", *[f"--file={f}" for f in files], *["--replace"] * replace,
+                *["--no-quant"] * (not rebuild)]
 
         def done():
             if mode == "file" and place.view == "folder" and place.path == os.path.dirname(where):
@@ -1511,9 +1586,10 @@ class App:
         self.start([{"argv": argv, "title": t("packing", name=name)}], done)
 
     def ask_pack(self, default, what, source, files, here=None):
-        """(model name, "folder" or "file", the pack folder or new pack file) the user enters, checked (also that
-        `source` may be packed there), or None. here: the pack folder the list shows; the choice is then this pack
-        folder (the default) or a new pack file, a pack of its own."""
+        """(model name, "folder" or "file", the pack folder or new pack file, whether to replace the model, whether to
+        rebuild quantized weights) the user enters, checked (also that `source` may be packed there), or None. here: the
+        pack folder the list shows; the choice is then this pack folder (the default) or a new pack file, a pack of its
+        own."""
         dialog = self.dialog(t("name_title"))
         frame = ttk.Frame(dialog, padding=self.px(16))
         frame.pack(fill="both", expand=True)
@@ -1566,6 +1642,9 @@ class App:
             browse_button.configure(state="disabled" if fixed else "normal")
 
         lock()
+        rebuild = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frame, text=t("quant_tick"), variable=rebuild).pack(anchor="w", pady=(self.px(12), 0))
+        self.note(frame, t("quant_note"), padx=(self.px(24), 0))
         error = ttk.Label(frame, foreground="#b3261e", wraplength=wrap)
         error.pack(anchor="w", pady=(self.px(4), 0))
         self.note(frame, "\n".join([t("name_hint")] + [t("file_hint_here")] * bool(here)), pady=(self.px(8), 0))
@@ -1599,7 +1678,7 @@ class App:
                 if held and not messagebox.askyesno(t("name_title"), t("replace_q", pack=where, name=model,
                                                                        files=count(len(held["files"]), "file")), parent=dialog):
                     return
-            result.append((model, mode.get(), where, bool(held) if mode.get() == "folder" else False))
+            result.append((model, mode.get(), where, bool(held) if mode.get() == "folder" else False, rebuild.get()))
             dialog.destroy()
 
         self.dialog_buttons(dialog, frame, accept)
@@ -1839,7 +1918,7 @@ class App:
             self.heading(frame, t("rebase_file_some", count=len(names), model=place.model) if files
                          else t("rebase_some", count=len(names)))
             ttk.Label(frame, text=lines(names)).pack(anchor="w", pady=(self.px(2), 0))
-        mode, also = tk.StringVar(value="find"), tk.BooleanVar(value=len(fixed) == len(names))
+        mode, also, rebuild = tk.StringVar(value="find"), tk.BooleanVar(value=len(fixed) == len(names)), tk.BooleanVar(value=True)
         for key in ("find", "alone"):
             ttk.Radiobutton(frame, text=t(f"rebase_{key}"), value=key, variable=mode).pack(
                 anchor="w", pady=(self.px(8) if key == "find" else self.px(4), 0))
@@ -1847,6 +1926,10 @@ class App:
             if key == "find" and fixed:  # (otherwise left as they are, as rebase --all does)
                 ttk.Checkbutton(frame, text=t("rebase_also", names=names_text(fixed)), variable=also).pack(
                     anchor="w", padx=(self.px(24), 0), pady=(self.px(2), 0))
+            if key == "find":  # the choice is not kept with a file: a rebase left on would rebuild one stored without it
+                ttk.Checkbutton(frame, text=t("quant_tick"), variable=rebuild).pack(
+                    anchor="w", padx=(self.px(24), 0), pady=(self.px(2), 0))
+                self.note(frame, t("quant_note"), padx=(self.px(48), 0))
         self.note(frame, t("rebase_hint"), pady=(self.px(8), 0))
         chosen = []
 
@@ -1861,7 +1944,7 @@ class App:
         todo = names if chosen[0] == "alone" or also.get() else [n for n in names if n not in fixed]
         if not todo:
             return
-        alone = ["--no-base"] if chosen[0] == "alone" else []
+        alone = ["--no-base"] if chosen[0] == "alone" else [] if rebuild.get() else ["--no-quant"]
         if files:  # the files named: a choice made is theirs
             argv = ["rebase", place.path, place.model, *[f"--file={n}" for n in todo], *alone]
             what = f"{todo[0]} of {place.model}" if len(todo) == 1 else f"{count(len(todo), 'file')} of {place.model}"
@@ -1983,6 +2066,8 @@ class App:
         self.busy_line.pack(fill="x", pady=(self.px(8), 0))
         self.busy_step = ttk.Label(frame, foreground="#5f6368", width=78, anchor="w")
         self.busy_step.pack(fill="x", pady=(self.px(4), 0))
+        self.busy_note = ttk.Label(frame, foreground="#9a6700", wraplength=self.px(560), justify="left", anchor="w")
+        self.busy_note.pack(fill="x", pady=(self.px(4), 0))  # what a long, silent step is doing (the exact rebuild)
         row = ttk.Frame(frame)
         row.pack(fill="x", pady=(self.px(16), 0))
         self.spinner = ttk.Label(row, anchor="w")  # turns while something runs: activity; how far it is, in words
@@ -2007,11 +2092,12 @@ class App:
         if self.busy is None:
             return
         seconds = int(time.monotonic() - self.busy_since)
-        text = f"{SPINNER[step % len(SPINNER)]}   {seconds // 60}:{seconds % 60:02d}"
+        spinner, dot = t("spinner"), t("dot")
+        text = f"{spinner[step % len(spinner)]}   {seconds // 60}:{seconds % 60:02d}"
         progress = self.progress
         if progress and progress.get("total"):
             done, total = progress.get("done", 0), progress["total"]
-            text += f"   ·   {min(done / total, 1):.0%}   ·   {size_text(min(done, total))} / {size_text(total)}"
+            text += f"   {dot}   {min(done / total, 1):.0%}   {dot}   {size_text(min(done, total))} / {size_text(total)}"
         self.spinner.configure(text=text)
         self.root.after(150, self.spin, step + 1)
 
@@ -2025,11 +2111,13 @@ class App:
         self.busy_title.configure(text=self.job["title"] + counted)
         self.busy_line.configure(text="")
         self.busy_step.configure(text="")
+        self.busy_note.configure(text="")
+        self.exact_regions = 0
         self.progress = None
         argv, listed = self.command(self.job)
         shown = subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
         self.write(f"\n> llm_archive.py {shown}" + (t("listed", count=listed) if listed else "") + "\n", "command")
-        self.status.configure(text=self.job["title"] + " …")
+        self.status.configure(text=f"{self.job['title']} {t('more')}")
         # below normal priority: a job uses every core the user leaves idle, and gives way when the user needs them
         where = (dict(creationflags=subprocess.CREATE_NO_WINDOW | subprocess.BELOW_NORMAL_PRIORITY_CLASS) if os.name == "nt"
                  else dict(start_new_session=True))
@@ -2084,14 +2172,19 @@ class App:
                     self.job_damage = event
                 if event["event"] == "error":
                     self.job_error = event
+                if event["event"] == "inexact":
+                    self.not_exact.append(os.path.join(self.job["argv"][3], *str(event.get("note", "")).split("/")))
+                if event["event"] == "exact":  # else the busy window sits at one percent for minutes, the one line cut
+                    self.exact_regions += 1
+                    self.busy_note.configure(text=t("exact_slow", regions=count(self.exact_regions, "region")))
                 if event["event"] in ("hint", "summary"):
                     self.events.append(event)
                 if event["event"] == "progress":
                     self.progress = event
                     step = event.get("step") or ""
                     if event.get("item"):
-                        step += f"  ·  {event['item']}"
-                    self.busy_step.configure(text=step if len(step) <= 90 else step[:89] + "…")
+                        step += f"  {t('dot')}  {event['item']}"
+                    self.busy_step.configure(text=step if len(step) <= 90 else step[:89] + t("more"))
                     continue
                 text = str(event.get("text", ""))
                 self.output.append(text + "\n")
@@ -2099,7 +2192,7 @@ class App:
                 if text.strip() and not self.cancelling:
                     shown = text.strip().splitlines()[0]
                     self.status.configure(text=f"{self.job['title']}:  {shown}")
-                    self.busy_line.configure(text=shown if len(shown) <= 90 else shown[:89] + "…")
+                    self.busy_line.configure(text=shown if len(shown) <= 90 else shown[:89] + t("more"))
         except queue.Empty:
             pass
         self.root.after(100, self.poll)
@@ -2120,40 +2213,62 @@ class App:
             self.write(t("cancelled") + "\n")
             self.finish(False)
             return
-        if code != 0:
-            retry = self.job.get("retry") and self.job["retry"](self.job, self.job_error or {})
+        error = self.job_error or {}
+        if code != 0 and not (error.get("code") == "inexact" and "--accept-inexact" in self.job["argv"]):  # that the
+            # user asked for: it did what it could, and what follows runs (finish says which files are not the originals)
+            retry = self.job.get("retry") and self.job["retry"](self.job, error)
             if not retry:
                 damage = self.job_damage
                 if damage:
-                    self.remember(damage)
+                    self.remember(self.job, damage)
                 self.finish(False)
                 if damage:
-                    self.show_damage(damage)
+                    self.show_damage(damage, error.get("code") == "inexact")
                     return
                 last = next((line for line in reversed(output.strip().splitlines()) if line.strip()), f"exit code {code}")
                 messagebox.showerror(t("failed"), sentence(last) + "\n\n" + t("see_log"), parent=self.root)
                 return
             self.jobs.insert(0, {**self.job, "argv": retry})
             self.job_number -= 1  # the same job, once more
+        elif self.job["argv"][0] == "verify":
+            self.remember(self.job)
         self.next_job()
 
-    def remember(self, damage):
-        """Keep what a verify found lost, for the ⚠ marks (mark) and for cleaning up (clean_up)."""
-        lost = {(item["model"], item["path"]): item["own"] for item in damage["lost"]}
-        models = {}
-        for model, _ in lost:
-            models[model] = models.get(model, 0) + 1
-        self.marks = {"pack": os.path.normcase(os.path.abspath(damage["pack"])), "stamp": pack_stamp(damage["pack"]),
-                      "lost": lost, "models": models}
+    def remember(self, job, damage=None):
+        """What a verify job that ran through found, for the ⚠ marks (mark) and for cleaning up (clean_up): what it
+        checked loses its mark, what it found lost (damage, its report) gets one, the rest stays. Marks are of one pack
+        at a time, as it is now; a verify that found nothing leaves another pack's alone."""
+        pack = job["argv"][1]
+        where, stamp, m = os.path.normcase(os.path.abspath(pack)), pack_stamp(pack), self.marks
+        if not m or m["pack"] != where or m["stamp"] != stamp:
+            if not damage:
+                return
+            m = self.marks = {"pack": where, "stamp": stamp, "lost": {}, "here": set()}
+        names = [a for a in job["argv"][2:] if not a.startswith("--")]  # none: every model
+        paths = [a[len("--file="):] for a in job["argv"][2:] if a.startswith("--file=")]  # none: every file of them
+        for key in [k for k in m["lost"] if (not names or k[0] in names) and (not paths or k[1] in paths)]:
+            del m["lost"][key]
+            m["here"].discard(key)
+        if damage:
+            intact = {fault["sha256"] for fault in damage["faults"] if fault.get("intact")}
+            for item in damage["lost"]:
+                m["lost"][item["model"], item["path"]] = item["own"]
+                if item["causes"] and intact.issuperset(item["causes"]):
+                    m["here"].add((item["model"], item["path"]))
 
-    def show_damage(self, damage):
-        """The damage report of a verify that failed, to read and copy; for a pack folder, Clean up (clean_up)."""
+    def show_damage(self, damage, only_here=False):
+        """The damage report of a verify that failed, to read and copy; for a pack folder, Clean up (clean_up), unless
+        a blob at fault is intact and only does not rebuild here: it may well restore on another machine, so nothing
+        is given up yet. only_here: that is all that failed (the error's code)."""
         dialog = self.dialog(t("damage_title"))
         frame = ttk.Frame(dialog, padding=self.px(16))
         frame.pack(fill="both", expand=True)
         lost = len(damage["lost"])
-        self.heading(frame, t("damage_heading", files=count(lost, "file")) if lost else t("damage_heading_other"))
-        self.note(frame, t("damage_note"), pady=(self.px(2), self.px(8)))
+        if only_here:
+            self.heading(frame, t("damage_heading_here", files=count(lost, "file")))
+        else:
+            self.heading(frame, t("damage_heading", files=count(lost, "file")) if lost else t("damage_heading_other"))
+        self.note(frame, t("damage_note_here" if only_here else "damage_note"), pady=(self.px(2), self.px(8)))
         box = ttk.Frame(frame)
         box.pack(fill="both", expand=True)
         text = tk.Text(box, width=100, height=22, wrap="none", font=self.mono, relief="flat", padx=self.px(8),
@@ -2170,8 +2285,11 @@ class App:
         box.columnconfigure(0, weight=1)
         pack = damage["pack"]
         writable = not la.is_oczip(pack)
+        intact = any(fault.get("intact") for fault in damage["faults"])
         if not writable:
             self.note(frame, t("clean_read_only"), pady=(self.px(8), 0))
+        elif intact:
+            self.note(frame, t("clean_off_here"), pady=(self.px(8), 0))
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x", pady=(self.px(12), 0))
 
@@ -2188,7 +2306,7 @@ class App:
         copy_button.pack(side="left")
         ttk.Button(buttons, text=t("close"), command=dialog.destroy).pack(side="right")
         ttk.Button(buttons, text=t("clean_up"), command=clean,
-                   state="normal" if writable and lost else "disabled").pack(side="right", padx=(0, self.px(6)))
+                   state="normal" if writable and lost and not intact else "disabled").pack(side="right", padx=(0, self.px(6)))
         dialog.resizable(True, True)
         dialog.bind("<Escape>", lambda _: dialog.destroy())
         self.show_dialog(dialog)
@@ -2279,6 +2397,9 @@ class App:
             self.go(Place(gone, pack=is_pack(gone)))
         else:
             self.refresh()  # also turns the buttons back on
+        notes, self.not_exact = self.not_exact, []
+        if notes:
+            messagebox.showwarning(t("not_exact_title"), t("not_exact", notes=lines(short(note) for note in notes)), parent=self.root)
         if ok:
             self.done()
 
@@ -2332,6 +2453,7 @@ def main():
         except (AttributeError, OSError):
             pass
     root = tk.Tk()
+    fit_text(root)
     App(root, start_place())
     root.mainloop()
 

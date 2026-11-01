@@ -13,6 +13,7 @@ public partial class BusyOverlay : Control
     private Label _title = null!;
     private Label _line = null!;
     private Label _step = null!;
+    private Label _notice = null!;  // what a long, silent step is doing (the tool's exact rebuild), in the window's words
     private Label _spinner = null!;
     private Ring _ring = null!;
     private Button _cancel = null!;
@@ -51,6 +52,10 @@ public partial class BusyOverlay : Control
         _step.ClipText = true;
         _step.TextOverrunBehavior = TextServer.OverrunBehavior.TrimEllipsis;
         box.AddChild(_step);
+        _notice = Ui.Label("", Ui.Amber, wrap: true);
+        _notice.CustomMinimumSize = new Vector2(Ui.Px(600), 0);
+        _notice.Visible = false;
+        box.AddChild(_notice);
         box.AddChild(Ui.Gap(8));
         var row = Ui.HBox(14);
         box.AddChild(row);
@@ -68,6 +73,7 @@ public partial class BusyOverlay : Control
         _title.Text = title;
         _line.Text = "";
         _step.Text = "";
+        SetNotice("");
         _spinner.Text = "";
         _cancel.Text = T.Get("cancel");
         _ring.Progress = null;
@@ -90,7 +96,13 @@ public partial class BusyOverlay : Control
         tw.TweenCallback(Callable.From(() => Visible = false));
     }
 
-    public void SetTitle(string text) => _title.Text = text;
+    public void SetTitle(string text) { _title.Text = text; SetNotice(""); }
+
+    public void SetNotice(string text)
+    {
+        _notice.Text = text;
+        _notice.Visible = text.Length > 0;
+    }
     public void SetLine(string text) => _line.Text = T.Cut(text);
     public void SetStep(string text) => _step.Text = T.Cut(text);
 

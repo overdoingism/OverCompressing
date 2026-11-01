@@ -99,9 +99,14 @@ public partial class OcDialog : Window
         }
     }
 
+    /// <summary>Dev hook (--answer=yes,no,...): the next dialogs are answered by themselves, in this order, a moment
+    /// after they open; when the queue is empty they stay, as they do for a hand.</summary>
+    public static readonly Queue<(bool yes, string? shot)> DevAnswers = new();  // shot: a screenshot taken before answering
+
     /// <summary>How many dialogs are open: the window keeps its frosted veil up while any is.</summary>
     public static event Action<int>? OpenCountChanged;
     private static int _open;
+    public static int OpenCount => _open;
     private MarginContainer _margin = null!;
 
     private void Finish(bool ok)
@@ -152,7 +157,28 @@ public partial class OcDialog : Window
         tw.TweenProperty(_margin, "scale", Vector2.One, 0.24).SetTrans(Tween.TransitionType.Back).SetEase(Tween.EaseType.Out);
         tw.TweenProperty(_margin, "modulate", Colors.White, 0.18);
         FirstFocus?.GrabFocus();
+        if (DevAnswers.Count > 0)
+        {
+            var (yes, shot) = DevAnswers.Dequeue();
+            _ = AnswerLater(yes, shot);
+        }
         return await _result.Task;
+    }
+
+    private async Task AnswerLater(bool yes, string? shot)
+    {
+        await ToSignal(GetTree().CreateTimer(0.6), SceneTreeTimer.SignalName.Timeout);
+        if (shot is not null)
+        {
+            var img = GetParent().GetViewport().GetTexture().GetImage();
+            img.SavePng(shot);
+            GD.Print($"screenshot: {shot}");
+        }
+        GD.Print($"dialog answered: {(yes ? "yes" : "no")}: {Title}");
+        if (yes)
+            Accept();
+        else
+            Finish(false);
     }
 
     // ------------------------------------------------------------------------------------------ message boxes

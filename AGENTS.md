@@ -9,7 +9,8 @@ and the decisions not to undo. What the tool does and how to use it: [README](RE
 A lossless archiver for open-weight model files (safetensors, GGUF, anything else in a model folder): every file is
 restored bit for bit and checked against its SHA-256. Float tensors are coded as byte planes; quantized tensors,
 metadata and text go to zstd; a fine-tune is stored as a delta against its base (`ans16`, a context-modelled rANS
-coder in NumPy, or XOR). Python 3.13 with NumPy and zstandard only: no compiled code of its own, no PyTorch.
+coder in NumPy, or XOR), a quantized GGUF as what its float parent does not predict (`--no-quant` to turn it off), an
+abliterated model as a rank-1 change of its base (`--no-rank1`). Python 3.13 with NumPy and zstandard only: no compiled code of its own, no PyTorch.
 
 | path | what |
 |---|---|
@@ -35,7 +36,7 @@ SHA-256 of the original and shared by every model that has it; a **manifest** is
 
 ```bash
 python -I tools/test_ans16.py
-python -I tools/test_formats.py <scratch_dir>   # several minutes, about 360 checks
+python -I tools/test_formats.py <scratch_dir>   # several minutes, about 500 checks
 ```
 
 - Speed changes are measured on real models before and after, per step, not only in total: `docs/benchmarks.md`.
@@ -58,9 +59,9 @@ python -I tools/test_formats.py <scratch_dir>   # several minutes, about 360 che
 
 ## Contracts
 
-- Format version 4. Any change to it goes into `tools/ARCHIVE_FORMAT.md`.
+- Format version 5. Any change to it goes into `tools/ARCHIVE_FORMAT.md`.
 - `--json`: every stdout line is a JSON object; a failure ends with `{"event": "error", "code", "text"}` and exit code 1.
-  The codes (`exists`, `name_taken`, `busy`, `no_room`, `damaged`, `cancelled`, `other`) are the contract, the text is
+  The codes (`exists`, `name_taken`, `busy`, `no_room`, `damaged`, `inexact`, `cancelled`, `other`) are the contract, the text is
   for people; programs, the window included, decide by the code. A command line that does not parse exits 2.
 - A user-facing change goes into both halves of `docs/usage.md` (English and Chinese).
 - Versions are pinned (python-build-standalone in the build guides, numpy and zstandard in the lock files) and bumped
@@ -86,7 +87,7 @@ python -I tools/test_formats.py <scratch_dir>   # several minutes, about 360 che
 
 ## The window
 
-- Text: Unicode symbols (BMP only, for Tk 8.6) where they say it, else English; no localization. Dialogs short, in
+- Text: Unicode symbols (BMP only, for Tk 8.6) where they say it, else English, all ASCII where Tk has no Xft (`plain_text`); no localization. Dialogs short, in
   sentence case; no "…" on buttons.
 - Reading (a pack, a model) is done in-process; every change runs the CLI in a child process with `--json
   --progress`, at below-normal priority; closing its stdin cancels it.

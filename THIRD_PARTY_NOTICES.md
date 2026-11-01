@@ -21,8 +21,9 @@ and SHA-256 hashes into a portable copy, with their own license files.
 
 | Work | License / status | Relation |
 |---|---|---|
-| [ZipNN](https://github.com/zipnn/zipnn) — IBM ([arXiv:2411.05239](https://arxiv.org/abs/2411.05239)) | MIT | Byte grouping of float weights (exponents in a byte stream of their own) comes from ZipNN. OverCompressing implements it itself (NumPy bit operations, zlib/zstd for the entropy coding) and does not use ZipNN's code. |
+| [ZipNN](https://github.com/zipnn/zipnn) — IBM ([arXiv:2411.05239](https://arxiv.org/abs/2411.05239)) | MIT | Byte grouping of float weights comes from ZipNN. OverCompressing implements its own form of it (the top 16 bits rotated, NumPy bit operations, zlib/zstd for the entropy coding) and does not use ZipNN's code. |
 | [ryg_rans](https://github.com/rygorous/ryg_rans) — Fabian Giesen | CC0 | The ans16 coder follows the structure of its 64-bit-state interleaved rANS (`rans64`), reimplemented in NumPy. |
+| [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) | MIT | The block layouts of its quantized GGUF types, and the arithmetic of Q8_0 quantization, which the quant codec reproduces in NumPy. No code of it is used. |
 | Asymmetric Numeral Systems — Jarek Duda ([arXiv:0902.0271](https://arxiv.org/abs/0902.0271), [arXiv:1311.2540](https://arxiv.org/abs/1311.2540)) | paper | Entropy coding behind ans16. |
 | [DFloat11](https://github.com/LeanModels/DFloat11) | Apache-2.0 | Evaluated, not used (needs a CUDA GPU to decompress). |
 | [constriction](https://github.com/bamler-lab/constriction) | MIT OR Apache-2.0 OR BSL-1.0 | Used only by the early experiment `dev/ans16_delta.py`. |

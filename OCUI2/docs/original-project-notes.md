@@ -62,3 +62,21 @@ observations and suggestions for its owner. 對原專案的觀察與建議（未
 - The stdin-EOF cancel runner (`RUNNER`) works from a .NET host too: closing the child's stdin ends a running verify
   with `cancelled` and exit code 1 within a second; `taskkill /T` for "Stop now".
 - Below-normal priority set on the child right after start is inherited by its ans16 worker processes.
+
+## Found while following the 0.6 / format 5 handoff (2026-11-01)
+
+11. **The exact rebuild looks like a stall.** When a `quant` or `rank1` region does not rebuild the fast way, the
+    tool works it out again without floating point arithmetic (`quant_region`, `rank1_region`): on a 482 MiB Q6_K
+    file that took minutes per 64 MiB region here, during which `--progress` stays where it was (progress is counted
+    as files are written) and the only word is one `exact` line per region, 100+ characters long, whose "(slow)"
+    comes last and is cut by both windows (90 characters). The owner, watching, took it for a hang ("1 % and no
+    progress"). This window now shows a notice of its own on the busy card when an `exact` event arrives. For the
+    tool: a `progress` event per region of an exact rebuild (`step: "rebuilding region 3 of 8 exactly"`, or `done`
+    advanced by the region's length), or the words "slow, exact rebuild" first in the `exact` text, would let any
+    client say what is happening. Low cost, and the one place where the tool is silent for minutes.
+    **Done the same day at the owner's word** (the one edit outside `OCUI2/`): the line is now `slow: exact rebuild of
+    <file>, region at <offset>`, and the Tkinter window's busy window got the same note as this one (`exact_slow`).
+12. **`list` names a folder's model after the folder as it is.** `pack <Org__Name folder>` without `--name` makes the
+    model `Org__Name`, not `Org/Name` (`name = args.name or os.path.basename(source)`; the help says "the folder's
+    name"). Consistent with the documentation; noted because the test packs here were first built with `--name` and
+    the difference showed in the window's lists. Not a bug.

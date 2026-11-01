@@ -46,6 +46,7 @@ import json
 import math
 import multiprocessing
 import os
+import re
 import secrets
 import shutil
 import stat
@@ -59,18 +60,19 @@ import zipfile
 import zlib
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from fractions import Fraction
 
 import numpy as np
 import zstandard
 
-VERSION = "0.5"  # of this command-line tool (the window has its own); raised by hand for changes people see
-FORMAT_VERSION = 4
+VERSION = "0.6"  # of this command-line tool (the window has its own); raised by hand for changes people see
+FORMAT_VERSION = 5
 SKIP_DIRS = {".git", ".cache", "__MACOSX"}  # bookkeeping of git / download tools / macOS unzipping: not model files
 SKIP_FILES = {".hf_files.json", "thumbs.db", "desktop.ini", ".ds_store"}  # compared ignoring case: staging metadata of
 # earlier versions of this tool, and the folder-view caches Windows and macOS leave everywhere
-MAGIC = b"OCZ4"
-CODEC_RAW, CODEC_PLANES, CODEC_ZSTD, CODEC_ANS16 = 0, 1, 2, 3
-CODEC_NAMES = ["raw", "planes", "zstd", "ans16"]
+MAGIC = b"OCZ5"
+CODEC_RAW, CODEC_PLANES, CODEC_ZSTD, CODEC_ANS16, CODEC_QUANT, CODEC_RANK1 = 0, 1, 2, 3, 4, 5
+CODEC_NAMES = ["raw", "planes", "zstd", "ans16", "quant", "rank1"]
 FRAME_HEAD = struct.Struct("<BQQI")  # codec, raw_len, payload_len, crc32 of the original chunk
 FLOAT_DTYPES = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1, "F8_E5M2": 1}  # float dtypes coded as byte planes
 
@@ -93,7 +95,7 @@ def say(text, event="note", **fields):
 
 # What failed, for programs: the "code" of the error event that ends --json output. The text is for people and may
 # change; these do not. Only failures a caller can act on have a code of their own; the rest are "other".
-ERROR_CODES = ("exists", "name_taken", "busy", "no_room", "damaged", "cancelled", "other")
+ERROR_CODES = ("exists", "name_taken", "busy", "no_room", "damaged", "inexact", "cancelled", "other")
 
 
 class Failure(SystemExit):
@@ -446,26 +448,19 @@ def zstd_frame_length(frame):
 
 def zstd_bounded(frame, limit):
     """The bytes of a payload that must be exactly one zstd frame (nothing after it) decoding to at most `limit`
-    bytes. Never produces more than limit + 1 bytes whatever the frame claims; ValueError otherwise."""
+    bytes. Never produces more than `limit` bytes whatever the frame claims; ValueError otherwise."""
     try:
         if zstd_frame_length(frame) != len(frame):
             raise ValueError("bytes after the zstd frame")
         declared = zstandard.frame_content_size(frame)
         if declared > limit:
             raise ValueError("zstd frame declares more than its region holds")
-        reader = zstandard.ZstdDecompressor().stream_reader(bytes(frame), read_across_frames=False)
-        parts, got = [], 0
-        while got <= limit:
-            part = reader.read(min(limit + 1 - got, 16 << 20))
-            if not part:
-                break
-            parts.append(part)
-            got += len(part)
+        out = zstandard.ZstdDecompressor().decompress(frame, max_output_size=limit)
     except zstandard.ZstdError as e:
         raise ValueError(f"bad zstd frame ({e})") from e
-    if got > limit or declared not in (-1, got):
+    if declared not in (-1, len(out)):
         raise ValueError("zstd frame decodes to more than it should")
-    return b"".join(parts)
+    return out
 
 
 def zstd_exact(frame, size):
@@ -478,23 +473,25 @@ def zstd_exact(frame, size):
 
 # ----------------------------------------------------------------------------------------------- byte planes (codec 1)
 #
-# A float tensor's bytes look like noise to a general compressor because each weight's exponent, the only part with
-# little information, is split across bytes and mixed with the mantissa. Codec 1 rearranges the bits of each weight
-# into byte planes, the exponent in a plane of its own (byte grouping, the idea of ZipNN), and codes each plane with
-# the smallest of: raw DEFLATE Huffman-only (zlib: near the plane's order-0 entropy, without LZ matching that only
-# costs on such data), a zstd frame (catches long runs, e.g. a zeroed tensor), or the plane as it is. Byte-level
-# spec: ARCHIVE_FORMAT.md.
+# A float tensor's bytes look like noise to a general compressor because the bits with little information are mixed
+# with mantissa bits that have much. Codec 1 groups each weight's bytes into byte planes (byte grouping, the idea of
+# ZipNN), for BF16 and F32 after rotating the top 16 bits, which measured smallest across model families; low bits an
+# F32 widened from a 16-bit float never used stay planes of their own. Each plane is coded with zstd (fast to code and
+# to decode, and it catches long runs), with raw DEFLATE Huffman-only (zlib: near the plane's order-0 entropy) where
+# that saves enough to pay for its slower decoding, or as it is. Byte-level spec: ARCHIVE_FORMAT.md.
 
 PLANE_STORED, PLANE_DEFLATE, PLANE_ZSTD = 0, 1, 2
 PLANES_HEAD = struct.Struct("<B")  # number of streams
 PLANE_HEAD = struct.Struct("<BQ")  # coding, coded length
+PLANE_ROTATION = 3  # bits the top 16 bits of a BF16 or F32 element are rotated left by
+HUFFMAN_GAIN = 0.005  # share of a plane that Huffman coding must save over zstd to be used
+HUFFMAN_SAMPLE = 64 << 10  # bytes of a piece of the sample that decides whether a large plane tries Huffman coding
 
 
 def byte_planes(data, dtype):
     """(planes, tail): the bytes of whole elements rearranged into byte planes (uint8 arrays of one byte per element),
-    and the bytes after the last whole element. BF16: exponent; sign and 7 mantissa bits. F16: high byte (sign,
-    exponent, 2 mantissa bits); low byte. F32: exponent; sign and the top 7 mantissa bits; the middle and the low
-    mantissa byte. F8: the bytes themselves."""
+    and the bytes after the last whole element. BF16: the two bytes of the element rotated left by PLANE_ROTATION bits.
+    F32: the same of its top 16 bits, then its two low bytes. F16: high byte; low byte. F8: the bytes themselves."""
     size = FLOAT_DTYPES[dtype]
     n = len(data) // size
     tail = bytes(data[n * size:])
@@ -504,16 +501,15 @@ def byte_planes(data, dtype):
     u = u.reshape(n, size)  # a row per element, its bytes from the lowest up (little-endian)
     if dtype == "F16":
         return [np.ascontiguousarray(u[:, 1]), np.ascontiguousarray(u[:, 0])], tail
-    # BF16 and F32: the top byte holds the sign and the exponent's top 7 bits, the next the exponent's lowest bit and
-    # the top 7 mantissa bits; byte operations into arrays made once (whole-width ones cost more memory traffic than
-    # the coding itself, and threads doing them at once wait for memory)
+    # BF16 and F32: byte operations into arrays made once (whole-width ones cost more memory traffic than the coding
+    # itself, and threads doing them at once wait for memory)
     hi, lo = u[:, size - 1], u[:, size - 2]
-    exponent, sign, tmp = np.empty(n, np.uint8), np.empty(n, np.uint8), np.empty(n, np.uint8)
-    np.left_shift(hi, 1, out=exponent)
-    np.bitwise_or(exponent, np.right_shift(lo, 7, out=tmp), out=exponent)
-    np.bitwise_and(hi, 0x80, out=sign)
-    np.bitwise_or(sign, np.bitwise_and(lo, 0x7F, out=tmp), out=sign)
-    return [exponent, sign, *(np.ascontiguousarray(u[:, i]) for i in range(size - 3, -1, -1))], tail
+    first, second, tmp = np.empty(n, np.uint8), np.empty(n, np.uint8), np.empty(n, np.uint8)
+    np.left_shift(hi, PLANE_ROTATION, out=first)
+    np.bitwise_or(first, np.right_shift(lo, 8 - PLANE_ROTATION, out=tmp), out=first)
+    np.left_shift(lo, PLANE_ROTATION, out=second)
+    np.bitwise_or(second, np.right_shift(hi, 8 - PLANE_ROTATION, out=tmp), out=second)
+    return [first, second, *(np.ascontiguousarray(u[:, i]) for i in range(size - 3, -1, -1))], tail
 
 
 def join_planes(planes, tail, dtype):
@@ -528,12 +524,12 @@ def join_planes(planes, tail, dtype):
     elif dtype == "F16":
         u[:, 1], u[:, 0] = planes
     else:
-        exponent, sign, *rest = planes
+        first, second, *rest = planes
         hi, lo, tmp = u[:, size - 1], u[:, size - 2], np.empty(n, np.uint8)
-        np.right_shift(exponent, 1, out=hi)
-        np.bitwise_or(hi, np.bitwise_and(sign, 0x80, out=tmp), out=hi)
-        np.left_shift(exponent, 7, out=lo)
-        np.bitwise_or(lo, np.bitwise_and(sign, 0x7F, out=tmp), out=lo)
+        np.right_shift(first, PLANE_ROTATION, out=hi)
+        np.bitwise_or(hi, np.left_shift(second, 8 - PLANE_ROTATION, out=tmp), out=hi)
+        np.right_shift(second, PLANE_ROTATION, out=lo)
+        np.bitwise_or(lo, np.left_shift(first, 8 - PLANE_ROTATION, out=tmp), out=lo)
         for i, plane in zip(range(size - 3, -1, -1), rest):
             u[:, i] = plane
     return out
@@ -544,13 +540,25 @@ def deflate_huffman(data):
     return c.compress(data) + c.flush()
 
 
+def code_plane(plane):
+    """(coding, coded bytes) of a plane: zstd or the plane as it is, whichever is smaller, unless Huffman coding saves
+    over HUFFMAN_GAIN of the plane. From 1 MiB up, Huffman coding runs on the whole plane only if pieces of it say so."""
+    n = len(plane)
+    coded = zstandard.ZstdCompressor(level=1).compress(plane)  # the arrays go to the coders as they are
+    best = (PLANE_ZSTD, coded) if len(coded) < n else (PLANE_STORED, plane)
+    if n >= 1 << 20:
+        pieces = 16 if n >= 4 << 20 else 4
+        step = (n - HUFFMAN_SAMPLE) // (pieces - 1)
+        sample = np.concatenate([plane[i * step:i * step + HUFFMAN_SAMPLE] for i in range(pieces)])
+        if len(best[1]) - len(deflate_huffman(sample)) * n / len(sample) <= n * HUFFMAN_GAIN:
+            return best
+    coded = deflate_huffman(plane)
+    return (PLANE_DEFLATE, coded) if len(best[1]) - len(coded) > n * HUFFMAN_GAIN else best
+
+
 def planes_encode(data, dtype):
     planes, tail = byte_planes(data, dtype)
-    streams = []
-    for plane in planes:  # the arrays go to the coders as they are
-        options = [(PLANE_STORED, plane), (PLANE_ZSTD, zstandard.ZstdCompressor(level=1).compress(plane)),
-                   (PLANE_DEFLATE, deflate_huffman(plane))]
-        streams.append(min(options, key=lambda o: len(o[1])))
+    streams = [code_plane(plane) for plane in planes]
     if tail:
         streams.append((PLANE_STORED, tail))
     return PLANES_HEAD.pack(len(streams)) + b"".join(PLANE_HEAD.pack(c, len(s)) for c, s in streams) + b"".join(s for _, s in streams)
@@ -653,7 +661,7 @@ def ordered_map(fn, items, workers):
 #
 # A layout-aware file is described as regions {"offset", "length", "kind", "dtype"?}: "float" regions are float
 # tensors (byte planes of that dtype), "zstd" regions are headers, metadata and quantized/integer tensors, "auto"
-# regions are bytes of unknown type (the smaller of BF16 byte planes and zstd wins, chunk by chunk).
+# regions are bytes of unknown type (the smaller of plain byte columns and zstd wins, chunk by chunk).
 
 GGUF_FLOAT_TYPES = {0: ("F32", 4), 1: ("F16", 2), 30: ("BF16", 2)}  # ggml_type -> (dtype, bytes per element)
 GGUF_SCALARS = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f", 7: "<?", 10: "<Q", 11: "<q", 12: "<d"}
@@ -759,13 +767,15 @@ def tensor_regions(tensors, file_size, chunk_size, match=None):
         m = match(tensor) if match and end > start else None
         if m:
             cut = start + m[4]
-            spans.append((start, cut, m[2], dtype, [m[0], m[1]], m[3]))
+            shape = tensor[4] if len(tensor) > 4 else ()
+            cols = math.prod(shape[1:]) if len(shape) > 1 and m[2] == "ans16" else None
+            spans.append((start, cut, m[2], dtype, [m[0], m[1]], m[3], cols))
             if cut < end:
-                spans.append((cut, end, standalone, dtype, None, None))
+                spans.append((cut, end, standalone, dtype, None, None, None))
         else:
-            spans.append((start, end, standalone, dtype, None, None))
+            spans.append((start, end, standalone, dtype, None, None, None))
     regions, pos = [], 0
-    for start, end, kind, dtype, base, base_dtype in sorted(spans, key=lambda s: (s[0], s[1])):
+    for start, end, kind, dtype, base, base_dtype, cols in sorted(spans, key=lambda s: (s[0], s[1])):
         if start < pos or end > file_size:
             return None
         if start > pos:
@@ -776,6 +786,8 @@ def tensor_regions(tensors, file_size, chunk_size, match=None):
                 region["base"] = base
             if base_dtype:
                 region["base_dtype"] = base_dtype
+            if cols:
+                region["cols"] = cols
             regions.append(region)
         pos = end
     if file_size > pos:
@@ -790,16 +802,21 @@ def tensor_regions(tensors, file_size, chunk_size, match=None):
 
 
 def split_regions(regions, chunk_size):
-    """Cut long regions into pieces: ans16 regions into blocks of ANS16_BLOCK_ELEMS weights, the rest into
-    chunk_size (a multiple of every element size). A piece's base offset advances with it."""
+    """Cut long regions into pieces: ans16 regions into blocks of ANS16_BLOCK_ELEMS weights, on whole rows where it knows
+    them, quant regions on whole blocks of the tensor and of its parent, the rest into chunk_size (a multiple of every
+    element size). A piece's base offset advances with it."""
     out = []
     for r in regions:
         piece = 2 * ANS16_BLOCK_ELEMS if r["kind"] == "ans16" else chunk_size
+        if r.get("cols") and 0 < r["cols"] * 2 <= piece:
+            piece = piece // (r["cols"] * 2) * (r["cols"] * 2)
+        if r["kind"] == "quant":
+            unit = quant_unit(r["dtype"], r["base_dtype"])
+            piece = max(piece // unit, 1) * unit
         for off in range(0, r["length"], piece):
             p = {**r, "offset": r["offset"] + off, "length": min(piece, r["length"] - off)}
             if "base" in r:  # a converted base (e.g. F32 for a BF16 target) advances by its own element size
-                scale = FLOAT_BYTES[r["base_dtype"]] // FLOAT_BYTES[r["dtype"]] if "base_dtype" in r else 1
-                p["base"] = [r["base"][0], r["base"][1] + off * scale]
+                p["base"] = [r["base"][0], r["base"][1] + base_length(r, off)]
             out.append(p)
     return out
 
@@ -815,23 +832,132 @@ def file_regions(path, size, chunk_size):
     return kind, None, split_regions([{"offset": 0, "length": size, "kind": kind}], chunk_size)
 
 
-def match_against_base(tensors, base_files, delta_codec):
-    """match() for tensor_regions. A target tensor matches a base tensor with the same name and, in order of
-    preference: the same dtype and byte size; the same element count in another float dtype (BF16/F16 targets only,
-    base values converted: base_dtype); or, for float tensors, the same shape except the first dimension (e.g. an
-    embedding after vocabulary extension), covering the leading rows both have. Prefers the base file sharing the
-    most bytes with this target file. base_files: [{"tensors": ...}]. match() returns
-    (base file, base start, kind, base_dtype or None, covered bytes)."""
+CONTENT_SAMPLE = 4096  # elements of a tensor compared when looking for its like in a file of another format
+CONTENT_MIN = 16  # elements a tensor must have for that; smaller ones are not worth a read
+CONTENT_MAX_BITS = 11.0  # bits per element a like may differ by; unrelated weights differ by about 13
+CONTENT_MAX_TRIED = 256  # tensors tried for one when none has the same numbers in its name
+CONTENT_MAX_ERROR = 0.5  # how far a quantized tensor's values may be from its like's, as a share of their size
+
+
+class ContentMatch:
+    """Finds, by their bytes, the float tensors of base files in another format that a file's float tensors are like.
+    Names differ between formats (blk.0.attn_q.weight, model.layers.0.self_attn.q_proj.weight) and no table could
+    follow them all. A tensor's like has its shape and, if any such has the same numbers in its name, is one of those;
+    of these, the one whose first elements differ least from its own. Only what is asked for is read, so choosing a
+    base looks at a few tensors of each candidate. read(start, length): bytes of the file itself."""
+
+    def __init__(self, p, read, base_files, fmt):
+        self.p, self.read, self.best, self.samples = p, read, {}, {}
+        self.by_shape = {}
+        for index, f in enumerate(base_files):
+            if f.get("format") != fmt:
+                for t in f["tensors"]:
+                    if t[1] in FLOAT_BYTES:
+                        self.by_shape.setdefault(tuple(t[4]), []).append((index, f["sha256"], t))
+
+    def plausible(self, tensors):
+        """Whether tensors of these shapes make up at least half of this file's tensor bytes (tables alone tell)."""
+        like = sum(t[3] - t[2] for t in tensors if (t[1] in FLOAT_BYTES or t[1] in QUANT_BLOCKS) and tuple(t[4]) in self.by_shape)
+        return like > 0 and like * 2 >= sum(t[3] - t[2] for t in tensors)
+
+    def sample(self, sha, t, count, dtype):
+        """The first `count` elements of base tensor t, as the 16 bits compared: converted to a 16-bit dtype, or the
+        top half of an F32."""
+        key = (sha, t[2], count, dtype)
+        if key not in self.samples:
+            raw = read_range(self.p, sha, t[2], count * FLOAT_BYTES[t[1]])
+            self.samples[key] = top_bits(raw, t[1], dtype)
+        return self.samples[key]
+
+    def __call__(self, tensor):
+        """[(base file, dtype, start, byte size, shape)] of the tensor's like: one, or none."""
+        name, dtype, start, end, shape = tensor
+        if name in self.best:
+            return self.best[name]
+        self.best[name] = []
+        if dtype in QUANT_BLOCKS:
+            self.best[name] = self.like_of_quantized(tensor)
+        else:
+            options = self.by_shape.get(tuple(shape), []) if dtype in FLOAT_BYTES else []
+            options = [o for o in options if o[2][1] == dtype or dtype in ANS16_EXPONENT]
+            count = min((end - start) // FLOAT_BYTES[dtype], CONTENT_SAMPLE) if options else 0
+            if count >= CONTENT_MIN:
+                numbers = re.findall(r"\d+", name)
+                near = [o for o in options if re.findall(r"\d+", o[2][0]) == numbers]
+                mine = top_bits(self.read(start, count * FLOAT_BYTES[dtype]), dtype, dtype)
+                found = (CONTENT_MAX_BITS, None)
+                for index, sha, t in near or options[:CONTENT_MAX_TRIED]:
+                    try:
+                        apart = (mine - self.sample(sha, t, count, dtype)).astype(np.int16)
+                    except (OSError, ValueError):
+                        continue
+                    bits = float(np.log2(1.0 + np.abs(apart.astype(np.int32))).mean())
+                    if bits < found[0]:
+                        found = (bits, (index, t[1], t[2], t[3] - t[2], t[4]))
+                if found[1]:
+                    self.best[name] = [found[1]]
+        return self.best[name]
+
+    def like_of_quantized(self, tensor):
+        """The float tensor of its shape whose values a quantized tensor's come closest to, [] if none is close."""
+        name, dtype, start, end, shape = tensor
+        width, size = QUANT_BLOCKS[dtype]
+        elements = math.prod(shape)
+        options = self.by_shape.get(tuple(shape), [])
+        if not options or elements < width or elements % width or end - start < elements // width * size:
+            return []
+        blocks = min(elements // width, max(CONTENT_SAMPLE // width, 1))
+        mine = quant_parent_values(self.read(start, blocks * size), dtype).reshape(-1)
+        numbers = re.findall(r"\d+", name)
+        near = [o for o in options if re.findall(r"\d+", o[2][0]) == numbers]
+        found = (CONTENT_MAX_ERROR, None)
+        for index, sha, t in near or options[:CONTENT_MAX_TRIED]:
+            key = (sha, t[2], mine.size)
+            try:
+                if key not in self.samples:
+                    self.samples[key] = quant_parent_values(read_range(self.p, sha, t[2], mine.size * FLOAT_BYTES[t[1]]), t[1]).reshape(-1)
+            except (OSError, ValueError):
+                continue
+            theirs = self.samples[key]
+            with np.errstate(all="ignore"):
+                error = float(np.abs(mine.astype(np.float64) - theirs).sum() / max(np.abs(theirs.astype(np.float64)).sum(), 1e-30))
+            if error < found[0]:
+                found = (error, (index, t[1], t[2], t[3] - t[2], t[4]))
+        return [found[1]] if found[1] else []
+
+
+def top_bits(raw, dtype, target_dtype):
+    """16-bit values to compare a tensor's elements by: those of raw (elements of dtype) as target_dtype, or for F32
+    their top half."""
+    if target_dtype == "F32":
+        return (np.frombuffer(raw, "<u4") >> 16).astype(np.uint16)
+    return prediction_from_bytes(raw, None if dtype == target_dtype else dtype, target_dtype)
+
+
+def match_against_base(tensors, base_files, delta_codec, content=None):
+    """match() for tensor_regions. A target tensor matches a base tensor with the same name (or, if none has it, the
+    one content(tensor) finds: ContentMatch) and, in order of preference: the same dtype and byte size; the same
+    element count in another float dtype (BF16/F16 targets only, base values converted: base_dtype); or, for float
+    tensors, the same shape except the first dimension (e.g. an embedding after vocabulary extension), covering the
+    leading rows both have. Prefers the base file sharing the most bytes with this target file by name.
+    base_files: [{"tensors": ...}]. match() returns (base file, base start, kind, base_dtype or None, covered bytes)."""
     by_name = {}
     for index, base_file in enumerate(base_files):
         for t in base_file["tensors"]:
             by_name.setdefault(t[0], []).append((index, t[1], t[2], t[3] - t[2], t[4] if len(t) > 4 else None))
 
-    def candidates(tensor):
+    def candidates(tensor, by_content=True):
         name, dtype, start, end = tensor[:4]
         shape, size = (tensor[4] if len(tensor) > 4 else None), end - start
-        found = by_name.get(name, [])
+        found = by_name.get(name, []) or (content(tensor) if content and by_content else [])
         exact = [(i, s, None, size) for i, d, s, n, _ in found if d == dtype and n == size]
+        if not exact and dtype in QUANT_BLOCKS and delta_codec == "ans16" and REBUILD_QUANTIZED and shape:
+            elements = math.prod(shape)
+            width, block = QUANT_BLOCKS[dtype]
+            covered = elements // width * block
+            if elements % width == 0 and 0 < covered <= size:
+                return [(i, s, d, covered) for i, d, s, n, base_shape in found
+                        if base_shape == shape and d in QUANT_PARENTS and elements % quant_width(d) == 0 and n >= quant_parent_bytes(elements, d)]
         if exact or dtype not in FLOAT_BYTES:
             return exact
         out = []
@@ -850,15 +976,15 @@ def match_against_base(tensors, base_files, delta_codec):
 
     shared = {}
     for tensor in tensors:
-        for index, _, _, covered in candidates(tensor):
+        for index, _, _, covered in candidates(tensor, by_content=False):
             shared[index] = shared.get(index, 0) + covered
 
     def match(tensor):
         found = candidates(tensor)
         if not found:
             return None
-        index, base_start, base_dtype, covered = max(found, key=lambda c: (c[3], shared[c[0]]))
-        kind = "ans16" if delta_codec == "ans16" and tensor[1] in ANS16_EXPONENT else "xor"
+        index, base_start, base_dtype, covered = max(found, key=lambda c: (c[3], shared.get(c[0], 0)))
+        kind = "quant" if tensor[1] in QUANT_BLOCKS and base_dtype else "ans16" if delta_codec == "ans16" and tensor[1] in ANS16_EXPONENT else "xor"
         return index, base_start, kind, base_dtype, covered
 
     return match
@@ -924,8 +1050,11 @@ def prediction_from_bytes(raw, base_dtype, dtype):
 
 
 def base_bytes(base_paths, base_files, region):
-    """Bytes a region's XOR residual is taken against."""
+    """Bytes a region is coded against: an XOR residual's, or the parent's bytes of a quant region."""
     index, offset = region["base"]
+    if region["kind"] == "quant":
+        base_files[index].seek(offset)
+        return base_files[index].read(base_length(region))
     if "base_dtype" in region:
         return base_prediction(base_paths[index], offset, region["length"] // 2, region["base_dtype"], region["dtype"]).tobytes()
     base_files[index].seek(offset)
@@ -1025,12 +1154,14 @@ def ans16_quantize(counts, k, prec):
     return freq
 
 
-def ans16_encode(base, target, dtype, prec=ANS16_PREC, min_context=ANS16_MIN_CONTEXT):
+def ans16_encode(base, target, dtype, prec=ANS16_PREC, min_context=ANS16_MIN_CONTEXT, predicted=None):
+    """The payload of target against base, whose exponents give the contexts. predicted: what the residuals are taken
+    against, if not base (rank1); the stream can then be decoded whatever that was."""
     if base.size == 0 or base.size != target.size:
         raise ValueError("ans16 codes one or more weights against as many base weights")  # pack never asks otherwise
     ctx, ctx_ids = ans16_contexts(base, dtype, min_context)
     ctxpos = np.searchsorted(ctx_ids, ctx).astype(np.int32)
-    residual = (target - base).astype(np.uint16)  # wraps mod 2^16
+    residual = (target - (base if predicted is None else predicted)).astype(np.uint16)  # wraps mod 2^16
     # Histogram over (context, residual) keys; keys < 257 * 65536, so a dense count array beats sorting.
     key = ctxpos * np.int32(65536) + residual
     histogram = np.bincount(key, minlength=ctx_ids.size * 65536)
@@ -1059,8 +1190,9 @@ def ans16_encode(base, target, dtype, prec=ANS16_PREC, min_context=ANS16_MIN_CON
     return head + tables_z + states.astype("<u8").tobytes() + counts_z + words.astype("<u4").tobytes()
 
 
-def ans16_decode(base, payload, dtype, stop=None):
-    """The target weights coded in payload; with stop, only the first `stop` of them (cheaper, but unchecked)."""
+def ans16_decode(base, payload, dtype, stop=None, predicted=None):
+    """The target weights coded in payload; with stop, only the first `stop` of them (cheaper, but unchecked).
+    predicted: what the residuals were taken against, if not base."""
     if len(payload) < ANS16_HEAD.size:
         raise ValueError("ans16 payload too short")
     prec, min_context, n, lanes, contexts, tables_zlen, counts_zlen, nwords = ANS16_HEAD.unpack_from(payload, 0)
@@ -1104,7 +1236,527 @@ def ans16_decode(base, payload, dtype, stop=None):
         return idx, freq[idx], cum[idx]
 
     idx = rans_decode(states, lane_counts, words, n, prec, lookup, stop)
-    return (base[: idx.size] + sym[idx]).astype(np.uint16)
+    return ((base if predicted is None else predicted)[: idx.size] + sym[idx]).astype(np.uint16)
+
+
+# ----------------------------------------------------------------------------------------------- quant (codec 4)
+#
+# A quantized tensor is a function of the float weights it was made from: given a block's scales (which K types store),
+# each value is the nearest step to its weight, and Q8_0's scale follows from the block too. So a tensor whose parent is
+# in the pack is coded as what the prediction leaves: the scales, and the difference of each value from the prediction,
+# nearly all zero. What makes the bytes come out the same on any machine: every prediction step below is defined as a
+# binary32 result under IEEE 754 (add, subtract, multiply, divide, rint, trunc, nothing from a math library), so a
+# result does not depend on the CPU or on NumPy. quant_predict_exact reaches the same results in fractions, without any
+# floating point: the check of the fast path, and what restoring falls back on. Byte-level spec: ARCHIVE_FORMAT.md.
+
+QUANT_BLOCKS = {"ggml_type_8": (32, 34), "ggml_type_12": (256, 144), "ggml_type_13": (256, 176), "ggml_type_14": (256, 210)}  # dtype -> (elements, bytes) of a block: Q8_0, Q4_K, Q5_K, Q6_K
+QUANT_PARENTS = {*FLOAT_BYTES, *QUANT_BLOCKS}
+REBUILD_QUANTIZED = True  # off for one command with --no-quant
+Q8_0, Q4_K, Q5_K, Q6_K = QUANT_BLOCKS
+
+
+def quant_width(dtype):
+    """Elements a dtype's values come in blocks of (a float dtype: 1)."""
+    return QUANT_BLOCKS[dtype][0] if dtype in QUANT_BLOCKS else 1
+
+
+def quant_parent_bytes(elements, dtype):
+    return elements // QUANT_BLOCKS[dtype][0] * QUANT_BLOCKS[dtype][1] if dtype in QUANT_BLOCKS else elements * FLOAT_BYTES[dtype]
+
+
+def quant_unit(dtype, base_dtype):
+    """Bytes of a quant region that hold whole blocks of its dtype and of its parent's."""
+    width, size = QUANT_BLOCKS[dtype]
+    return math.lcm(width, quant_width(base_dtype)) // width * size
+
+
+def base_length(region, length=None):
+    """Bytes of its base file that `length` bytes (default: all) of a delta region are coded against."""
+    length = region["length"] if length is None else length
+    if region["kind"] == "quant":
+        width, size = QUANT_BLOCKS[region["dtype"]]
+        return quant_parent_bytes(length // size * width, region["base_dtype"])
+    return length * FLOAT_BYTES[region["base_dtype"]] // FLOAT_BYTES[region["dtype"]] if "base_dtype" in region else length
+
+
+def half_float32(column):
+    """binary16 values stored in two bytes of each block, as binary32 (exact); not finite: 0."""
+    values = np.frombuffer(column.tobytes(), "<f2").astype(np.float32)
+    return np.where(np.isfinite(values), values, np.float32(0))
+
+
+def k_scales(side):
+    """(scale, minimum) of each sub-block of a Q4_K or Q5_K block, as uint8: six bits each, packed in twelve bytes."""
+    s = side[:, 4:16]
+    scale, low = np.empty((len(s), 8), np.uint8), np.empty((len(s), 8), np.uint8)
+    scale[:, :4], low[:, :4] = s[:, :4] & 63, s[:, 4:8] & 63
+    for j in range(4, 8):
+        scale[:, j] = (s[:, j + 4] & 0xF) | ((s[:, j - 4] >> 2) & 0x30)
+        low[:, j] = (s[:, j + 4] >> 4) | ((s[:, j] >> 2) & 0x30)
+    return scale, low
+
+
+def quant_split(data, dtype):
+    """(values, side): a tensor's blocks as its values, uint8 of blocks x elements as stored (Q8_0 as two's complement,
+    Q6_K offset by 32), and what else each block holds (scales), uint8 of blocks x bytes."""
+    width, size = QUANT_BLOCKS[dtype]
+    raw = np.frombuffer(data, np.uint8).reshape(-1, size)
+    q = np.empty((len(raw), width), np.uint8)
+    if dtype == Q8_0:
+        q[:] = raw[:, 2:]
+        return q, raw[:, :2]
+    if dtype == Q6_K:
+        for g in range(2):
+            a, h, at = raw[:, g * 64:g * 64 + 64], raw[:, 128 + g * 32:128 + g * 32 + 32], g * 128
+            q[:, at:at + 32] = (a[:, :32] & 0xF) | ((h & 3) << 4)
+            q[:, at + 32:at + 64] = (a[:, 32:] & 0xF) | (((h >> 2) & 3) << 4)
+            q[:, at + 64:at + 96] = (a[:, :32] >> 4) | (((h >> 4) & 3) << 4)
+            q[:, at + 96:at + 128] = (a[:, 32:] >> 4) | ((h >> 6) << 4)
+        return q, raw[:, 192:]
+    fives = dtype == Q5_K
+    qs = raw[:, 48:] if fives else raw[:, 16:]
+    for p in range(4):
+        low, high = qs[:, p * 32:p * 32 + 32] & 0xF, qs[:, p * 32:p * 32 + 32] >> 4
+        if fives:
+            low = low | (((raw[:, 16:48] >> (2 * p)) & 1) << 4)
+            high = high | (((raw[:, 16:48] >> (2 * p + 1)) & 1) << 4)
+        q[:, p * 64:p * 64 + 32], q[:, p * 64 + 32:p * 64 + 64] = low, high
+    return q, raw[:, :16]
+
+
+def quant_join(q, side, dtype):
+    """Inverse of quant_split, as a bytearray."""
+    width, size = QUANT_BLOCKS[dtype]
+    out = bytearray(len(q) * size)
+    raw = np.frombuffer(out, np.uint8).reshape(-1, size)
+    if dtype == Q8_0:
+        raw[:, :2], raw[:, 2:] = side, q
+    elif dtype == Q6_K:
+        raw[:, 192:] = side
+        for g in range(2):
+            at = g * 128
+            one, two, three, four = q[:, at:at + 32], q[:, at + 32:at + 64], q[:, at + 64:at + 96], q[:, at + 96:at + 128]
+            raw[:, g * 64:g * 64 + 32] = (one & 0xF) | (three << 4)
+            raw[:, g * 64 + 32:g * 64 + 64] = (two & 0xF) | (four << 4)
+            raw[:, 128 + g * 32:128 + g * 32 + 32] = (one >> 4) | ((two >> 4) << 2) | ((three >> 4) << 4) | ((four >> 4) << 6)
+    else:
+        raw[:, :16] = side
+        fives = dtype == Q5_K
+        qs = raw[:, 48:] if fives else raw[:, 16:]
+        high = np.zeros((len(q), 32), np.uint8)
+        for p in range(4):
+            first, second = q[:, p * 64:p * 64 + 32], q[:, p * 64 + 32:p * 64 + 64]
+            qs[:, p * 32:p * 32 + 32] = (first & 0xF) | (second << 4)
+            if fives:
+                high |= ((first >> 4) << (2 * p)) | ((second >> 4) << (2 * p + 1))
+        if fives:
+            raw[:, 16:48] = high
+    return out
+
+
+def quant_steps(side, dtype):
+    """(step, floor) as binary32, each per element: a value v stands for v * step - floor (Q6_K: (v - 32) * step)."""
+    if dtype == Q6_K:
+        d = half_float32(side[:, 16:18])
+        scale = side[:, :16].view(np.int8).astype(np.float32)
+        return np.repeat(np.multiply(scale, d[:, None], dtype=np.float32), 16, axis=1), None
+    d, dmin = half_float32(side[:, 0:2]), half_float32(side[:, 2:4])
+    scale, low = k_scales(side)
+    step = np.multiply(scale.astype(np.float32), d[:, None], dtype=np.float32)
+    floor = np.multiply(low.astype(np.float32), dmin[:, None], dtype=np.float32)
+    return np.repeat(step, 32, axis=1), np.repeat(floor, 32, axis=1)
+
+
+def quant_parent_values(raw, dtype):
+    """A parent's bytes as finite binary32 values (not finite: 0): a float tensor's, or a quantized tensor's rebuilt."""
+    raw = bytes(raw) if not isinstance(raw, (bytes, bytearray)) else raw
+    with np.errstate(all="ignore"):
+        if dtype in FLOAT_BYTES:
+            values = to_float32(np.frombuffer(raw, {"BF16": "<u2", "F16": "<u2", "F32": "<u4"}[dtype]), dtype)
+        else:
+            q, side = quant_split(raw, dtype)
+            if dtype == Q8_0:
+                values = np.multiply(q.view(np.int8).astype(np.float32), half_float32(side)[:, None], dtype=np.float32)
+            elif dtype == Q6_K:
+                values = np.multiply(q.astype(np.float32) - np.float32(32), quant_steps(side, dtype)[0], dtype=np.float32)
+            else:
+                step, floor = quant_steps(side, dtype)
+                values = np.subtract(np.multiply(q.astype(np.float32), step, dtype=np.float32), floor, dtype=np.float32)
+    return np.where(np.isfinite(values), values, np.float32(0))
+
+
+def quant_predict(x, side, dtype):
+    """(values, side as predicted or None): what a tensor's values should be, from the parent's values x (binary32,
+    blocks x elements) and the block's side bytes. Only IEEE 754 binary32 results, one operation at a time."""
+    with np.errstate(all="ignore"):
+        if dtype == Q8_0:
+            d = np.divide(np.abs(x).max(axis=1), np.float32(127), dtype=np.float32)
+            inverse = np.divide(np.float32(1), d, dtype=np.float32)
+            inverse = np.where(np.isfinite(inverse), inverse, np.float32(0))
+            scaled = np.multiply(x, inverse[:, None], dtype=np.float32)
+            half = np.copysign(np.float32(0.5), scaled)
+            values = np.clip(np.trunc(np.add(scaled, half, dtype=np.float32)), -128, 127)
+            return values.astype(np.int16).astype(np.uint8), np.frombuffer(d.astype(np.float16).tobytes(), np.uint8).reshape(-1, 2)
+        step, floor = quant_steps(side, dtype)
+        above = x if floor is None else np.add(x, floor, dtype=np.float32)
+        steps = np.rint(np.divide(above, step, dtype=np.float32))
+        if dtype == Q6_K:
+            values = np.clip(np.where(step != 0, steps, np.float32(0)), -32, 31) + np.float32(32)
+        else:
+            values = np.clip(np.where(step != 0, steps, np.float32(0)), 0, 15 if dtype == Q4_K else 31)
+        return values.astype(np.uint8), None
+
+
+def ieee_problem():
+    """Whether this thread's binary32 arithmetic is not what the fast path needs (say a library loaded here set
+    flush-to-zero): known results, subnormals and ties among them."""
+    tiny = np.array([2.0 ** -140], np.float32)
+    one, three = np.array([1.0], np.float32), np.array([3.0], np.float32)
+    ties = np.rint(np.array([0.5, 1.5, 2.5, -0.5], np.float32))
+    return not (np.multiply(tiny, np.float32(0.5), dtype=np.float32).item() == 2.0 ** -141
+                and np.add(tiny, tiny, dtype=np.float32).item() == 2.0 ** -139
+                and np.divide(one, three, dtype=np.float32).view(np.uint32).item() == 0x3EAAAAAB
+                and ties.tolist() == [0.0, 2.0, 2.0, 0.0])
+
+
+def binary_round(value, bits, lowest):
+    """A Fraction rounded to `bits` bits of precision, ties to even, nothing below 2^lowest: the rule of IEEE 754."""
+    if value == 0:
+        return Fraction(0)
+    sign = -1 if value < 0 else 1
+    value = abs(value)
+    exponent = value.numerator.bit_length() - value.denominator.bit_length()
+    if Fraction(2) ** exponent > value:
+        exponent -= 1
+    unit = Fraction(2) ** max(exponent - bits + 1, lowest)
+    quotient, rest = divmod(value, unit)
+    if 2 * rest > unit or (2 * rest == unit and quotient % 2):
+        quotient += 1
+    return sign * quotient * unit
+
+
+def b32(value):
+    return binary_round(value, 24, -149)
+
+
+def half_exact(lo, hi):
+    """The Fraction of a binary16 value (not finite: 0)."""
+    bits = lo | hi << 8
+    e, m = (bits >> 10) & 0x1F, bits & 0x3FF
+    if e == 31:
+        return Fraction(0)
+    value = Fraction(m, 1 << 24) if e == 0 else Fraction(1024 + m) * Fraction(2) ** (e - 25)
+    return -value if bits & 0x8000 else value
+
+
+def half_bytes(value):
+    """The two bytes of the binary16 nearest to a Fraction, or of infinity if it overflows."""
+    rounded = abs(binary_round(value, 11, -24))
+    sign = 0x8000 if value < 0 else 0
+    if rounded >= 65536:
+        bits = 0x7C00
+    elif rounded < Fraction(1, 1 << 14):
+        bits = int(rounded * (1 << 24))
+    else:
+        e = rounded.numerator.bit_length() - rounded.denominator.bit_length()
+        if Fraction(2) ** e > rounded:
+            e -= 1
+        bits = (e + 15) << 10 | (int(rounded / Fraction(2) ** (e - 10)) - 1024)
+    bits |= sign
+    return bits & 0xFF, bits >> 8
+
+
+def exact_steps(side_row, dtype):
+    """(step, floor) of each element of a block as Fractions, each a binary32 result."""
+    row = [int(b) for b in side_row]
+    if dtype == Q6_K:
+        d = half_exact(row[16], row[17])
+        scales = [b - 256 if b >= 128 else b for b in row[:16]]
+        return [b32(scales[i // 16] * d) for i in range(256)], [Fraction(0)] * 256
+    d, dmin = half_exact(row[0], row[1]), half_exact(row[2], row[3])
+    s = row[4:16]
+    scale, low = [s[j] & 63 for j in range(4)], [s[j + 4] & 63 for j in range(4)]
+    for j in range(4, 8):
+        scale.append((s[j + 4] & 0xF) | ((s[j - 4] >> 2) & 0x30))
+        low.append((s[j + 4] >> 4) | ((s[j] >> 2) & 0x30))
+    return [b32(scale[i // 32] * d) for i in range(256)], [b32(low[i // 32] * dmin) for i in range(256)]
+
+
+def exact_parent_values(raw, dtype):
+    """quant_parent_values as Fractions, flat, without floating point arithmetic."""
+    if dtype in FLOAT_BYTES:
+        values = to_float32(np.frombuffer(bytes(raw), {"BF16": "<u2", "F16": "<u2", "F32": "<u4"}[dtype]), dtype)  # exact
+        return [Fraction(v) if math.isfinite(v) else Fraction(0) for v in map(float, values)]
+    q, side = quant_split(bytes(raw), dtype)
+    out = []
+    for block, row in zip(q, side):
+        if dtype == Q8_0:
+            d = half_exact(int(row[0]), int(row[1]))
+            out += [b32((int(v) - 256 if v >= 128 else int(v)) * d) for v in block]
+        else:
+            step, floor = exact_steps(row, dtype)
+            if dtype == Q6_K:
+                out += [b32((int(v) - 32) * s) for v, s in zip(block, step)]
+            else:
+                out += [b32(b32(int(v) * s) - f) for v, s, f in zip(block, step, floor)]
+    return out
+
+
+def rint_exact(value):
+    down = value.numerator // value.denominator
+    rest = value - down
+    return down + 1 if rest > Fraction(1, 2) or (rest == Fraction(1, 2) and down % 2) else down
+
+
+def quant_predict_exact(parent_values, side, dtype):
+    """quant_predict in fractions and integers only, from exact_parent_values: slow, and the same by the standard."""
+    width = QUANT_BLOCKS[dtype][0]
+    values = np.empty((len(side), width), np.uint8)
+    predicted = np.empty((len(side), 2), np.uint8) if dtype == Q8_0 else None
+    biggest = Fraction(2) ** 128
+    for b, row in enumerate(side):
+        x = parent_values[b * width:(b + 1) * width]
+        if dtype == Q8_0:
+            d = b32(max(map(abs, x)) / 127)
+            predicted[b] = half_bytes(d)
+            inverse = b32(1 / d) if d else Fraction(0)
+            inverse = inverse if inverse < biggest else Fraction(0)
+            for i, v in enumerate(x):
+                scaled = b32(v * inverse)
+                total = b32(scaled + (Fraction(1, 2) if scaled >= 0 else Fraction(-1, 2)))
+                values[b, i] = max(-128, min(127, int(total))) & 0xFF  # int() truncates, as trunc
+            continue
+        step, floor = exact_steps(row, dtype)
+        top, shift = (31, 32) if dtype == Q6_K else (15, 0) if dtype == Q4_K else (31, 0)
+        bottom = -32 if dtype == Q6_K else 0
+        for i, v in enumerate(x):
+            n = rint_exact(b32(b32(v + floor[i]) / step[i])) if step[i] else 0
+            values[b, i] = max(bottom, min(top, n)) + shift
+    return values, predicted
+
+
+def read_streams(payload, sizes):
+    """The streams of a payload (as planes_decode reads them) that must decode to these sizes; ValueError if it does
+    not fit them exactly."""
+    (count,) = PLANES_HEAD.unpack_from(payload, 0)
+    if count != len(sizes):
+        raise ValueError(f"quant: {count} streams, expected {len(sizes)}")
+    heads = [PLANE_HEAD.unpack_from(payload, PLANES_HEAD.size + i * PLANE_HEAD.size) for i in range(count)]
+    pos = PLANES_HEAD.size + count * PLANE_HEAD.size
+    if pos + sum(length for _, length in heads) != len(payload):
+        raise ValueError("quant: stream lengths do not add up to the payload")
+    out, view = [], memoryview(payload)
+    for (coding, length), expect in zip(heads, sizes):
+        body, pos = view[pos:pos + length], pos + length
+        if coding == PLANE_STORED:
+            raw = body
+        elif coding == PLANE_DEFLATE:
+            d = zlib.decompressobj(-15)
+            raw = d.decompress(body, expect)
+            if not d.eof or d.unconsumed_tail or d.unused_data:
+                raise ValueError("quant: DEFLATE stream does not end where it should")
+        elif coding == PLANE_ZSTD:
+            raw = zstd_exact(body, expect)
+        else:
+            raise ValueError(f"quant: unknown coding {coding}")
+        if len(raw) != expect:
+            raise ValueError("quant: a stream decodes to the wrong length")
+        out.append(np.frombuffer(raw, np.uint8))
+    return out
+
+
+def quant_encode(data, parent, dtype, base_dtype):
+    """The payload of a quantized tensor's bytes against its parent's bytes: two streams, its side bytes (Q8_0: XOR
+    the prediction of them) and its values minus the prediction, mod 256."""
+    q, side = quant_split(data, dtype)
+    x = quant_parent_values(parent, base_dtype).reshape(q.shape)
+    predicted, guessed = quant_predict(x, side, dtype)
+    kept = side if guessed is None else side ^ guessed
+    streams = [code_plane(np.ascontiguousarray(kept).reshape(-1)), code_plane((q - predicted).reshape(-1))]
+    return PLANES_HEAD.pack(len(streams)) + b"".join(PLANE_HEAD.pack(c, len(s)) for c, s in streams) + b"".join(s for _, s in streams)
+
+
+def quant_decode(payload, raw_len, parent, dtype, base_dtype, exact=False):
+    """Inverse of quant_encode. exact: by quant_predict_exact, without floating point arithmetic."""
+    width, size = QUANT_BLOCKS[dtype]
+    if raw_len % size:
+        raise ValueError("quant: a region of part of a block")
+    blocks = raw_len // size
+    side_bytes = size - {Q8_0: 32, Q4_K: 128, Q5_K: 160, Q6_K: 192}[dtype]
+    kept, moved = read_streams(payload, [blocks * side_bytes, blocks * width])
+    kept = kept.reshape(blocks, side_bytes)
+    if exact:
+        predicted, guessed = quant_predict_exact(exact_parent_values(parent, base_dtype), kept, dtype)
+    else:
+        predicted, guessed = quant_predict(quant_parent_values(parent, base_dtype).reshape(blocks, width), kept, dtype)
+    return quant_join(moved.reshape(blocks, width) + predicted, kept if guessed is None else kept ^ guessed, dtype)
+
+
+# ----------------------------------------------------------------------------------------------- rank1 (codec 5)
+#
+# Some fine-tunes change a matrix by one direction: abliteration subtracts a projection, W' = W - r r^T W, so the change
+# is the product of a column and a row. Such a region is coded as those two vectors and an ans16 stream of what they leave
+# unexplained, the residuals taken against base + u v^T while the contexts stay the base's exponents: so the stream
+# decodes whatever the prediction comes to, and a prediction that differs shows as a CRC that fails, never as a stream
+# that cannot be read. Each step of the prediction is a binary32 result under IEEE 754, as for quant.
+
+RANK1_HEAD = struct.Struct("<II")  # rows, columns of the region
+RANK1_MIN_SIZE = 16  # rows and columns a region must have
+RANK1_SAMPLE_ROWS = 256  # rows looked at first, to tell at little cost whether one direction explains the change
+RANK1_MIN_SHARE = 0.5  # share of the change's energy the direction must hold for the region to be tried
+RANK1_ROUNDS = 8  # of power iteration
+REBUILD_RANK1 = True  # off for one command with --no-rank1
+
+
+def clean_float32(bits, dtype):
+    """16-bit weights as finite binary32 values (exact; not finite: 0)."""
+    values = to_float32(bits, dtype)
+    return np.where(np.isfinite(values), values, np.float32(0))
+
+
+def rank1_factors(base, target, dtype, cols):
+    """(u, v), binary32, whose product holds most of the change from base to target as a rows x cols matrix; None if no
+    such pair is worth trying. Nothing here needs to come out the same elsewhere: the factors are stored."""
+    n = base.size
+    if not cols or n % cols or cols < RANK1_MIN_SIZE or n // cols < RANK1_MIN_SIZE or np.array_equal(base, target):
+        return None
+    rows = n // cols
+    with np.errstate(all="ignore"):
+        change = (clean_float32(target, dtype).astype(np.float64) - clean_float32(base, dtype)).reshape(rows, cols)
+        picked = np.linspace(0, rows - 1, min(rows, RANK1_SAMPLE_ROWS)).astype(np.int64)
+        sample = change[picked]
+        power = float((sample * sample).sum())
+        if not power or not np.isfinite(power):
+            return None
+        v = sample[int((sample * sample).sum(axis=1).argmax())].copy()
+        for _ in range(RANK1_ROUNDS):
+            v = sample.T @ (sample @ v)
+            size = np.sqrt(v @ v)
+            if not size or not np.isfinite(size):
+                return None
+            v /= size
+        along = sample @ v
+        if float(along @ along) < RANK1_MIN_SHARE * power:
+            return None
+        for _ in range(RANK1_ROUNDS):
+            v = change.T @ (change @ v)
+            size = np.sqrt(v @ v)
+            if not size or not np.isfinite(size):
+                return None
+            v /= size
+        u = (change @ v).astype(np.float32)
+        v = v.astype(np.float32)
+    return (u, v) if np.isfinite(u).all() and np.isfinite(v).all() else None
+
+
+def rank1_predict(base, u, v, dtype):
+    """base + u v^T in 16-bit bit patterns, binary32 steps: each product, each sum, then the conversion to dtype."""
+    with np.errstate(all="ignore"):
+        moved = np.add(clean_float32(base, dtype), np.multiply.outer(u, v).reshape(-1), dtype=np.float32)
+    return convert_bits(moved.view(np.uint32), "F32", dtype)
+
+
+def rank1_predict_exact(base, u, v, dtype):
+    """rank1_predict in fractions and integers only: slow, and the same by the standard."""
+    values = clean_float32(base, dtype)
+    us, vs = [Fraction(float(x)) for x in u], [Fraction(float(x)) for x in v]
+    out = np.empty(base.size, np.uint16)
+    cols = len(vs)
+    bf16 = dtype == "BF16"
+    for i, x in enumerate(map(float, values)):
+        total = b32(Fraction(x) + b32(us[i // cols] * vs[i % cols]))
+        if bf16:  # the integer rule of convert_bits, on the bits of this binary32 value (float32 of it is exact)
+            out[i] = convert_bits(np.array([float(total)], np.float32).view(np.uint32), "F32", "BF16")[0]
+        else:
+            lo, hi = half_bytes(total)
+            out[i] = lo | hi << 8
+    return out
+
+
+def rank1_encode(base, target, dtype, cols, plain):
+    """The rank1 payload of a region if it is smaller than `plain` (its ans16 payload), else None."""
+    factors = rank1_factors(base, target, dtype, cols)
+    if factors is None:
+        return None
+    u, v = factors
+    head = RANK1_HEAD.pack(u.size, v.size) + u.astype("<f4").tobytes() + v.astype("<f4").tobytes()
+    room = len(plain) - len(head)
+    if room <= 0:
+        return None
+    coded = ans16_encode(base, target, dtype, predicted=rank1_predict(base, u, v, dtype))
+    return head + coded if len(coded) < room else None
+
+
+def rank1_parts(payload, n):
+    """(u, v, the ans16 payload) of a rank1 payload for a region of n weights; ValueError if it does not fit."""
+    if len(payload) < RANK1_HEAD.size:
+        raise ValueError("rank1 payload too short")
+    rows, cols = RANK1_HEAD.unpack_from(payload, 0)
+    if not rows or not cols or rows * cols != n or RANK1_HEAD.size + 4 * (rows + cols) > len(payload):
+        raise ValueError("rank1 factors do not fit the region")
+    u = np.frombuffer(payload, "<f4", rows, RANK1_HEAD.size)
+    v = np.frombuffer(payload, "<f4", cols, RANK1_HEAD.size + 4 * rows)
+    return u, v, memoryview(payload)[RANK1_HEAD.size + 4 * (rows + cols):]
+
+
+def rank1_decode(base, payload, dtype, stop=None, exact=False):
+    """Inverse of rank1_encode. exact: by rank1_predict_exact, without floating point arithmetic."""
+    u, v, coded = rank1_parts(payload, base.size)
+    coded = bytes(coded)
+    if exact:
+        moved = ans16_decode(base, coded, dtype, stop, predicted=np.zeros(base.size, np.uint16))
+        return (rank1_predict_exact(base, u, v, dtype)[: moved.size] + moved).astype(np.uint16)
+    return ans16_decode(base, coded, dtype, stop, predicted=rank1_predict(base, u, v, dtype))
+
+
+def rank1_region(payload, base, region, crc, where):
+    """(the bytes of a rank1 region whose fast decoding failed its CRC, whether they are still not what the CRC says):
+    the fast way again, as a core may err only sometimes; then without floating point arithmetic; then InexactRegion,
+    unless that was accepted."""
+    dtype = region["dtype"]
+    if not ieee_problem():
+        chunk = rank1_decode(base, payload, dtype).tobytes()
+        if zlib.crc32(chunk) == crc:
+            return chunk, False
+    say(f"    slow: exact rebuild of {where}, region at {region['offset']}", event="exact", offset=region["offset"])
+    chunk = rank1_decode(base, payload, dtype, exact=True).tobytes()
+    if zlib.crc32(chunk) == crc:
+        return chunk, False
+    if not _INEXACT["accept"]:
+        raise InexactRegion(where, region["offset"])
+    _INEXACT["regions"].append((region["offset"], region["length"]))
+    return chunk, True
+
+
+class InexactRegion(ValueError):
+    """A quant or rank1 region's bytes are intact but do not restore its CRC, however it is worked out."""
+
+    def __init__(self, where, offset):
+        super().__init__(f"{where}: region at {offset}: {PREDICTION_DISAGREES}")
+
+
+PREDICTION_DISAGREES = ("its stored bytes are intact but what they are coded against does not rebuild them here "
+                        "(the machine, or a base that is not the same): try another machine")
+_INEXACT = {"accept": False, "regions": [], "note": None}  # restore --accept-inexact
+
+
+def quant_region(payload, raw_len, region, parent, crc, where):
+    """(the bytes of a quant region, whether they are not what its CRC says): the fast way, again, as a core may err
+    only sometimes; then without floating point arithmetic; then InexactRegion, unless that was accepted."""
+    dtype, base_dtype = region["dtype"], region["base_dtype"]
+    if not ieee_problem():
+        for _ in range(2):
+            chunk = quant_decode(payload, raw_len, parent, dtype, base_dtype)
+            if zlib.crc32(chunk) == crc:
+                return chunk, False
+    say(f"    slow: exact rebuild of {where}, region at {region['offset']}", event="exact", offset=region["offset"])
+    chunk = quant_decode(payload, raw_len, parent, dtype, base_dtype, exact=True)
+    if zlib.crc32(chunk) == crc:
+        return chunk, False
+    if not _INEXACT["accept"]:
+        raise InexactRegion(where, region["offset"])
+    _INEXACT["regions"].append((region["offset"], region["length"]))
+    return chunk, True
 
 
 def region_zstd_level(region, text_level, tensor_level):
@@ -1114,9 +1766,9 @@ def region_zstd_level(region, text_level, tensor_level):
 
 
 def region_planes_dtype(region):
-    """The dtype whose byte planes a region's codec-1 frame uses: BF16 for bytes of unknown type, the tensor's own
-    for a float tensor (None: the region never uses byte planes)."""
-    return "BF16" if region["kind"] == "auto" else region.get("dtype") if region.get("dtype") in FLOAT_DTYPES else None
+    """The dtype whose byte planes a region's codec-1 frame uses: F16 for bytes of unknown type (plain byte columns,
+    which assume the least), the tensor's own for a float tensor (None: the region never uses byte planes)."""
+    return "F16" if region["kind"] == "auto" else region.get("dtype") if region.get("dtype") in FLOAT_DTYPES else None
 
 
 def ans16_workers():
@@ -1155,24 +1807,29 @@ def hash_workers():
 
 
 def _ans16_encode_job(job):
-    base_path, base_offset, base_dtype, target_path, offset, length, dtype = job
+    """(codec, payload) of an ans16 region; cols: its row width if one direction may explain its change (rank1)."""
+    base_path, base_offset, base_dtype, target_path, offset, length, dtype, cols = job
     base = base_prediction(base_path, base_offset, length // 2, base_dtype, dtype)
     target = np.fromfile(target_path, "<u2", length // 2, offset=offset)
-    return ans16_encode(base, target, dtype)
+    plain = ans16_encode(base, target, dtype)
+    rank1 = rank1_encode(base, target, dtype, cols, plain) if cols else None
+    return (CODEC_RANK1, rank1) if rank1 else (CODEC_ANS16, plain)
 
 
 def _ans16_decode_job(job):
-    container_path, payload_offset, payload_len, base_path, base_offset, base_dtype, length, dtype = job
+    container_path, payload_offset, payload_len, base_path, base_offset, base_dtype, length, dtype, codec = job
     with open(container_path, "rb") as f:
         f.seek(payload_offset)
         payload = f.read(payload_len)
     base = base_prediction(base_path, base_offset, length // 2, base_dtype, dtype)
+    if codec == CODEC_RANK1:
+        return rank1_decode(base, payload, dtype).tobytes()
     return ans16_decode(base, payload, dtype).tobytes()
 
 
 # ----------------------------------------------------------------------------------------------- blobs
 #
-# Every file a pack stores is a blob: one OCZ4 container, named by the SHA-256 of the original file and shared by
+# Every file a pack stores is a blob: one OCZ5 container, named by the SHA-256 of the original file and shared by
 # every model that has that file. Its header says how to restore it, including the blobs it is coded against (its
 # bases, by SHA-256); its last 32 bytes are the SHA-256 of all its bytes before them, so a blob shows its own damage
 # before any decoder reads it. Byte-level spec: ARCHIVE_FORMAT.md.
@@ -1181,7 +1838,7 @@ def _ans16_decode_job(job):
 MAX_HEADER = 64 << 20  # bytes of container header JSON
 MAX_REGION = 1 << 30  # bytes one region restores to (--chunk-mib is at most 1024)
 MAX_REGIONS = 1 << 22
-REGION_KINDS = {"float", "zstd", "auto", "ans16", "xor"}
+REGION_KINDS = {"float", "zstd", "auto", "ans16", "xor", "quant"}
 TRAILER = 32  # the SHA-256 that ends a blob
 
 
@@ -1210,18 +1867,22 @@ def container_header_problem(header):
                 or not isinstance(r.get("kind"), str) or r["kind"] not in REGION_KINDS or not isinstance(r.get("dtype", ""), str):
             return f"region at {pos} malformed, out of order or too long"
         base = r.get("base")
-        if (base is not None) != (r["kind"] in ("ans16", "xor")):
+        if (base is not None) != (r["kind"] in ("ans16", "xor", "quant")):
             return f"region at {pos}: a delta region needs a base reference, and only a delta region has one"
         if base is not None:
             if not (isinstance(base, list) and len(base) == 2 and type(base[0]) is int and 0 <= base[0] < len(bases) and is_size(base[1])):
                 return f"region at {pos}: bad base reference"
-            if not isinstance(r.get("base_dtype", "BF16"), str) or r.get("base_dtype", "BF16") not in FLOAT_BYTES \
+            if r["kind"] == "quant":
+                dtype, parent = r.get("dtype"), r.get("base_dtype")
+                if dtype not in QUANT_BLOCKS or not isinstance(parent, str) or parent not in QUANT_PARENTS \
+                        or r["length"] % quant_unit(dtype, parent):
+                    return f"region at {pos}: bad quant region"
+            elif not isinstance(r.get("base_dtype", "BF16"), str) or r.get("base_dtype", "BF16") not in FLOAT_BYTES \
                     or ("base_dtype" in r and r.get("dtype") not in ANS16_EXPONENT):
                 return f"region at {pos}: bad base_dtype"
             if r["kind"] == "ans16" and (r.get("dtype") not in ANS16_EXPONENT or r["length"] % 2):
                 return f"region at {pos}: bad ans16 region"
-            scale = FLOAT_BYTES[r["base_dtype"]] // FLOAT_BYTES[r["dtype"]] if "base_dtype" in r else 1
-            if base[1] + r["length"] * scale > bases[base[0]]["size"]:
+            if base[1] + base_length(r) > bases[base[0]]["size"]:
                 return f"region at {pos}: its base bytes run past the end of the base file"
         pos += r["length"]
     return None if pos == header["original_size"] else "regions do not add up to original_size"
@@ -1256,7 +1917,8 @@ def read_container(f, start=0, size=None):
         pos += FRAME_HEAD.size
         kind = codec & ~STANDALONE
         fits = (kind in (CODEC_RAW, CODEC_ZSTD) or (kind == CODEC_PLANES and region_planes_dtype(region))
-                or (codec == CODEC_ANS16 and region["kind"] == "ans16")) and not (codec & STANDALONE and "base" not in region)
+                or (codec in (CODEC_ANS16, CODEC_RANK1) and region["kind"] == "ans16")
+                or (codec == CODEC_QUANT and region["kind"] == "quant")) and not (codec & STANDALONE and "base" not in region)
         if raw_len != region["length"] or not fits or payload_len > end - pos:
             raise ValueError(f"container frame at {region['offset']} does not fit its region")
         frames.append((codec, raw_len, pos, payload_len, crc))
@@ -1301,7 +1963,7 @@ def blob_damage(span, sha, counted=False):
 # A pack is a folder (FolderPack) or the same tree in one ZIP file (FilePack, read where it lies; NewFilePack while
 # pack writes a new one):
 #
-#     ocpack.json                   {"format": "overcompressing-pack", "format_version": 4}: what makes it a pack
+#     ocpack.json                   {"format": "overcompressing-pack", "format_version": 5}: what makes it a pack
 #     models/<Org__Name>.json       one manifest per model: the paths, sizes and SHA-256s of its files
 #     blobs/<ab>/<sha256>.ocz       one blob per distinct file, shared by every model that has that file
 #     _kit/                         a portable copy of the tool, if one was put there (never read; export carries it)
@@ -1705,8 +2367,8 @@ def iter_blob_bytes(p, sha, span=None, depth=0):
         regions = header["regions"]
         base_paths, owned = base_paths_for(p, header["bases"], depth)
         jobs = [
-            (path, start + off, plen, base_paths[r["base"][0]], r["base"][1], r.get("base_dtype"), r["length"], r["dtype"])
-            for r, (codec, _, off, plen, _) in ((r, fr) for r, fr in zip(regions, frames) if fr) if codec == CODEC_ANS16
+            (path, start + off, plen, base_paths[r["base"][0]], r["base"][1], r.get("base_dtype"), r["length"], r["dtype"], codec)
+            for r, (codec, _, off, plen, _) in ((r, fr) for r, fr in zip(regions, frames) if fr) if codec in (CODEC_ANS16, CODEC_RANK1)
         ]
         pool = worker_pool(ans16_workers()) if jobs else None
         bases = [open(b, "rb") for b in base_paths]
@@ -1715,14 +2377,17 @@ def iter_blob_bytes(p, sha, span=None, depth=0):
             decoded = pool.map(_ans16_decode_job, jobs) if pool else iter(())
 
             def to_decode():  # read here, in order; decoded on the threads
-                for region, (codec, raw_len, off, plen, _) in ((r, fr) for r, fr in zip(regions, frames) if fr):
-                    if codec != CODEC_ANS16:
+                for region, (codec, raw_len, off, plen, crc) in ((r, fr) for r, fr in zip(regions, frames) if fr):
+                    if codec not in (CODEC_ANS16, CODEC_RANK1):
                         f.seek(start + off)
                         payload = f.read(plen)
                         base = base_bytes(base_paths, bases, region) if "base" in region and not codec & STANDALONE else None
-                        yield codec, payload, raw_len, region, base
+                        yield codec, payload, raw_len, region, base, crc
 
-            def decode(codec, payload, raw_len, region, base):  # with its CRC, on the thread too
+            def decode(codec, payload, raw_len, region, base, crc):  # with its CRC, on the thread too
+                if codec == CODEC_QUANT:
+                    chunk, inexact = quant_region(payload, raw_len, region, base, crc, path)
+                    return chunk, crc if inexact else zlib.crc32(chunk)
                 chunk = decode_payload(codec & ~STANDALONE, payload, raw_len, region_planes_dtype(region))
                 chunk = chunk if base is None else xor_bytes(chunk, base)
                 return chunk, zlib.crc32(chunk)
@@ -1734,9 +2399,14 @@ def iter_blob_bytes(p, sha, span=None, depth=0):
                         yield bytes(min(16 << 20, region["length"] - at))
                     continue
                 codec, raw_len, off, plen, crc = frame
-                if codec == CODEC_ANS16:
+                if codec in (CODEC_ANS16, CODEC_RANK1):
                     chunk = next(decoded)
                     check = zlib.crc32(chunk)
+                    if codec == CODEC_RANK1 and check != crc:
+                        f.seek(start + off)
+                        base = base_prediction(base_paths[region["base"][0]], region["base"][1], raw_len // 2, region.get("base_dtype"), region["dtype"])
+                        chunk, inexact = rank1_region(f.read(plen), base, region, crc, path)
+                        check = crc if inexact else zlib.crc32(chunk)
                 else:
                     chunk, check = next(plain)
                 if len(chunk) != raw_len or check != crc:
@@ -1903,8 +2573,7 @@ def read_range(p, sha, start, length, depth=0):
 def region_base(p, header, region, depth):
     """The base bytes (before any dtype conversion) a delta region was coded against."""
     index, offset = region["base"]
-    scale = FLOAT_BYTES[region["base_dtype"]] // FLOAT_BYTES[region["dtype"]] if "base_dtype" in region else 1
-    return read_range(p, header["bases"][index]["sha256"], offset, region["length"] * scale, depth + 1)
+    return read_range(p, header["bases"][index]["sha256"], offset, base_length(region), depth + 1)
 
 
 def region_bytes(p, span, i, a, b, depth):
@@ -1920,11 +2589,20 @@ def region_bytes(p, span, i, a, b, depth):
     with open(span[0], "rb") as f:
         f.seek(span[1] + off)
         payload = f.read(plen)
-    if codec == CODEC_ANS16:
+    if codec in (CODEC_ANS16, CODEC_RANK1):
         base = prediction_from_bytes(region_base(p, header, region, depth), region.get("base_dtype"), region["dtype"])
         stop = -(-b // 2)
-        chunk = ans16_decode(base, payload, region["dtype"], stop if stop < raw_len // 2 else None).tobytes()
+        decode = rank1_decode if codec == CODEC_RANK1 else ans16_decode
+        chunk = decode(base, payload, region["dtype"], stop if stop < raw_len // 2 else None).tobytes()
         if len(chunk) < raw_len:  # a prefix only: nothing to check it against, so it is not cached either
+            return chunk[a:b]
+        if codec == CODEC_RANK1 and zlib.crc32(chunk) != crc:
+            chunk, inexact = rank1_region(payload, base, region, crc, span[0])
+            if inexact:
+                return chunk[a:b]
+    elif codec == CODEC_QUANT:
+        chunk, inexact = quant_region(payload, raw_len, region, region_base(p, header, region, depth), crc, span[0])
+        if inexact:
             return chunk[a:b]
     else:
         chunk = decode_payload(codec & ~STANDALONE, payload, raw_len, region_planes_dtype(region))
@@ -1972,7 +2650,8 @@ def method_of(fmt, regions):
     +ans16 or +xor for a delta."""
     if not any("base" in r for r in regions):
         return fmt
-    return f"{fmt}+{'ans16' if any(r['kind'] == 'ans16' for r in regions) else 'xor'}"
+    kinds = {r["kind"] for r in regions}
+    return f"{fmt}+{'ans16' if 'ans16' in kinds else 'quant' if 'quant' in kinds else 'xor'}"
 
 
 def write_container(src_path, out, header, base_paths=(), levels=(19, 9), workers=1):
@@ -1986,7 +2665,7 @@ def write_container(src_path, out, header, base_paths=(), levels=(19, 9), worker
     hb = json.dumps(header).encode()
     codecs_used, based = {}, 0
     jobs = [
-        (base_paths[r["base"][0]], r["base"][1], r.get("base_dtype"), src_path, r["offset"], r["length"], r["dtype"])
+        (base_paths[r["base"][0]], r["base"][1], r.get("base_dtype"), src_path, r["offset"], r["length"], r["dtype"], r.get("cols") if REBUILD_RANK1 else None)
         for r in regions if r["kind"] == "ans16"
     ]
     pool = worker_pool(workers) if jobs else None
@@ -1997,6 +2676,18 @@ def write_container(src_path, out, header, base_paths=(), levels=(19, 9), worker
         dtype, level = region_planes_dtype(region), region_zstd_level(region, *levels)
         if base is None:
             return len(data), zlib.crc32(data), [encode_chunk(data, dtype, level, try_both=region["kind"] == "auto")]
+        if region["kind"] == "quant":
+            options = []
+            try:
+                payload = quant_encode(data, base, region["dtype"], region["base_dtype"])
+                if len(payload) < len(data) and bytes(quant_decode(payload, len(data), base, region["dtype"], region["base_dtype"])) == data:
+                    options.append((CODEC_QUANT, payload))
+            except Exception as e:  # a codec bug must never cost data
+                say(f"    quant failed self-check ({type(e).__name__}); falling back")
+            if not options or len(options[0][1]) > len(data) * ANS16_ALONE_CHECK:
+                codec, payload = encode_chunk(data, dtype, level)
+                options.append((codec | STANDALONE, payload))
+            return len(data), zlib.crc32(data), options
         codec, payload = encode_chunk(data, dtype, level)
         return len(data), zlib.crc32(data), [encode_chunk(xor_bytes(data, base), dtype, level), (codec | STANDALONE, payload)]
 
@@ -2020,11 +2711,11 @@ def write_container(src_path, out, header, base_paths=(), levels=(19, 9), worker
                 else:
                     src.seek(region["offset"])
                     data = src.read(region["length"])
-                    length, crc, payload = len(data), zlib.crc32(data), next(encoded)
+                    (frame_codec, payload), length, crc = next(encoded), len(data), zlib.crc32(data)
                     if len(payload) >= len(data):  # no gain from ans16: XOR against the base, or standalone
                         options = code(region, data, base_bytes(base_paths, bases, region))[2]
                     else:
-                        options = [(CODEC_ANS16, payload)]
+                        options = [(frame_codec, payload)]
                         if len(payload) > len(data) * ANS16_ALONE_CHECK:  # weakly related base
                             codec, alone = encode_chunk(data, region_planes_dtype(region), region_zstd_level(region, *levels))
                             options.append((codec | STANDALONE, alone))
@@ -2202,11 +2893,12 @@ def choose_base(p, fmt, tensors, read, manifests, blocked, delta_codec):
         return None, [], None, 0
     candidates = []
     for name, manifest in sorted(manifests.items()):
-        files = [e for e in manifest["files"] if e.get("format") == fmt and e.get("tensors") and e["sha256"] not in blocked]
+        files = [e for e in manifest["files"] if e.get("tensors") and e["sha256"] not in blocked]
         if files:
-            match = match_against_base(tensors, files, delta_codec)
-            if any(match(t) for t in tensors):
-                candidates.append((name, files, match))
+            by_name = match_against_base(tensors, files, delta_codec)
+            content = ContentMatch(p, read, files, fmt)
+            if any(by_name(t) for t in tensors) or content.plausible(tensors):
+                candidates.append((name, files, match_against_base(tensors, files, delta_codec, content)))
     windows = sample_windows(tensors) if candidates else []
     if not windows:
         return None, [], None, len(candidates)
@@ -2223,6 +2915,16 @@ def choose_base(p, fmt, tensors, read, manifests, blocked, delta_codec):
         if covered <= 0:
             return alone[k] * w
         index, base_start, kind, base_dtype, _ = m
+        if kind == "quant":
+            unit = quant_unit(t[1], base_dtype)
+            skip = -rel % unit
+            usable = (covered - skip) // unit * unit
+            if usable <= 0:
+                return alone[k] * w
+            region = {"kind": kind, "dtype": t[1], "base_dtype": base_dtype}
+            parent = read_range(p, files[index]["sha256"], base_start + base_length(region, rel + skip), base_length(region, usable))
+            coded = min(len(quant_encode(data[k][skip:skip + usable], parent, t[1], base_dtype)), alone[k] * usable)
+            return (coded + alone[k] * (length - usable)) / length * w
         scale = FLOAT_BYTES[base_dtype] // FLOAT_BYTES[t[1]] if base_dtype else 1
         base_raw = read_range(p, files[index]["sha256"], base_start + rel * scale, covered * scale)
         coded = min(delta_estimate(data[k][:covered], base_raw, t[1], kind, base_dtype), alone[k] * covered)
@@ -2350,8 +3052,7 @@ def base_reads(header, frames):
         if frame is None or "base" not in r or frame[0] & STANDALONE:
             continue
         i, offset = r["base"]
-        scale = FLOAT_BYTES[r["base_dtype"]] // FLOAT_BYTES[r["dtype"]] if "base_dtype" in r else 1
-        reads.append((i, offset, offset + r["length"] * scale))
+        reads.append((i, offset, offset + base_length(r)))
     return reads
 
 
@@ -2460,11 +3161,13 @@ def sweep(p):
     return count, freed + saved
 
 
-def delta_layout(tensors, fmt, size, chunk_size, base_files, delta_codec):
+def delta_layout(p, read, tensors, fmt, size, chunk_size, base_files, delta_codec):
     """(regions of a parsed file whose "base" references number the base files they use, those base files) for a
-    delta against base_files, or (None, []) if none of its tensors is found there."""
-    candidates = [b for b in base_files if b.get("format") == fmt and b.get("tensors")] if tensors is not None else []
-    regions = tensor_regions(tensors, size, chunk_size, match_against_base(tensors, candidates, delta_codec)) if candidates else None
+    delta against base_files, or (None, []) if none of its tensors is found there. read(start, length): the file's
+    bytes, for finding its tensors in a base file of another format."""
+    candidates = [b for b in base_files if b.get("tensors")] if tensors is not None else []
+    match = match_against_base(tensors, candidates, delta_codec, ContentMatch(p, read, candidates, fmt)) if candidates else None
+    regions = tensor_regions(tensors, size, chunk_size, match) if candidates else None
     used = sorted({r["base"][0] for r in regions or [] if "base" in r})
     if not used:
         return None, []
@@ -2514,13 +3217,13 @@ def print_entry(rec, info, t0, new=True):
 
 def pack_blob(args, p, src, rec, fmt, tensors, regions, base, manifests, blocked=frozenset(), replace=False, keep=None):
     """Store the file at src (its record rec) as its blob: a delta against the model `base` if its tensors are found
-    there (by name, in any of its files whose blobs are not `blocked`), else standalone (`regions`). It is decoded
+    there (in any of its files whose blobs are not `blocked`), else standalone (`regions`). It is decoded
     back before it takes its place; an ans16 delta that fails is redone as an XOR delta, and one that would read its
     base for (almost) nothing is stored standalone instead (UnusedBase). Returns blob_info of it."""
     levels, chunk_size = (args.zstd_level, args.zstd_tensor_level), args.chunk_mib << 20
     files = [f for f in manifests[base]["files"] if f["sha256"] not in blocked] if base else []
     for codec in dict.fromkeys([args.delta_codec, "xor"]):
-        layout, used = delta_layout(tensors, fmt, rec["size"], chunk_size, files, codec)
+        layout, used = delta_layout(p, file_reader(src), tensors, fmt, rec["size"], chunk_size, files, codec)
         bases = [{"sha256": f["sha256"], "size": f["size"], "model": base, "path": f["path"]} for f in used]
         header = {"original_size": rec["size"], "sha256": rec["sha256"], "method": method_of(fmt, layout or regions),
                   "regions": layout or regions, "bases": bases}
@@ -3290,22 +3993,53 @@ def restore_plan(dest_dir, entries, flat=False):
     return plan
 
 
-def restore_entry(p, entry, tree, rel, replace):
+def not_exact_note(tree, rel, entry, regions, places, replace):
+    """Write what --accept-inexact says about the file rel beside it, and return the note's path in tree:
+    <rel>.not-exact.txt, or " (1)", " (2)", ... before its extension where that name is one of `places` (those of the
+    model's files and folders; the note's own is added), or is held by anything but a plain file, or by a plain file
+    unless `replace` (--overwrite). Not replacing is one step with the placing, as for a restored file."""
+    *folder, name = rel.split("/")
+    name += ".not-exact.txt"
+    text = ("This file is NOT the original: its SHA-256 differs from " + entry["sha256"] + ".\n"
+            "Its stored bytes were intact, but these regions (offset, length) did not rebuild on this machine, "
+            "so some of their values may be off:\n"
+            + "".join(f"{a} {b}\n" for a, b in regions)).encode()
+    for n in itertools.count():
+        where = folder + [numbered(name, n) if n else name]
+        dst = os.path.join(tree.root, *where)
+        key = target_key(dst)
+        if key in places or (os.path.lexists(dst) and not (replace and os.path.isfile(dst) and not os.path.islink(dst))):
+            continue
+        try:
+            with tree.placing("/".join(where), replace) as f:
+                f.write(text)
+        except FileExistsError:
+            continue
+        places.add(key)
+        return "/".join(where)
+
+
+def restore_entry(p, entry, tree, rel, replace, places=None):
     """Write the original bytes of a model's file to rel in tree (SafeTree.placing): into a new temporary file that
     is put in place only once its size and SHA-256 are right, so on a problem rel is left as it was; over a file
     already there only if `replace` (else the placing fails, in one step, if a file of that name has appeared).
+    With --accept-inexact, a file whose quant regions do not rebuild is written all the same, after a note beside it
+    (not_exact_note), so that it is never there without one; its regions and the note's path are then in _INEXACT.
     Returns None, or (the kind of failure, ERROR_CODES; the problem)."""
     problem = blob_problem(p, entry["sha256"])
     if problem:
         return "damaged", problem
+    _INEXACT["regions"].clear()
     try:
         with tree.placing(rel, replace) as f:
             out = HashingWriter(f)
             for chunk in iter_blob_bytes(p, entry["sha256"]):
                 out.write(chunk)
                 PROGRESS.add(len(chunk))
-            if out.size != entry["size"] or out.hash.hexdigest() != entry["sha256"]:
+            if out.size != entry["size"] or (out.hash.hexdigest() != entry["sha256"] and not _INEXACT["regions"]):
                 raise _Mismatch
+            if _INEXACT["regions"]:
+                _INEXACT["note"] = not_exact_note(tree, rel, entry, _INEXACT["regions"], places, replace)
     except _Mismatch:
         return "damaged", "restored bytes differ from the original SHA-256"
     except FileExistsError:
@@ -3314,7 +4048,11 @@ def restore_entry(p, entry, tree, rel, replace):
         return "other", f"{e}; restore into an empty folder with --overwrite instead"
     except UnsafePath as e:
         return "other", str(e)
+    except InexactRegion as e:
+        return "inexact", f"{e}. To write it all the same, with some values of those regions off: restore --accept-inexact"
     except ValueError as e:  # a frame that does not decode or fails its CRC
+        if isinstance(e.__cause__, InexactRegion):
+            return "inexact", f"{e}. To write it all the same, with some values of those regions off: restore --accept-inexact"
         return "damaged", f"restore failed: {e}"
     except Exception as e:
         return "no_room" if isinstance(e, OSError) and e.errno == errno.ENOSPC else "other", f"restore failed: {e}"
@@ -3334,8 +4072,11 @@ def cmd_restore(args):
     chosen = [e for e in manifest["files"] if not args.files or e["path"] in set(args.files)]
     try:  # placed among all the model's files, so that each lands where it always does; with --flat, among those chosen
         plan = restore_plan(args.dest_dir, chosen if args.flat else manifest["files"], flat=args.flat)
+        whole = restore_plan(args.dest_dir, manifest["files"], flat=True) if args.flat else []
     except ValueError as e:
         sys.exit(f"cannot restore {name}: {e}")
+    places = {target_key(dst) for _, dst, _, _ in plan + whole}  # for a note: where the model's files and folders go, chosen or not
+    places.update(target_key(os.path.join(args.dest_dir, *rel.split("/")[:i])) for _, _, rel, _ in plan for i in range(1, rel.count("/") + 1))
     wanted = {e["path"] for e in chosen}
     plan = [p_ for p_ in plan if p_[0]["path"] in wanted]
     for folder in dict.fromkeys([args.dest_dir, *(os.path.dirname(dst) for _, dst, _, _ in plan)]):
@@ -3359,6 +4100,7 @@ def cmd_restore(args):
                        f"{conflicts[0]}: restore into an empty folder, or add --overwrite to replace them")
     os.makedirs(args.dest_dir, exist_ok=True)
     tree = SafeTree(args.dest_dir)
+    _INEXACT["accept"], inexact = args.accept_inexact, []
     PROGRESS.begin("checking blobs")
     shas = dict.fromkeys(e["sha256"] for e, _, _, present in targets if not present)
     for _ in ordered_map(blob_problem, ((p, sha) for sha in shas), hash_workers()):
@@ -3369,10 +4111,16 @@ def cmd_restore(args):
             say(f"  ok    {shown}  (already there)", event="file", path=entry["path"], dest=rel, written=False)
             continue
         PROGRESS.at(entry["path"])
-        problem = restore_entry(p, entry, tree, rel, replace=args.overwrite)
+        problem = restore_entry(p, entry, tree, rel, replace=args.overwrite, places=places)
         if problem:
             fail(problem[0], f"  cannot restore {shown}: {problem[1]}")
-        say(f"  ok    {shown}", event="file", path=entry["path"], dest=rel, written=True)
+        if _INEXACT["regions"]:
+            regions = list(_INEXACT["regions"])
+            inexact.append(shown)
+            say(f"  NOT EXACT  {shown}  ({len(regions)} region(s) did not rebuild; see {_INEXACT['note']})", event="inexact",
+                path=entry["path"], dest=rel, regions=regions, note=_INEXACT["note"])
+        else:
+            say(f"  ok    {shown}", event="file", path=entry["path"], dest=rel, written=True)
     PROGRESS.end()
     renamed = sum(1 for e, _, rel, r in plan if r and (not args.flat or rel != e["path"].rsplit("/", 1)[-1]))
     if renamed:
@@ -3381,6 +4129,8 @@ def cmd_restore(args):
     what = f"{len(plan)} of {len(manifest['files'])} files of {name}" if args.files else name
     say(f"restored {what}" + (f" @ {manifest['revision']}" if manifest.get("revision") else "") + f" into {args.dest_dir}",
         event="summary", model=name, files=len(plan), dest=args.dest_dir)
+    if inexact:
+        fail("inexact", f"{len(inexact)} file(s) are NOT the originals (--accept-inexact): {', '.join(inexact[:5])}")
 
 
 # ----------------------------------------------------------------------------------------------- verify
@@ -3594,6 +4344,9 @@ def damage_report(p, manifests, names, found, problems):
         gone |= set(more)
     plural = lambda n, word: f"{n} {word}{'' if n == 1 else 's'}"  # noqa: E731
     lines = ["DAMAGE REPORT", f"  pack: {p.root}"]
+    if any(PREDICTION_DISAGREES in f for f in faults.values()):
+        lines.append("  NOTE: some of these blobs are intact and only do not rebuild here: verify the pack on another machine "
+                     "before giving anything up; restore --accept-inexact writes such a file all the same")
     if problems:
         lines.append(f"  manifests that cannot be read ({len(problems)}): their models' files are not known")
         lines += [f"    {rel}: {problem}" for rel, problem in problems]
@@ -3630,7 +4383,7 @@ def damage_report(p, manifests, names, found, problems):
         lines += [f"    {h['file']}  sha256 {h['sha256']}  heals {plural(h['heals'], 'lost file')}" for h in heal]
     if lost:
         lines.append("  to give a lost file up: remove <pack> MODEL --file PATH (or the whole model: remove <pack> MODEL)")
-    data = {"pack": p.root, "faults": [{"sha256": sha, "problem": faults[sha], "file": name_of(sha)} for sha in faults],
+    data = {"pack": p.root, "faults": [{"sha256": sha, "problem": faults[sha], "file": name_of(sha), "intact": PREDICTION_DISAGREES in faults[sha]} for sha in faults],
             "lost": lost, "models": models, "affected": affected, "heal": heal,
             "manifests": [{"path": rel, "problem": problem} for rel, problem in problems]}
     return lines, data
@@ -3673,7 +4426,8 @@ def cmd_verify(args):
     if failures:
         lines, data = damage_report(p, manifests, names, findings, problems)
         say("\n".join(lines), event="damage", **data)
-        fail("damaged", f"{failures} FAILURE(S): what is lost, why, and what to do are in the damage report above")
+        machine = findings[0] and not problems and all(PREDICTION_DISAGREES in f for f in findings[0].values())
+        fail("inexact" if machine else "damaged", f"{failures} FAILURE(S): what is lost, why, and what to do are in the damage report above")
     if not checked:
         sys.exit("no files found: nothing verified")
     say(f"ALL VERIFIED ({checked} files)", event="summary", checked=checked)
@@ -4075,13 +4829,10 @@ def rebase_model(args, p, graph, name, base, release=frozenset(), entries=None):
             above = graph.above(sha)  # using any of these as a base would make a cycle
             letting_go = bool(release & set(now_bases))
             PROGRESS.begin(f"rebasing {name}", None, e["path"])
-            if forced:
-                chosen = base
-            else:
-                read = lambda start, length, sha=sha: read_range(p, sha, start, length)  # noqa: E731
-                chosen = pick_base(args, p, e, e["format"], e["tensors"], read, others, above)
+            read = lambda start, length, sha=sha: read_range(p, sha, start, length)  # noqa: E731
+            chosen = base if forced else pick_base(args, p, e, e["format"], e["tensors"], read, others, above)
             files = [f for f in others[chosen]["files"] if f["sha256"] not in above] if chosen else []
-            used = delta_layout(e["tensors"], e["format"], e["size"], chunk_size, files, args.delta_codec)[1]
+            used = delta_layout(p, read, e["tensors"], e["format"], e["size"], chunk_size, files, args.delta_codec)[1]
             if chosen and not used and any(f["sha256"] in above for f in others[chosen]["files"]):
                 say(f"  {e['path']:<34} unchanged: {chosen} needs this file (directly or through others), so it "
                     "cannot be its base")
@@ -4446,6 +5197,10 @@ def whole_number(lo, hi):
 def add_codec_options(s):
     s.add_argument("--delta-codec", choices=["ans16", "xor"], default="ans16",
                    help="for 16-bit float tensors found in the base: ans16 (smaller) or xor (faster)")
+    s.add_argument("--no-quant", action="store_true",
+                   help="do not code quantized tensors against the weights they came from; what is stored already stays as it is")
+    s.add_argument("--no-rank1", action="store_true",
+                   help="do not look for a change of one direction in matrices (abliteration); what is stored already stays as it is")
     s.add_argument("--workers", type=whole_number(1, 1024), default=None,
                    help="worker processes for ans16 (default: OC_WORKERS, else one per CPU)")
     s.add_argument("--chunk-mib", type=whole_number(1, 1024), default=64, help="maximum region size, 1-1024 (default 64)")
@@ -4528,7 +5283,7 @@ def read_lists(args):
 
 
 def main():
-    global JSON_OUT
+    global JSON_OUT, REBUILD_QUANTIZED, REBUILD_RANK1
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--json", action="store_true",
                         help="print every result line (and progress line) as a JSON object {\"event\", \"text\", ...}")
@@ -4602,6 +5357,9 @@ def main():
     s.add_argument("--flat", action="store_true",
                    help="put every file straight into dest_dir, without the model's folders (two files of one name: "
                         "the later one gets \" (1)\")")
+    s.add_argument("--accept-inexact", action="store_true",
+                   help="if a quantized tensor's stored bytes are intact but do not rebuild on this machine, write the file "
+                        "all the same, with a note beside it, and end with an error: it is not the original")
     s.add_argument("--no-lock", **no_lock)
     s.set_defaults(func=cmd_restore)
 
@@ -4664,6 +5422,8 @@ def main():
 
     args = p.parse_args()
     JSON_OUT = args.json
+    REBUILD_QUANTIZED = not getattr(args, "no_quant", False)
+    REBUILD_RANK1 = not getattr(args, "no_rank1", False)
     for stream in (sys.stdout, sys.stderr):  # a name the console's code page lacks must not stop the program
         with contextlib.suppress(AttributeError, ValueError):
             stream.reconfigure(errors="backslashreplace")
