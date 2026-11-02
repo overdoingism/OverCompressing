@@ -14,7 +14,7 @@ abliterated model as a rank-1 change of its base (`--no-rank1`). Python 3.13 wit
 
 | path | what |
 |---|---|
-| `tools/llm_archive.py` | the whole tool: CLI (`pack`, `list`, `verify`, `restore`, `remove`, `rename`, `rebase`, `export`), codecs, format, safety |
+| `tools/llm_archive.py` | the whole tool: CLI (`init`, `pack`, `list`, `verify`, `restore`, `remove`, `rename`, `name`, `rebase`, `export`), codecs, format, safety |
 | `tools/llm_archive_gui.py` | the Tkinter window; reads in-process, runs the CLI in a child process for every change |
 | `tools/ARCHIVE_FORMAT.md` | the on-disk format, byte by byte (enough to restore by hand) |
 | `tools/test_ans16.py`, `tools/test_formats.py` | the test suites |

@@ -27,7 +27,7 @@ from tkinter import filedialog, messagebox, ttk
 from tkinter import font as tkfont
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "0.6"  # of this window (llm_archive.py, the command-line tool, has its own); raised by hand
+VERSION = "0.7"  # of this window (llm_archive.py, the command-line tool, has its own); raised by hand
 sys.path.insert(0, HERE)
 import llm_archive as la  # noqa: E402
 
@@ -79,11 +79,12 @@ SHOWN = {"folder": ("size", "type", "modified"), "pack": ("packed", "files", "si
          "model": ("size", "stored", "ratio", "type", "needs")}  # columns of each view
 SORT_KEYS = {"modified": "mtime", "packed": "packed_ts"}  # columns sorted by another value than the one shown
 BUTTONS = {  # the buttons (and right-click menu) of each view, in order; None: a separator
-    "folder": ("pack_to", None, "refresh", "remove"),
+    "folder": ("pack_to", "turn_pack", "new_pack", None, "refresh", "remove"),
     "pack": ("pack_in", "save", None, "extract", "verify", None, "rebase", None, "remove", "rename"),
     "model": ("add_file", None, "extract", "verify", None, "rebase", None, "remove", "rename"),
 }
 WATCH_SECONDS = 5  # the place is looked at (one file's time stamp) at most this often
+NOTE_WIDTH = 28  # characters: the field beside the path that shows a pack's name; the whole of it on hover
 WRAP = 460  # pixels (at 100%): the width of a dialog's text
 ARGS_LIMIT = 8000  # characters: past it, models and files go in list files (--models-from, --files-from); Windows: 32,767
 BELOW = "\0below"  # a drag begun under the last row of the list
@@ -100,6 +101,9 @@ TEXT = {  # all of the window's text: symbols (Unicode BMP) where they say it, e
     "up": "↑",
     "drives": "Drives",
     "pack_to": "+ Pack to",
+    "new_pack": "+ New pack folder",
+    "turn_pack": "+ Turn folder into pack",
+    "name_pack": "✎ Rename pack",
     "pack_in": "+ Pack in",
     "add_file": "+ Add file",
     "save": "⤓ Save .oczip",
@@ -110,6 +114,20 @@ TEXT = {  # all of the window's text: symbols (Unicode BMP) where they say it, e
     "refresh": "↻ Refresh",
     "hint_keys": "F5 Force refresh · Ctrl+A Select all",
     "mode_in_file": "in pack file",
+    "unnamed": "unnamed",
+    "new_pack_what": "A new pack folder in:",
+    "turn_pack_what": "Turn this folder into a pack:",
+    "folder_prompt": "Folder name:",
+    "pack_name_prompt": "Pack name (optional):",
+    "pack_name_note": "Only ever shown. Without one, the pack is shown by a short hash.",
+    "pack_name_to": "Name of a new pack (optional):",
+    "pack_name_held": "That pack folder has its name already: ✎ Rename pack changes it.",
+    "need_folder": "Enter a name for the folder.",
+    "folder_bad": "A folder name only, with no path in it.",
+    "folder_exists": "That name is taken in this folder.",
+    "making_pack": "▶ Making the pack {name}",
+    "done_make_pack": "✔ {path} is a pack now. + Pack in puts models in it.",
+    "naming_pack": "▶ Naming the pack",
     "cancel": "✕ Cancel",
     "stop_now": "✕ Stop now",
     "ok": "OK",
@@ -138,6 +156,7 @@ TEXT = {  # all of the window's text: symbols (Unicode BMP) where they say it, e
     "removed": "{name} (removed)",
     "shared": "= also in {models}",
     "where_pack": "{kind} · {models} · {size} → {stored} ({ratio}) · {blobs}",
+    "where_empty": "{kind} · no models yet",
     "selected": "{count} selected: {size} → {stored} ({ratio})",
     "selected_size": "{count} selected: {size}",
     "selected_count": "{count} selected",
@@ -544,6 +563,16 @@ def list_folder(place):
     return rows, None
 
 
+def identity_of(path):
+    """The name, id and label of the pack at `path` (la.pack_identity); all None if it cannot be read."""
+    try:
+        return la.pack_identity(la.open_pack(path))
+    except (OSError, ValueError):
+        return la.marker_identity({})
+    finally:
+        la.close_pack_files()
+
+
 def read_pack(path):
     """(the pack at path, its manifests, problems with the others), the pack file closed again afterwards by the
     caller (la.close_pack_files)."""
@@ -595,7 +624,7 @@ def list_pack(place):
     size = sum(m["size"] for m in summary["models"])  # what the models would take on disk, each with all its files
     where = t("where_pack", kind=p.kind, models=count(len(rows), "model"), size=size_text(size),
               stored=size_text(summary["stored"]), ratio=percent(summary["stored"], size),
-              blobs=count(summary["blobs"], "blob"))
+              blobs=count(summary["blobs"], "blob")) if rows or summary["blobs"] else t("where_empty", kind=p.kind)
     if summary["kept"]:
         users = sorted({n for k in summary["kept"] for n in k["needed_by"]})
         where += t("where_kept", size=size_text(sum(k["size"] for k in summary["kept"])), models=", ".join(users))
@@ -819,14 +848,28 @@ class App:
         entry = ttk.Entry(top, textvariable=self.path)
         entry.pack(side="left", fill="x", expand=True, padx=(self.px(6), 0))
         entry.bind("<Return>", lambda _: self.go_to_text())
+        self.pack_name = tk.StringVar()  # the pack's name, edited here; or in gray its short hash, for want of one
+        self.name_held, self.name_hint, self.note_whole = "", "", None
+        self.name_entry = ttk.Entry(top, textvariable=self.pack_name, width=NOTE_WIDTH, justify="center", state="disabled")
+        self.name_entry.pack(side="left", padx=(self.px(6), 0))  # always there, so that nothing moves
+        self.name_entry.bind("<Return>", lambda _: self.name_pack())
+        self.name_entry.bind("<Escape>", lambda _: self.pack_name.set(self.name_held or self.name_hint))
+        self.name_entry.bind("<FocusIn>", lambda _: self.name_hint and self.name_entry.select_range(0, "end"))
+        self.name_entry.bind("<Enter>", lambda e: self.note_whole and self.show_tip(self.note_whole, e.x_root + self.px(12), e.y_root + self.px(18)))
+        self.name_entry.bind("<Leave>", self.hide_tip)
+        self.name_button = ttk.Button(top, text=t("name_pack"), command=self.name_pack, state="disabled")
+        self.name_button.pack(side="left", padx=(self.px(6), 0))
+        self.pack_name.trace_add("write", lambda *_: self.name_edited())
 
         self.bar = ttk.Frame(self.root, padding=(self.px(10), 0, self.px(10), self.px(6)))
         self.bar.pack(fill="x")
         self.commands = {"pack_to": self.pack, "pack_in": self.pack, "add_file": self.add_file, "save": self.export,
                          "extract": self.extract, "verify": self.verify, "remove": self.remove, "rename": self.rename,
-                         "rebase": self.rebase, "refresh": self.refresh}
+                         "rebase": self.rebase, "refresh": self.refresh, "new_pack": self.new_pack,
+                         "turn_pack": self.turn_pack}
         self.buttons, self.bar_items, self.laid_out = {}, [], None  # laid out: the view the buttons are for
-        self.mode = tk.Label(self.bar, font=self.bold, fg="#202124")  # what the place is: the legend's word and color
+        self.mode = tk.Label(self.bar, font=self.bold, fg="#202124", width=12)  # what the place is: the legend's word and
+        # color, as wide in every place, so that the buttons start where they did
         self.mode.pack(side="left", padx=(0, self.px(4)))
         self.mode_note = ttk.Label(self.bar, foreground="#5f6368")
         self.mode_note.pack(side="left", padx=(0, self.px(10)))
@@ -1065,9 +1108,17 @@ class App:
         kind = {"model": "model", "pack": "oczip" if place.read_only else "pack"}.get(place.view, "folder")
         self.mode.configure(text=f" {dict(LEGEND)[kind]} ", bg=COLORS[kind])
         self.mode_note.configure(text=t("mode_in_file") if place.view == "model" and place.read_only else "")
+        identity = identity_of(place.path) if place.pack else None
+        label = identity and (identity["label"] or t("unnamed"))
+        font = tkfont.nametofont("TkDefaultFont")
+        self.note_whole = label if label and font.measure(label) > font.measure("0") * (NOTE_WIDTH - 2) else None
+        self.name_held = identity["name"] or "" if identity else ""
+        self.name_hint = label if identity and not identity["name"] else ""
+        self.name_entry.configure(state="disabled" if not identity else "readonly" if place.read_only else "normal")
+        self.pack_name.set(self.name_held or self.name_hint)
         self.seen, self.looked = self.stamp(), time.monotonic()
         self.path.set(place.text())
-        self.root.title(f"OverCompressing {self.versions} {t('dash')} {place.text()}")
+        self.root.title(f"OverCompressing {self.versions} {t('dash')} {place.text()}" + (f" [{label}]" if label else ""))
         if place.view == "pack":
             self.views.pack(side="right", before=self.hint, padx=(self.px(12), 0))
         else:
@@ -1388,18 +1439,28 @@ class App:
         if row and row["kind"] in ("folder", "drive", "pack", "oczip", "model"):
             self.go(self.place.child(row))
 
+    @property
+    def running(self):
+        """Whether a job runs: from the busy window's start, before its child process exists (the busy window, opening,
+        handles events still queued, such as a selection, which turn buttons back on: found by the downstream team), to
+        its end."""
+        return self.proc is not None or self.busy is not None
+
     def update_buttons(self):
-        """Refresh, Pack in and Add file can always be used (where the place can be changed); the others act on what
-        is selected (Rename on one row), so they are off while nothing is."""
+        """Refresh, Pack in, Add file and what makes a pack act on the place, so they can always be used (where the place
+        can be changed); the others act on what is selected (Rename on one row), so they are off while nothing is.
+        Rename pack, beside the path, is on while the name there has been changed."""
         place, count = self.place, len(self.tree.selection())
         writable = place is not None and place.pack and not place.read_only  # a pack folder, or a model in one
         on_disk = place is not None and place.view == "folder" and place.path is not None and not self.inside_pack
         usable = {"refresh": True, "pack_in": writable, "add_file": writable, "pack_to": on_disk and count > 0,
                   "remove": (on_disk or writable) and count > 0, "save": count > 0, "extract": count > 0,
-                  "verify": count > 0, "rename": writable and count == 1, "rebase": writable and count > 0}
+                  "verify": count > 0, "rename": writable and count == 1, "rebase": writable and count > 0,
+                  "new_pack": on_disk, "turn_pack": on_disk}
+        self.name_edited()
         keys = [k for k in BUTTONS[self.laid_out or "folder"] if k]
         for index, key in enumerate(keys):
-            state = "normal" if usable[key] and not self.proc else "disabled"
+            state = "normal" if usable[key] and not self.running else "disabled"
             self.buttons[key].configure(state=state)
             self.menu.entryconfigure(index, state=state)
 
@@ -1567,12 +1628,12 @@ class App:
                                source, files, here)
         if not answer:
             return
-        name, mode, where, replace, rebuild = answer
+        name, mode, where, replace, rebuild, pack_name = answer
         self.pack_mode = mode if here is None else self.pack_mode
         if mode == "folder":
             self.pack_target = where
         argv = ["pack", source, where, f"--name={name}", *[f"--file={f}" for f in files], *["--replace"] * replace,
-                *["--no-quant"] * (not rebuild)]
+                *["--no-quant"] * (not rebuild), *[f"--pack-name={pack_name}"] * bool(pack_name)]
 
         def done():
             if mode == "file" and place.view == "folder" and place.path == os.path.dirname(where):
@@ -1587,9 +1648,9 @@ class App:
 
     def ask_pack(self, default, what, source, files, here=None):
         """(model name, "folder" or "file", the pack folder or new pack file, whether to replace the model, whether to
-        rebuild quantized weights) the user enters, checked (also that `source` may be packed there), or None. here: the
-        pack folder the list shows; the choice is then this pack folder (the default) or a new pack file, a pack of its
-        own."""
+        rebuild quantized weights, the name of a new pack or "") the user enters, checked (also that `source` may be
+        packed there), or None. here: the pack folder the list shows; the choice is then this pack folder (the default)
+        or a new pack file, a pack of its own."""
         dialog = self.dialog(t("name_title"))
         frame = ttk.Frame(dialog, padding=self.px(16))
         frame.pack(fill="both", expand=True)
@@ -1642,6 +1703,10 @@ class App:
             browse_button.configure(state="disabled" if fixed else "normal")
 
         lock()
+        ttk.Label(frame, text=t("pack_name_to"), wraplength=wrap).pack(anchor="w", pady=(self.px(12), self.px(4)))
+        pack_name = tk.StringVar()
+        ttk.Entry(frame, textvariable=pack_name, width=58).pack(fill="x")
+        self.note(frame, t("pack_name_note"))
         rebuild = tk.BooleanVar(value=True)
         ttk.Checkbutton(frame, text=t("quant_tick"), variable=rebuild).pack(anchor="w", pady=(self.px(12), 0))
         self.note(frame, t("quant_note"), padx=(self.px(24), 0))
@@ -1664,6 +1729,10 @@ class App:
                     problem = t("target_oczip")
                 else:
                     problem = (la.holds(source, where) and not files and f"{source} holds {where}") or la.place_problem(source)
+            new_name = pack_name.get().strip()
+            if not problem and new_name:
+                problem = la.pack_name_problem(new_name) or (
+                    mode.get() == "folder" and os.path.isfile(os.path.join(where, la.MARKER)) and t("pack_name_held"))
             if problem:
                 error.configure(text=sentence(problem))
                 return
@@ -1678,7 +1747,7 @@ class App:
                 if held and not messagebox.askyesno(t("name_title"), t("replace_q", pack=where, name=model,
                                                                        files=count(len(held["files"]), "file")), parent=dialog):
                     return
-            result.append((model, mode.get(), where, bool(held) if mode.get() == "folder" else False, rebuild.get()))
+            result.append((model, mode.get(), where, bool(held) if mode.get() == "folder" else False, rebuild.get(), new_name))
             dialog.destroy()
 
         self.dialog_buttons(dialog, frame, accept)
@@ -1686,6 +1755,98 @@ class App:
         entry.focus_set()  # keys (Return, Escape) reach a dialog only through the focus
         self.show_dialog(dialog)
         return result[0] if result else None
+
+    def new_pack(self):
+        """Make a new pack folder inside the folder shown, and open it."""
+        answer = self.ask_new_pack(t("new_pack"), t("new_pack_what"), self.place.path, in_folder=True)
+        if answer:
+            self.make_pack(os.path.join(self.place.path, answer[0]), answer[1])
+
+    def turn_pack(self):
+        """Make the folder shown a pack folder, if it is empty (what systems leave in folders does not count), and open it."""
+        problem = la.new_pack_problem(self.place.path)
+        if problem:
+            messagebox.showinfo(t("turn_pack"), sentence(problem), parent=self.root)
+            return
+        answer = self.ask_new_pack(t("turn_pack"), t("turn_pack_what"), self.place.path)
+        if answer:
+            self.make_pack(self.place.path, answer[1])
+
+    def make_pack(self, path, name):
+        def done():
+            self.go(Place(path, pack=True))
+            messagebox.showinfo(t("new_pack"), t("done_make_pack", path=short(path)), parent=self.root)
+
+        self.start([{"argv": ["init", path, *[f"--name={name}"] * bool(name)],
+                     "title": t("making_pack", name=name or os.path.basename(path) or path)}], done)
+
+    def ask_new_pack(self, title, what, path, in_folder=False):
+        """(the new folder's name, or None; the pack's name, or "") the user enters, checked, or None."""
+        dialog = self.dialog(title)
+        frame = ttk.Frame(dialog, padding=self.px(16))
+        frame.pack(fill="both", expand=True)
+        self.heading(frame, what)
+        self.path_line(frame, path, pady=(self.px(2), 0))
+        folder = tk.StringVar()
+        if in_folder:
+            ttk.Label(frame, text=t("folder_prompt")).pack(anchor="w", pady=(self.px(12), self.px(4)))
+            first = ttk.Entry(frame, textvariable=folder, width=52)
+            first.pack(fill="x")
+        ttk.Label(frame, text=t("pack_name_prompt")).pack(anchor="w", pady=(self.px(12), self.px(4)))
+        name = tk.StringVar()
+        entry = ttk.Entry(frame, textvariable=name, width=52)
+        entry.pack(fill="x")
+        self.note(frame, t("pack_name_note"))
+        error = ttk.Label(frame, foreground="#b3261e", wraplength=self.px(WRAP))
+        error.pack(anchor="w", pady=(self.px(4), 0))
+        result = []
+
+        def problem_with(new):
+            if not new:
+                return t("need_folder")
+            if new in (".", "..") or os.path.basename(new) != new or "/" in new or "\\" in new:
+                return t("folder_bad")
+            if os.path.lexists(os.path.join(path, new)):
+                return t("folder_exists")
+            return la.new_pack_problem(os.path.join(path, new))
+
+        def accept(_=None):
+            new, pack_name = folder.get().strip(), name.get().strip()
+            problem = (in_folder and problem_with(new)) or (pack_name and la.pack_name_problem(pack_name))
+            if problem:
+                error.configure(text=sentence(problem))
+                return
+            result.append((new if in_folder else None, pack_name))
+            dialog.destroy()
+
+        self.dialog_buttons(dialog, frame, accept)
+        (first if in_folder else entry).focus_set()
+        self.show_dialog(dialog)
+        return result[0] if result else None
+
+    def name_change(self):
+        """The name typed beside the path ("": none), if that is a change; else None."""
+        new = self.pack_name.get().strip()
+        return None if new == self.name_held or (not self.name_held and new == self.name_hint) else new
+
+    def name_edited(self):
+        """The name beside the path was typed in, or the place changed: gray while it is the short hash; Rename pack on
+        while it is a change that can be made."""
+        self.name_entry.configure(foreground="#5f6368" if self.name_hint and self.pack_name.get() == self.name_hint else "#202124")
+        usable = str(self.name_entry.cget("state")) == "normal" and self.name_change() is not None and not self.running
+        self.name_button.configure(state="normal" if usable else "disabled")
+
+    def name_pack(self):
+        """Give the pack folder shown the name typed beside the path, or none if that was emptied."""
+        new, place = self.name_change(), self.place
+        if new is None or str(self.name_entry.cget("state")) != "normal" or self.running:
+            return
+        problem = new and la.pack_name_problem(new)
+        if problem:
+            messagebox.showinfo(t("name_pack"), sentence(problem), parent=self.root)
+            return
+        self.start([{"argv": ["name", place.path, f"--to={new}" if new else "--none"], "title": t("naming_pack")}],
+                   lambda: self.go(place))
 
     def add_file(self):
         """Add files from disk to the model shown (those whose names the model has already replace them, after
@@ -2043,7 +2204,7 @@ class App:
         `done` is called once all have succeeded."""
         self.jobs, self.done = list(jobs), done
         self.job_number, self.job_total = 0, len(self.jobs)
-        for button in self.buttons.values():
+        for button in (*self.buttons.values(), self.name_button):
             button.configure(state="disabled")
         self.show_busy()
         self.next_job()

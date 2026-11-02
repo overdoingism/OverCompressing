@@ -1,6 +1,6 @@
 # Format 5: what changed
 
-CLI 0.6 writes and reads format 5 only. **It cannot read a pack of format 4** (CLI 0.5 and earlier), and there is no
+CLI 0.6 and later write and read format 5 only. **They cannot read a pack of format 4** (CLI 0.5 and earlier), and there is no
 converter: to move a pack, restore it with the old tool and pack it again ([below](#moving-a-pack-from-format-4)).
 
 ## How much smaller

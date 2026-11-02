@@ -10,10 +10,14 @@ A pack is a folder (a *pack folder*) or the same tree in one ZIP file (a *pack f
 
 ```
 <pack>/
-  ocpack.json               {"format": "overcompressing-pack", "format_version": 5, "changed": "<time>"}: what
-                            makes the folder a pack; rewritten last by every change (pack, remove, rename, rebase,
-                            export --delete), with `changed` the UTC time in ISO 8601, so its time stamp tells a
-                            watcher once per complete change (readers check only `format` and `format_version`)
+  ocpack.json               {"format": "overcompressing-pack", "format_version": 5, "name": "<text>", "id": "<hex>",
+                            "changed": "<time>"}: what makes the folder a pack; rewritten last by every change (pack,
+                            remove, rename, name, rebase, export --delete), with `changed` the UTC time in ISO 8601, so
+                            its time stamp tells a watcher once per complete change (readers check only `format` and
+                            `format_version`). `name` (optional; at most 100 characters, no control characters or line
+                            breaks) and `id` (32 lowercase hex digits, random, made with the pack) are only ever shown:
+                            one missing, or not of that form, is taken as not there, and the next change gives a pack
+                            an id if it has none
   models/
     <Org__Name>.json        one manifest per model; "/" in the model's name becomes "__" (Qwen/Qwen2.5-7B ->
                             models/Qwen__Qwen2.5-7B.json)

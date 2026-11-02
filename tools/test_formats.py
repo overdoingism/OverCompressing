@@ -1634,6 +1634,94 @@ def check_safety():
     code, out = pack(src, kit_only, "t/S")
     expect("... but one holding only _kit is", code == 0 and "t/S" in models(kit_only), out[-200:])
 
+    print("a pack made before anything is in it, and its name")
+    marker_of = lambda folder: json.load(open(os.path.join(folder, la.MARKER), encoding="utf-8"))  # noqa: E731
+    made = os.path.join(root, "i1")
+    code, out = tool("init", made)
+    first = marker_of(made) if code == 0 else {}
+    expect("init makes a new folder a pack folder, with an id and no name", code == 0 and clean(out) and re.fullmatch("[0-9a-f]{32}", first.get("id", "")) and "name" not in first and first["id"][:8] in out, out[-200:])
+    code, out = tool("list", made)
+    expect("  list shows it, by the start of its id", code == 0 and f"[{first['id'][:8]}]" in out and "0 model(s)" in out, out[-200:])
+    code, out = tool("verify", made)
+    expect("  verify of a pack with no models finds nothing wrong", code == 0 and "nothing to verify" in out, out[-200:])
+    code, out = tool("export", made, os.path.join(root, "i1.oczip"))
+    expect("  export of it has nothing to write", code != 0 and clean(out) and not os.path.exists(os.path.join(root, "i1.oczip")), out[-200:])
+    code, out = tool("init", made)
+    expect("  init again leaves it as it is", code == 0 and "already" in out and marker_of(made) == first, out[-200:])
+    code, out = tool("init", made, "--name", "Other")
+    expect("  init again with a name does not name it, and says what does", code != 0 and clean(out) and "command name" in out and marker_of(made) == first, out[-200:])
+    code, out = tool("name", made, "--to", "Cold storage 冷存")
+    second = marker_of(made) if code == 0 else {}
+    expect("name gives it a name and keeps its id", code == 0 and second.get("name") == "Cold storage 冷存" and second["id"] == first["id"], out[-200:])
+    code, out = pack(src, made, "t/I")
+    third = marker_of(made)
+    expect("  a change keeps both, and is recorded", code == 0 and third["name"] == second["name"] and third["id"] == first["id"] and third["changed"] >= second["changed"], out[-200:])
+    code, out = tool("list", made, "--json")
+    event = json.loads(out.splitlines()[0]) if code == 0 else {}
+    expect("  list --json gives name, id and label", event.get("name") == second["name"] and event.get("id") == first["id"] and event.get("label") == second["name"], out[-200:])
+    code, out = tool("remove", made, "t/I")
+    code_v, out_v = tool("verify", made)
+    expect("  with its last model removed, the pack stays, and verifies", code == 0 and code_v == 0 and marker_of(made)["name"] == second["name"], out_v[-200:])
+    code, out = tool("name", made, "--none")
+    expect("name --none takes the name away: shown by the id again", code == 0 and "name" not in marker_of(made) and first["id"][:8] in out, out[-200:])
+    for bad in ("two\nlines", " space", "x" * 101, "‮right to left", ""):
+        code, out = tool("name", made, "--to", bad)
+        expect(f"  name {ascii(bad[:12])} refused", code != 0 and clean(out) and "name" not in marker_of(made), out[-200:])
+        code, out = tool("init", os.path.join(root, "i-bad"), "--name", bad)
+        code_p, out_p = pack(src, os.path.join(root, "i-bad"), "t/I", "--pack-name", bad)
+        expect("  ... by init and pack too, with nothing made", code != 0 and code_p != 0 and not os.path.exists(os.path.join(root, "i-bad")), out_p[-200:])
+    code, out = tool("name", made)
+    expect("name needs --to or --none", code != 0)
+    litter = make_folder(os.path.join(root, "i2"), {"Thumbs.db": b"x", "DESKTOP.INI": b"x", ".DS_Store": b"x", "$RECYCLE.BIN/S-1/f": b"x", "System Volume Information/g": b"x", ".Trash-1000/files/h": b"x"})
+    code, out = tool("init", litter, "--name", "L")
+    expect("what systems leave in a folder does not count as holding files", code == 0 and marker_of(litter)["name"] == "L" and os.path.isfile(os.path.join(litter, "Thumbs.db")), out[-200:])
+    litter = make_folder(os.path.join(root, "i2p"), {"Thumbs.db": b"x"})
+    code, out = pack(src, litter, "t/I")
+    expect("  ... so pack takes such a folder too", code == 0 and "t/I" in models(litter), out[-200:])
+    for folder, why in ((make_folder(os.path.join(root, "i3"), {"model.bin": b"x"}), "a file"), (make_folder(os.path.join(root, "i4"), {"sub/Thumbs.db": b"x"}), "a folder of one's own"),
+                        (make_folder(os.path.join(root, "i5"), {"Thumbs.db.txt": b"x"}), "a name like those")):
+        code, out = tool("init", folder)
+        expect(f"init refuses a folder holding {why}", code != 0 and clean(out) and "not a pack folder" in out and not os.path.exists(os.path.join(folder, la.MARKER)), out[-200:])
+    for inner in (os.path.join(made, "below"), os.path.join(made, "below", "further"), os.path.join(made, la.MODELS)):
+        code, out = tool("init", inner)
+        expect(f"init refuses a folder inside a pack folder ({os.path.relpath(inner, made)})", code != 0 and clean(out) and "inside the pack folder" in out and not os.path.exists(os.path.join(inner, la.MARKER)) and not os.path.exists(os.path.join(made, "below")), out[-200:])
+    above = make_folder(os.path.join(root, "i6"), {"inner/keep.txt": b"x"})
+    code, out = tool("init", os.path.join(above, "inner"))
+    code_o, _ = tool("init", above)
+    expect("  and one that holds anything, a pack below it or not", code != 0 and code_o != 0, out[-200:])
+    code, out = tool("init", os.path.join(root, "i7.oczip"))
+    expect("init of a pack file's name: refused, it is written whole", code != 0 and clean(out) and "written whole" in out and not os.path.exists(os.path.join(root, "i7.oczip")), out[-200:])
+    code, out = tool("init", os.path.join(root, "i1", la.MARKER))
+    expect("init of a file: refused", code != 0 and clean(out), out[-200:])
+    named = os.path.join(root, "i8")
+    code, out = pack(src, named, "t/I", "--pack-name", "Packed so")
+    expect("pack --pack-name names a pack it makes", code == 0 and marker_of(named)["name"] == "Packed so", out[-200:])
+    code, out = pack(src, named, "t/J", "--pack-name", "Another")
+    expect("  and refuses a pack that is there, nothing packed", code != 0 and clean(out) and "command name" in out and marker_of(named)["name"] == "Packed so" and "t/J" not in models(named), out[-200:])
+    plain = os.path.join(root, "i9")
+    pack(src, plain, "t/I")
+    expect("  without it, a new pack has an id and no name", "name" not in marker_of(plain) and marker_of(plain)["id"])
+    in_file = os.path.join(root, "i10.oczip")
+    code, out = pack(src, in_file, "t/I", "--pack-name", "In a file")
+    code_l, out_l = tool("list", in_file)
+    code_n, out_n = tool("name", in_file, "--to", "Other")
+    expect("a new pack file has its name, and being read-only keeps it", code == code_l == 0 and "[In a file]" in out_l and code_n != 0 and "read-only" in out_n, out_n[-200:])
+    copied = os.path.join(root, "i11.oczip")
+    code, out = tool("export", named, copied)
+    code_l, out_l = tool("list", copied)
+    expect("  export carries a pack folder's name", code == code_l == 0 and "[Packed so]" in out_l, out_l[-200:])
+    older = os.path.join(root, "i12")
+    pack(src, older, "t/I")
+    for odd in ({"format": la.PACK_FORMAT, "format_version": la.FORMAT_VERSION}, {"format": la.PACK_FORMAT, "format_version": la.FORMAT_VERSION, "name": ["no"], "id": "ZZ"},
+                {"format": la.PACK_FORMAT, "format_version": la.FORMAT_VERSION, "name": "two\nlines", "id": 7}):
+        with open(os.path.join(older, la.MARKER), "w", encoding="utf-8") as f:
+            json.dump(odd, f)
+        code, out = tool("list", older)
+        ok = code == 0 and clean(out) and "[" not in out.splitlines()[0]
+        code, out = tool("rename", older, "t/I", "t/I2")
+        expect(f"a pack with no name or id, or none that can be shown, opens; its next change gives it an id ({ascii(list(odd)[2:])})", ok and code == 0 and "name" not in marker_of(older) and len(marker_of(older)["id"]) == 32, out[-200:])
+        tool("rename", older, "t/I2", "t/I")
+
     print("safety: paths in a manifest")
     archive = os.path.join(root, "a3")
     files = {"note.txt": b"hello", "sub/f.txt": b"in a subfolder"}
@@ -2486,6 +2574,8 @@ def check_pack_files():
         fields = lambda text: sorted(re.findall(r"\{\w+\}", text))  # noqa: E731
         odd = [k for k, v in plain.items() if not v.isascii() or fields(v) != fields(gui.TEXT[k]) or not v.strip() and gui.TEXT[k].strip()]
         expect("where a Tk cannot draw symbols, the window's text is all ASCII, with what it fills in", not odd, odd)
+        expect("every button of the window has its text", all(k in gui.TEXT for keys in gui.BUTTONS.values() for k in keys if k))
+        expect("a place's pack is told by name or short hash; one that cannot be read by neither", gui.identity_of(single)["label"] and gui.identity_of(root)["label"] is None)
         expect("  a sign stands where a symbol says something, none where it goes before a word", plain["up"] == "Up" and plain["extract"] == "Extract to" and plain["mark_file"] == "! failed verify"
                and plain["name_hint"].startswith("Bases are") and len(plain["spinner"]) == len(gui.TEXT["spinner"]), plain["name_hint"])
         ask = lambda result: types.SimpleNamespace(tk=types.SimpleNamespace(call=result))  # noqa: E731

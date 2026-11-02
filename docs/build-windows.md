@@ -68,7 +68,7 @@ title and `--version` (a copy has no git to ask). To build without network, put 
 & "$out\python\python.exe" -I "$out\tools\test_formats.py" "$env:TEMP\oc-test"
 ```
 
-The first prints `OverCompressing CLI 0.6 (<date> <commit>), format 5`; both test suites end with `ALL PASSED` (the
+The first prints `OverCompressing CLI 0.7 (<date> <commit>), format 5`; both test suites end with `ALL PASSED` (the
 second takes several minutes).
 
 ## 6. Use it
@@ -164,7 +164,7 @@ pip 會把 numpy 與 zstandard 裝進可攜版自己的 Python（`$out\python\Li
 & "$out\python\python.exe" -I "$out\tools\test_formats.py" "$env:TEMP\oc-test"
 ```
 
-第一行會印出 `OverCompressing CLI 0.6 (<日期> <commit>), format 5`；兩個測試都必須以 `ALL PASSED` 結束（第二個需要幾分鐘）。
+第一行會印出 `OverCompressing CLI 0.7 (<日期> <commit>), format 5`；兩個測試都必須以 `ALL PASSED` 結束（第二個需要幾分鐘）。
 
 ## 6. 使用
 

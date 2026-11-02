@@ -27,6 +27,25 @@ model needs. A pack takes one of two forms, with the same tree inside:
 Commands name a pack by its path (the folder, or the `.oczip`) and a model by its name in the pack
 (`Qwen/Qwen2.5-7B`; its manifest's file name, `Qwen__Qwen2.5-7B`, works too).
 
+A pack folder comes into being when you first pack into it, or beforehand with `init`, and it may have a name, which is
+only ever shown:
+
+```bash
+python -I tools/llm_archive.py init <folder> [--name NAME]
+python -I tools/llm_archive.py name <pack_folder> (--to NAME | --none)
+```
+
+`init` takes a new folder or an empty one. What systems leave in folders does not count as content (`Thumbs.db`,
+`ehthumbs.db`, `desktop.ini`, `.DS_Store`, `.directory`, `$RECYCLE.BIN`, `System Volume Information`, `lost+found`,
+`.Spotlight-V100`, `.fseventsd`, `.Trashes`, `.Trash-*`), nor does `_kit/`; `pack` goes by the same rule. A folder holding anything else is
+refused, and so is any folder inside a pack folder: everything below a pack folder counts as that pack's, so packs do
+not nest. On a pack folder that is there already `init` changes nothing and succeeds, so a script can run it again;
+naming it that way is refused, as `name` does that. A name is at most 100 characters on one line. Without one, a pack
+is shown by the first 8 characters of its id (`[f5bd6001]`), a random number made with the pack: not a hash of its
+contents, which would change with every change. `list` shows the name or the short id on its first line. A pack file
+is read-only, so it keeps the name it was made with: `pack --pack-name` when it is written, or its pack folder's
+through `export`.
+
 ## Typical workflow
 
 ```bash
@@ -126,14 +145,20 @@ all at once with **Ctrl+A**: every row the filter lets through, without the gray
 in the list, selects nothing. In the path bar or the filter, Ctrl+A selects their text instead.
 
 The place shown is named at the left of the buttons, in the legend's word and color: **Folder**, **Pack folder**,
-**Pack file** or **Model** (a model in a pack file adds `in pack file`). The buttons (and the right-click menu) are
-those of that place. **↻ Refresh**, **+ Pack in** and **+ Add file** can always be used (where the place can be
-changed); every other button acts on what is selected, so it is off while nothing is (and Rename wants one row):
+**Pack file** or **Model** (a model in a pack file adds `in pack file`). In a pack or a model, the field beside the path
+shows the pack's name, or in gray its short id, and the window's title ends with it. In a pack folder, type in that
+field, then press **✎ Rename pack** beside it or Enter (emptied: no name; Esc: back to what it was). The buttons (and
+the right-click menu) are those of that place. **↻ Refresh**, **+ Pack in**,
+**+ Add file**, **+ Turn folder into pack** and **+ New pack folder** act on the place, so they can
+always be used (where the place can be changed); every other button acts on what is selected, so it is off while
+nothing is (and Rename wants one row):
 
-- **In a folder:** **+ Pack to** packs the selected folder, or the selected files of this folder (they then make up
+- **In a folder:** **+ Turn folder into pack** makes the folder shown a pack, if it is empty (see
+  [above](#two-forms-of-a-pack)), and opens it. **+ New pack folder** asks for a folder name and, if you like, a pack
+  name, makes that pack inside the folder shown and opens it. **+ Pack to** packs the selected folder, or the selected files of this folder (they then make up
   the model on their own; one file is named after itself by default), into a pack folder you choose (remembered for
   the next pack) or into a new pack file (`.oczip`); a name the pack folder holds already is replaced only after you
-  agree. Its dialog has **Δ Code quantized weights against the weights they came from**, ticked each time: unticked is
+  agree. If that makes a new pack, it can be named there. Its dialog has **Δ Code quantized weights against the weights they came from**, ticked each time: unticked is
   `--no-quant` (section 2), as in **+ Pack in** and under Find better bases in **⇄ Rebase**. **↻ Refresh**. **− Remove** moves the selection to the Recycle Bin (on Linux, the desktop trash), after
   asking, and never deletes anything for good: where the bin would not take it (a network or removable drive, a bin
   set to delete at once, or one too small for it) it is refused, and you delete it yourself if you mean to. Inside a
@@ -191,7 +216,7 @@ core left idle and gives way to what you are doing meanwhile. Delta bases are al
 `rebase` and the other options are on the command line only. The window's text is English and symbols, whatever the system language; where its Tk has no Xft (a portable copy on Linux), it cannot draw those symbols, so the text is plain ASCII there.
 Started from a portable copy kept in a pack folder as `_kit` (see Portable copy), it opens that pack. Its title shows its own version and that of `llm_archive.py`, each
 with its build (the date and commit the file was last changed in; `edited` if it differs from that commit), e.g.
-`OverCompressing GUI 0.6 (2026-11-01 1a2b3c4) · CLI 0.6 (2026-11-01 1a2b3c4)`: give both when reporting a problem.
+`OverCompressing GUI 0.7 (2026-11-01 1a2b3c4) · CLI 0.7 (2026-11-01 1a2b3c4)`: give both when reporting a problem.
 `llm_archive.py --version` prints the second.
 
 ## 1. `pack` — compress folders into a pack
@@ -222,6 +247,7 @@ there, and export again.
 | `--replace` | replace the model of that name in the pack folder with these files (without `--replace` or `--add`, a name the pack folder holds already is refused before anything is written) |
 | `--add` | add these files to the model of that name in the pack folder: files of the same path are replaced, the others kept (e.g. to put back one file removed by mistake: `--add --file <path>`); with `--base` or `--no-base`, that choice is these files' own, not the model's |
 | `--revision TEXT` | free-text note stored in the manifest, e.g. the upstream commit you downloaded |
+| `--pack-name NAME` | if this makes a new pack, folder or file: its name (see [Two forms of a pack](#two-forms-of-a-pack)); refused for a pack folder that is there already |
 | `--exclude GLOB` | skip files whose path or name matches (repeatable), e.g. `--exclude "*.bin"` |
 | `--file PATH` | pack only this file of `<source_dir>`, a path relative to it (repeatable): the model then holds just the files named; one folder only, not with `--exclude` |
 | `--files-from FILE` | the same for every path listed in FILE, one per line (UTF-8) |
@@ -335,7 +361,7 @@ lists them (files of a removed model) and the blobs no model needs (the next `pa
 them):
 
 ```
-pack folder V:\packs: 3 model(s), 52 blob(s), 31,204.6 MiB stored
+pack folder V:\packs [Cold storage]: 3 model(s), 52 blob(s), 31,204.6 MiB stored
   14,525.8 MiB ->  9,638.1 MiB   66.35%  Qwen/Qwen2.5-7B
   14,525.8 MiB ->  4,380.2 MiB   30.15%    Qwen/Qwen2.5-7B-Instruct
   14,525.8 MiB ->  9,640.0 MiB   66.37%  Qwen/Qwen2.5-Coder-7B
@@ -366,8 +392,8 @@ fault, its file's SHA-256 and how many lost files storing that original again wo
 how to give a lost file up (`remove <pack> MODEL --file PATH`). With `--json` it is one `damage` event (`faults`, each
 with `intact` if its stored bytes are intact and only do not rebuild here; `lost`, `models`, `affected`, `heal`, `manifests`). `--file PATH` (repeatable, with one model named) checks only
 those files of it, their paths as the pack lists them. Prints `ALL VERIFIED (<n> files)` or each failure with its
-cause, and exits with a non-zero code on any failure, and also when it verified nothing (no pack there, or no models
-in it). A missing or damaged blob, and a manifest that cannot be read or holds an unsafe path or name, are reported
+cause, and exits with a non-zero code on any failure, and also when there is no pack to verify; a pack with no models
+has nothing wrong with it, and says so. A missing or damaged blob, and a manifest that cannot be read or holds an unsafe path or name, are reported
 like any other failure; the rest is still checked. Run it after copying a pack and from time to time on cold storage.
 
 ## 5. `restore`
@@ -637,6 +663,21 @@ pack 用來存放模型。每個檔案只存一份，稱為 *blob*，以原始�
 指令以路徑指定 pack（資料夾或 `.oczip`），以 pack 中的名稱指定模型（`Qwen/Qwen2.5-7B`；用它 manifest 的檔名
 `Qwen__Qwen2.5-7B` 也可以）。
 
+pack 資料夾會在第一次打包進去時產生，也可以先用 `init` 建立。它可以有名稱，名稱只用來顯示：
+
+```bash
+python -I tools/llm_archive.py init <資料夾> [--name 名稱]
+python -I tools/llm_archive.py name <pack_folder> (--to 名稱 | --none)
+```
+
+`init` 接受尚不存在的資料夾或空資料夾。系統留在資料夾裡的東西不算內容（`Thumbs.db`、`ehthumbs.db`、`desktop.ini`、`.DS_Store`、
+`.directory`、`$RECYCLE.BIN`、`System Volume Information`、`lost+found`、`.Spotlight-V100`、`.fseventsd`、`.Trashes`、`.Trash-*`），
+`_kit/` 也不算；`pack` 依同一條規則。有其他內容的資料夾一律拒絕，pack 資料夾內的任何資料夾也一樣：pack 資料夾底下的一切都算那個
+pack 的，所以 pack 不能巢狀。對已經是 pack 資料夾的位置，`init` 什麼都不改並回報成功，腳本可以重複執行；但不能這樣改名，改名要用 `name`。
+名稱最多 100 個字元，只能一行。沒有名稱時，pack 以 id 的前 8 個字元顯示（`[f5bd6001]`）。id 是建立 pack 時產生的亂數，不是內容的雜湊，
+否則每次修改都會變。`list` 會在第一行顯示名稱或短 id。pack 檔是唯讀的，所以一直保有建立時的名稱：寫入時用 `pack --pack-name`
+指定，或由 `export` 帶上 pack 資料夾的名稱。
+
 ## 典型流程
 
 ```bash
@@ -721,12 +762,14 @@ pack 檔）會開成**模型清單**：列出每個模型的打包時間、檔�
 灰色列。點清單的空白處，或在清單上按 Esc，就取消選取。在路徑列或過濾框裡按 Ctrl+A，則是全選該欄的文字。
 
 按鈕列最左邊會標出目前所在的位置，用的是右上色標的字與顏色：**Folder**、**Pack folder**、**Pack file** 或 **Model**（pack 檔
-裡的模型會再加註 `in pack file`）。按鈕（與右鍵選單）依所在位置而不同。**↻ Refresh**、**+ Pack in** 與 **+ Add file** 隨時可按
+裡的模型會再加註 `in pack file`）。在 pack 或模型裡，路徑旁的欄位顯示 pack 的名稱，沒有名稱時以灰字顯示短 id，視窗標題結尾也會帶上。在 pack 資料夾裡，直接在該欄位輸入，再按旁邊的 **✎ Rename pack** 或 Enter 即可修改（清空就是不命名；按 Esc 還原）。按鈕（與右鍵選單）依所在位置而不同。
+**↻ Refresh**、**+ Pack in**、**+ Add file**、**+ Turn folder into pack** 與 **+ New pack folder** 作用在目前位置，隨時可按
 （限於可以修改的位置）；其他按鈕都作用在選取的項目上，所以沒有選取時會停用（Rename 要剛好選一列）：
 
-- **在一般資料夾：** **+ Pack to** 把選取的資料夾，或這個資料夾中選取的檔案（這些檔案自成一個模型；只選一個檔案時，預設以檔名
+- **在一般資料夾：** **+ Turn folder into pack** 把目前資料夾變成 pack，條件是它是空的（見[上文](#pack-的兩種形態)），然後開啟它。
+  **+ New pack folder** 詢問資料夾名稱與（可不填的）pack 名稱，在目前資料夾裡建立 pack 並開啟它。**+ Pack to** 把選取的資料夾，或這個資料夾中選取的檔案（這些檔案自成一個模型；只選一個檔案時，預設以檔名
   命名），壓縮進你指定的 pack 資料夾（下次壓縮會記住），或壓成一個新的 pack 檔（`.oczip`）；pack 資料夾裡已有同名模型時，經你
-  同意才會取代。對話框裡有 **Δ Code quantized weights against the weights they came from**，每次都預設勾選；不勾就是 `--no-quant`（第 2 節），
+  同意才會取代。如果因此建立了新的 pack，可以在這裡替它命名。對話框裡有 **Δ Code quantized weights against the weights they came from**，每次都預設勾選；不勾就是 `--no-quant`（第 2 節），
   **+ Pack in** 與 **⇄ Rebase** 的 Find better bases 底下也一樣。**↻ Refresh** 重新整理。**− Remove** 先詢問，再把選取的項目移到資源回收筒（Linux 上是桌面的垃圾桶），絕不會
   永久刪除：資源回收筒收不下的（網路磁碟或卸除式磁碟、設定成直接刪除的資源回收筒，或空間不夠時）一律拒絕，真要刪除請自己動手。
   在 pack 資料夾內部的資料夾（`blobs/`、`models/`）裡，Pack to 與 Remove 會停用：pack 只能在它自己的畫面裡修改。
@@ -769,7 +812,7 @@ pack 檔）會開成**模型清單**：列出每個模型的打包時間、檔�
 視窗會顯示提示，因為此時百分比會停住好幾分鐘。執行的優先權是「低於標準」（Linux 上為
 `nice` 10）：閒置的核心都會用上，你同時在用電腦時則讓給你的程式。差異基底一律自動選擇；`--base`、`rebase`
 等其他選項只能用命令列。介面文字只有英文與符號，與系統語系無關；Tk 沒有 Xft 的環境（Linux 的可攜版）畫不出這些符號，所以那裡的文字全用 ASCII。從放在 pack 資料夾裡的可攜版（`_kit`，見「可攜版」）啟動時，會直接開啟那個 pack。視窗標題會顯示它自己和 `llm_archive.py` 的版本，各附 build（該檔案最後一次變更的
-commit 日期與編號；與該 commit 不同時加註 `edited`），例如 `OverCompressing GUI 0.6 (2026-11-01 1a2b3c4) · CLI 0.6 (2026-11-01 1a2b3c4)`。
+commit 日期與編號；與該 commit 不同時加註 `edited`），例如 `OverCompressing GUI 0.7 (2026-11-01 1a2b3c4) · CLI 0.7 (2026-11-01 1a2b3c4)`。
 回報問題時請附上這兩個版本。`llm_archive.py --version` 會印出後者。
 
 ## 1. `pack`：把資料夾打包進 pack
@@ -796,6 +839,7 @@ python -I tools/llm_archive.py pack <來源資料夾> [<來源資料夾> ...] <p
 | `--replace` | 用這些檔案取代 pack 資料夾中同名的模型（沒有 `--replace` 或 `--add` 時，pack 資料夾中已有的名稱會在寫入任何東西之前被拒絕） |
 | `--add` | 把這些檔案加入 pack 資料夾中同名的模型：同路徑的檔案被取代，其餘保留（例如補回誤刪的一個檔：`--add --file <路徑>`）；搭配 `--base` 或 `--no-base` 時，這個選擇只屬於這些檔案，不屬於整個模型 |
 | `--revision 文字` | 寫進 manifest 的備註，例如你下載的上游 commit |
+| `--pack-name 名稱` | 這次打包建立新的 pack（資料夾或檔案）時，它的名稱（見 [Pack 的兩種形態](#pack-的兩種形態)）；pack 資料夾已經存在時拒絕 |
 | `--exclude 樣式` | 略過路徑或檔名符合的檔案（可重複指定），例如 `--exclude "*.bin"` |
 | `--file 路徑` | 只打包 `<來源資料夾>` 裡的這個檔案，路徑相對於該資料夾（可重複指定）：模型就只包含指定的檔案；限一個資料夾，不可與 `--exclude` 併用 |
 | `--files-from 檔案` | 同上，對檔案裡列出的每個路徑，一行一個（UTF-8） |
@@ -916,7 +960,7 @@ blob 壞了而遺失」。不指定模型時驗證 pack 中的所有模型，並
 （`remove <pack> 模型 --file 路徑`）。加上 `--json` 時，報告是一個 `damage` 事件（`faults`，儲存的資料完好、只是在這裡重建不出來時其 `intact` 為真；`lost`、`models`、`affected`、
 `heal`、`manifests`）。`--file 路徑`（可重複，須指定一個模型）只驗證該模型的這些
 檔案，路徑照 pack 列出的寫法。結果為 `ALL VERIFIED (<n> files)`，
-或逐一列出失敗原因；有任何失敗時結束碼不為 0；什麼都沒驗證到時（那裡沒有 pack，或裡面沒有模型）結束碼也不為 0。缺少或損毀的
+或逐一列出失敗原因；有任何失敗時結束碼不為 0；那裡沒有 pack 時結束碼也不為 0；pack 裡沒有模型並不算有問題，會直接說明。缺少或損毀的
 blob，以及無法讀取、或含有不安全路徑或名稱的 manifest，都會像其他失敗一樣列出，其餘項目照常檢查。建議在複製 pack 後、以及
 冷儲存定期執行。
 

@@ -17,11 +17,11 @@ own Python, packages and docs, in one folder) can travel with each pack, so it c
 把微調模型存成「和 base 的差異」，並由量化前的浮點權重重建量化 GGUF。可攜版工具（自帶 Python、套件與文件的單一資料夾）可以跟著 pack 一起保存，沒有網路也能還原。
 
 > [!IMPORTANT]
-> **This version cannot read packs of the previous one.** CLI 0.6 (format 5) refuses packs of format 4 (CLI 0.5 and
+> **This version cannot read packs of the previous one.** CLI 0.6 and later (format 5) refuse packs of format 4 (CLI 0.5 and
 > earlier), and there is no converter. To change versions, restore your models with the old tool, then pack them again
 > with the new one. **[What changed and how to move](docs/format-5.md)**
 >
-> **此版本與上一版不相容。** CLI 0.6（format 5）不讀 format 4 的 pack（CLI 0.5 及更早版本），也沒有轉換工具。要換版，必須先用舊版工具解壓還原，再用新版重新打包。
+> **此版本與上一版不相容。** CLI 0.6 及之後的版本（format 5）不讀 format 4 的 pack（CLI 0.5 及更早版本），也沒有轉換工具。要換版，必須先用舊版工具解壓還原，再用新版重新打包。
 
 ---
 
@@ -111,6 +111,9 @@ Two forms of a pack:
 - **Pack file (`.oczip`, the same tree in one ZIP file): for cold storage.** Made by `pack` or `export`, written once;
   copy it, shelve it. `list`, `verify` and `restore` read it as it is.
 
+A pack folder appears when you first pack into it, or beforehand with `init <folder> [--name NAME]`. The name is only
+ever shown; without one, a pack is shown by a short id.
+
 → **[Usage](docs/usage.md)** (中英對照)
 
 ## The window / 視窗
@@ -156,7 +159,7 @@ without this tool: **[tools/ARCHIVE_FORMAT.md](tools/ARCHIVE_FORMAT.md)**.
 ## Repository layout / 目錄結構
 
 ```
-tools/llm_archive.py       the archiver (pack / list / verify / restore / remove / rename / rebase / export)
+tools/llm_archive.py       the archiver (init / pack / list / verify / restore / remove / rename / name / rebase / export)
 tools/llm_archive_gui.py   a small window (Tkinter): a pack as the list of its models, and the actions above
 tools/ARCHIVE_FORMAT.md    format specification
 tools/compare_tensors.py   how well a fine-tune lines up with a base

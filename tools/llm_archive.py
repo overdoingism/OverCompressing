@@ -12,7 +12,9 @@ ARCHIVE_FORMAT.md.
     python -I llm_archive.py restore <pack> MODEL <dest_dir> [--overwrite] [--file PATH ...] [--flat]
     python -I llm_archive.py remove  <pack_folder> MODEL ... [--file PATH ...] [--dry-run]
     python -I llm_archive.py rename  <pack_folder> MODEL NEW_NAME | <pack_folder> MODEL --file PATH NEW_PATH
-    python -I llm_archive.py rebase  <pack_folder> (MODEL ... | --all) [--base MODEL | --no-base] [--dry-run]
+    python -I llm_archive.py init    <folder> [--name NAME]
+    python -I llm_archive.py name    <pack_folder> (--to NAME | --none)
+    python -I llm_archive.py rebase <pack_folder> (MODEL ... | --all) [--base MODEL | --no-base] [--dry-run]
     python -I llm_archive.py export  <pack> <new.oczip> [MODEL ...] [--verify | --no-verify] [--delete]
 
 A pack holds models. It is a folder (a pack folder: ocpack.json, models/, blobs/) or the same tree in one ZIP file (a
@@ -56,6 +58,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import zipfile
 import zlib
 from collections import deque
@@ -65,11 +68,14 @@ from fractions import Fraction
 import numpy as np
 import zstandard
 
-VERSION = "0.6"  # of this command-line tool (the window has its own); raised by hand for changes people see
+VERSION = "0.7"  # of this command-line tool (the window has its own); raised by hand for changes people see
 FORMAT_VERSION = 5
 SKIP_DIRS = {".git", ".cache", "__MACOSX"}  # bookkeeping of git / download tools / macOS unzipping: not model files
 SKIP_FILES = {".hf_files.json", "thumbs.db", "desktop.ini", ".ds_store"}  # compared ignoring case: staging metadata of
 # earlier versions of this tool, and the folder-view caches Windows and macOS leave everywhere
+LEFT_BY_SYSTEMS = {"thumbs.db", "ehthumbs.db", "desktop.ini", ".ds_store", ".directory", "$recycle.bin", "lost+found",
+                   "system volume information", ".spotlight-v100", ".fseventsd", ".trashes"}  # compared ignoring case: what
+# systems and file managers leave in a folder or at the top of a drive; a folder holding only these counts as empty
 MAGIC = b"OCZ5"
 CODEC_RAW, CODEC_PLANES, CODEC_ZSTD, CODEC_ANS16, CODEC_QUANT, CODEC_RANK1 = 0, 1, 2, 3, 4, 5
 CODEC_NAMES = ["raw", "planes", "zstd", "ans16", "quant", "rank1"]
@@ -1980,6 +1986,7 @@ MARKER = "ocpack.json"
 # export carries it, and the window started from it opens the pack.
 MODELS, BLOBS, KIT = "models", "blobs", "_kit"
 MARKER_JSON = {"format": PACK_FORMAT, "format_version": FORMAT_VERSION}
+PACK_NAME_MAX, SHORT_ID = 100, 8  # characters: of a pack's name; of its id, where it is shown for want of a name
 MAX_MANIFEST = 256 << 20
 
 
@@ -2147,11 +2154,11 @@ class NewFilePack:
 
     kind = "pack file"
 
-    def __init__(self, f, root):
+    def __init__(self, f, root, name=None):
         self.f, self.root, self.temp_path = f, root, f.temp_path
         self.zip = zipfile.ZipFile(f, "w", allowZip64=True)
         self.spans, self.members = {}, {}  # blob sha -> (start, size); other member -> its bytes
-        self.put(MARKER, json.dumps(MARKER_JSON).encode())
+        self.put(MARKER, json.dumps(new_marker(name)).encode())
 
     def put(self, rel, data):
         info = zipfile.ZipInfo(rel, time.localtime()[:6])
@@ -2209,6 +2216,42 @@ def marker_problem(p):
     if marker.get("format_version") != FORMAT_VERSION:
         return f"a pack of format version {marker.get('format_version')!r}: this tool reads version {FORMAT_VERSION}"
     return None
+
+
+def pack_name_problem(name):
+    """None if `name` can name a pack, else why not. It is only ever shown, so any text will do that shows as one line."""
+    if not isinstance(name, str) or not name:
+        return "a pack name cannot be empty"
+    if name != name.strip():
+        return f"bad pack name {name!r}: it may not start or end with a space"
+    if len(name) > PACK_NAME_MAX:
+        return f"bad pack name {name!r}: at most {PACK_NAME_MAX} characters"
+    if any(unicodedata.category(ch)[0] == "C" or unicodedata.category(ch) in ("Zl", "Zp") for ch in name):
+        return f"bad pack name {name!r}: it may not hold control characters or line breaks"
+    return None
+
+
+def new_marker(name=None):
+    """What a new pack's ocpack.json holds: its name, if it has one, and its id, made once. The id is random, not a hash
+    of the pack: that would change with every change, and be the same for every empty pack."""
+    return {**MARKER_JSON, **({"name": name} if name else {}), "id": secrets.token_hex(16)}
+
+
+def marker_identity(marker):
+    """The name and id in an ocpack.json, and the label a pack is shown by: its name, else the start of its id. They
+    matter only to the eye, so one that cannot be shown is taken as not there, and the pack still opens."""
+    name, pack_id = marker.get("name"), marker.get("id")
+    name = None if pack_name_problem(name) else name
+    pack_id = pack_id if isinstance(pack_id, str) and re.fullmatch("[0-9a-f]{32}", pack_id) else None
+    return {"name": name, "id": pack_id, "label": name or (pack_id[:SHORT_ID] if pack_id else None)}
+
+
+def pack_identity(p):
+    try:
+        marker = strict_json(p.read(MARKER, 1 << 16))
+    except (OSError, ValueError):
+        marker = None
+    return marker_identity(marker if isinstance(marker, dict) else {})
 
 
 def close_pack_files():
@@ -2787,12 +2830,21 @@ def store_blob(p, sha, size, fill, replace=False, keep=None, spool=False):
     return stored
 
 
+def write_marker(p, **change):
+    """Write ocpack.json again in one step, with the pack's name and id and the time, and what `change` says. A pack
+    made before packs had ids gets one here."""
+    identity = {**marker_identity(strict_json(p.read(MARKER, 1 << 16))), **change}
+    marker = {**MARKER_JSON, **({"name": identity["name"]} if identity["name"] else {}),
+              "id": identity["id"] or new_marker()["id"], "changed": now()}
+    with SafeTree(p.root).placing(MARKER, replace=True) as f:
+        f.write(json.dumps(marker).encode())
+
+
 def touch_marker(p):
     """Record in ocpack.json when the pack folder last changed. It is the last step of every change, so whatever
     watches that one file (the window does) sees each change once, when it is complete."""
     with contextlib.suppress(OSError, ValueError):
-        with SafeTree(p.root).placing(MARKER, replace=True) as f:
-            f.write(json.dumps({**MARKER_JSON, "changed": now()}).encode())
+        write_marker(p)
 
 
 def write_manifest(p, manifest):
@@ -3326,27 +3378,46 @@ def pack_model(args, p, source, name, paths, manifests, base):
         event="model", name=name, size=total, stored=stored, added=added)
 
 
-def folder_pack_for_writing(root):
-    """The pack folder `root`, locked for this run alone. A folder that does not exist, is empty or holds only _kit
-    becomes one; any other folder that is no pack stops the program, as does one inside a pack folder."""
+def is_pack_folder(root):
     root = os.path.abspath(root)
     inside = pack_folder_of(root)
-    if inside and os.path.normcase(inside) != os.path.normcase(os.path.realpath(root)):
-        sys.exit(f"{root} is inside the pack folder {inside}: pack into that pack folder, or one of its own")
-    if not inside:
-        if os.path.exists(root):
-            if not os.path.isdir(root):
-                sys.exit(f"{root} is not a folder")
-            others = sorted(set(os.listdir(root)) - {KIT, LOCK_NAME})
-            if others:
-                sys.exit(f"{root} is not a pack folder (no {MARKER} in it) and holds other files, e.g. {others[0]}: "
-                         "give a new or empty folder")
+    return inside is not None and os.path.normcase(inside) == os.path.normcase(os.path.realpath(root))
+
+
+def new_pack_problem(root):
+    """None if the folder `root` can become a pack folder, else why not. It must not exist, or hold nothing but _kit and
+    what systems leave in folders; and no pack folder may be above it, as all that is below one counts as that pack's."""
+    root = os.path.abspath(root)
+    if is_pack_folder(root):
+        return f"{root} is a pack folder already"
+    inside = pack_folder_of(root)
+    if inside:
+        return f"{root} is inside the pack folder {inside}: pack into that pack folder, or one of its own"
+    if os.path.exists(root):
+        if not os.path.isdir(root):
+            return f"{root} is not a folder"
+        others = sorted(n for n in os.listdir(root) if n not in (KIT, LOCK_NAME) and n.casefold() not in LEFT_BY_SYSTEMS
+                        and not n.casefold().startswith(".trash-"))
+        if others:
+            return (f"{root} is not a pack folder (no {MARKER} in it) and holds other files, e.g. {others[0]}: "
+                    "give a new or empty folder")
+    return None
+
+
+def folder_pack_for_writing(root, name=None):
+    """The pack folder `root`, locked for this run alone. A folder that new_pack_problem allows becomes one (called
+    `name`, if given); any other folder that is no pack stops the program, as does one inside a pack folder."""
+    root = os.path.abspath(root)
+    if not is_pack_folder(root):
+        problem = new_pack_problem(root)
+        if problem:
+            sys.exit(problem)
         os.makedirs(root, exist_ok=True)
     lock_archive(root, exclusive=True)
     p = FolderPack(root)
     if not os.path.exists(p.full(MARKER)):
         with contextlib.suppress(FileExistsError), SafeTree(root).placing(MARKER, replace=False) as f:
-            f.write(json.dumps({**MARKER_JSON, "changed": now()}).encode())
+            f.write(json.dumps({**new_marker(name), "changed": now()}).encode())
     problem = marker_problem(p)
     if problem:
         sys.exit(f"{root}: {problem}")
@@ -3354,7 +3425,9 @@ def folder_pack_for_writing(root):
 
 
 def pack_into_folder(args, root, plans):
-    p = folder_pack_for_writing(root)
+    if args.pack_name and is_pack_folder(root):
+        sys.exit(f"--pack-name names a new pack, and {root} is a pack folder already: give it a name with the command name")
+    p = folder_pack_for_writing(root, args.pack_name)
     manifests = all_manifests(p)
     planned = {name for _, name, _ in plans}
     base = args.base if not args.base or args.base in planned else model_named(manifests, args.base, p)
@@ -3419,7 +3492,7 @@ def pack_into_new_file(args, target, plans):
     os.makedirs(folder, exist_ok=True)
     say(f"packing into a new pack file: {target}")
     with SafeTree(folder).placing(os.path.basename(target), replace=False) as f:
-        p, manifests = NewFilePack(f, target), {}
+        p, manifests = NewFilePack(f, target, args.pack_name), {}
         try:
             for source, name, paths in plans:
                 pack_model(args, p, source, name, paths, manifests, args.base if args.base != name else None)
@@ -3441,6 +3514,9 @@ def cmd_pack(args):
         sys.exit("--name and --file are for one folder at a time")
     if args.files and args.exclude:
         sys.exit("use --file or --exclude, not both")
+    problem = args.pack_name is not None and pack_name_problem(args.pack_name)
+    if problem:
+        sys.exit(problem)
     new_file = is_oczip(target)
     if new_file and os.path.lexists(target):
         fail("exists", f"{target} exists already: a pack file is written whole, never added to. To add a model to it, "
@@ -4403,8 +4479,8 @@ def cmd_verify(args):
     problems = []
     manifests = all_manifests(p, problems)
     names = list(dict.fromkeys(model_named(manifests, n, p) for n in args.models)) or sorted(manifests)
-    if not names and not problems:
-        sys.exit(f"no models in {p.root}: nothing verified")
+    if not names and not problems:  # nothing is at fault: an empty pack is where a pack starts
+        return say(f"no models in {p.root}: nothing to verify", event="summary", checked=0)
     if args.files:
         if len(args.models) != 1:
             sys.exit("--file: name the one model these files are of")
@@ -4530,7 +4606,7 @@ def pack_summary(p, manifests):
         except (OSError, ValueError):
             return 0
 
-    return {"pack": p.root, "kind": p.kind, "models": list(models.values()),
+    return {"pack": p.root, "kind": p.kind, **pack_identity(p), "models": list(models.values()),
             "kept": [{"sha256": sha, "size": size(sha), "model": names.get(sha, (None, None))[0],
                       "path": names.get(sha, (None, None))[1], "needed_by": users[sha]} for sha in kept],
             "unused": {"blobs": len(unused), "size": sum(size(sha) for sha in unused)},
@@ -4564,7 +4640,8 @@ def cmd_list(args):
             say(f"  {f['path']:<40} {stored_text(f['size'], f['stored'])}  {f['method'] or '?':<18} {note}".rstrip())
         return
     s = pack_summary(p, manifests)
-    head = (f"{s['kind']} {s['pack']}: {len(s['models'])} model(s), {s['blobs']} blob(s), {human(s['stored'])} stored")
+    head = (f"{s['kind']} {s['pack']}{f' [{s["label"]}]' if s['label'] else ''}: {len(s['models'])} model(s), "
+            f"{s['blobs']} blob(s), {human(s['stored'])} stored")
     if JSON_OUT:
         return say(head, event="pack", **s)
     say(head)
@@ -4725,6 +4802,40 @@ def cmd_rename(args):
         tree.remove(manifest_rel(old))
     touch_marker(p)
     say(f"renamed {old} to {new}", event="summary", old=old, new=new)
+
+
+def cmd_init(args):
+    """Make a folder a pack folder with no model in it yet. A pack folder that is there already is left as it is, so
+    that this can be run again."""
+    if is_oczip(args.folder):
+        sys.exit(f"{args.folder}: a pack file is written whole, by pack or export; give a folder")
+    problem = args.name is not None and pack_name_problem(args.name)
+    if problem:
+        sys.exit(problem)
+    root = os.path.abspath(args.folder)
+    made = not is_pack_folder(root)
+    if not made:
+        p = folder_for_change(root, exclusive=False)
+        identity = pack_identity(p)
+        if args.name is not None and args.name != identity["name"]:
+            sys.exit(f"{root} is a pack folder already: give it a name with the command name")
+    else:
+        p = folder_pack_for_writing(root, args.name)
+        identity = pack_identity(p)
+    shown = f" [{identity['label']}]" if identity["label"] else ""
+    say(f"made {root} a pack folder{shown}" if made else f"{root} is a pack folder already{shown}", event="summary",
+        pack=root, made=made, **identity)
+
+
+def cmd_name(args):
+    p = folder_for_change(args.pack)
+    problem = args.to is not None and pack_name_problem(args.to)
+    if problem:
+        sys.exit(problem)
+    write_marker(p, name=args.to)
+    identity = pack_identity(p)
+    say(f"named the pack {identity['label']}" if args.to else f"the pack has no name now: shown as {identity['label']}",
+        event="summary", pack=p.root, **identity)
 
 
 # ----------------------------------------------------------------------------------------------- rebase
@@ -5325,8 +5436,23 @@ def main():
                       help="store tensors as deltas against this model (of the pack, or packed now before the others) "
                            "(default: each file picks the model that compresses it best, by sampling)")
     base.add_argument("--no-base", action="store_true", help="store every file without a delta base")
+    s.add_argument("--pack-name", metavar="NAME", help="if this makes a new pack: its name, only ever shown (without one, "
+                                                       "it is shown by a short hash)")
     add_codec_options(s)
     s.set_defaults(func=cmd_pack)
+
+    s = sub.add_parser("init", parents=[common], help="make a folder a pack folder, with no model in it yet")
+    s.add_argument("folder", help="a new folder, or an empty one (what systems leave in folders, such as Thumbs.db or "
+                                  ".DS_Store, does not count), with no pack folder above it")
+    s.add_argument("--name", help="the pack's name, only ever shown (without one, it is shown by a short hash)")
+    s.set_defaults(func=cmd_init)
+
+    s = sub.add_parser("name", parents=[common], help="give a pack folder another name, or none")
+    s.add_argument("pack", metavar="pack_folder")
+    to = s.add_mutually_exclusive_group(required=True)
+    to.add_argument("--to", metavar="NAME", help="the pack's new name")
+    to.add_argument("--none", action="store_true", help="no name: the pack is shown by a short hash")
+    s.set_defaults(func=cmd_name)
 
     s = sub.add_parser("list", parents=[common], help="show the models of a pack as a tree of what needs what, or "
                                                       "the files of one model")
