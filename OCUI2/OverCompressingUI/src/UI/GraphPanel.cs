@@ -61,6 +61,13 @@ public partial class GraphPanel : PanelContainer
             b.Append($"{Esc(T.Count(r.Files ?? 0, "file"))}  ·  {Esc(T.SizeText(r.Size))} → {Esc(T.SizeText(r.Stored))}  {Dim("(" + r.Ratio + ")")}\n");
             if (r.Packed is not null)
                 b.Append($"{Dim("packed")} {r.Packed.Value:yyyy-MM-dd HH:mm}\n");
+            if (r.Weights is { WeightBytes: > 0 } w)
+            {
+                b.Append(Head(T.Get("graph_weights")));
+                var c = w.Class == WeightClass.Other ? Ui.BitsUnknown : Ui.BitsColor(w.Bits ?? 2);
+                b.Append($"[color=#{c.ToHtml(false)}]●[/color] {Esc(w.Container)}\n");
+                b.Append($"{Dim(w.Shares())}\n");
+            }
             if (m is not null)
             {
                 var choice = m.BaseChoice switch { "forced" => "bases set by hand (--base)", "none" => "no bases (--no-base)", _ => "bases chosen automatically" };

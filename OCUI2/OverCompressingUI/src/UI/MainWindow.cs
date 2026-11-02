@@ -27,11 +27,12 @@ public partial class MainWindow : Control
     private static readonly string[] Fitted = { "type", "needs" };  // as wide as what they hold, as the name is
     private static readonly Dictionary<string, string?[]> Buttons = new()
     {
-        ["folder"] = new[] { "pack_to", null, "refresh", "remove" },
+        ["folder"] = new[] { "pack_to", "turn_pack", "new_pack", null, "refresh", "remove" },  // the owner's order
         ["pack"] = new[] { "pack_in", "save", null, "extract", "verify", null, "rebase", null, "remove", "rename" },
         ["model"] = new[] { "add_file", null, "extract", "verify", null, "rebase", null, "remove", "rename" },
     };
     private const double WatchSeconds = 5;
+    private const int NoteWidth = 28;  // characters: the field beside the path that shows a pack's name; the whole on hover
     private const string Below = "\0below";
 
     // ------------------------------------------------------------------------------------------ state
@@ -66,13 +67,21 @@ public partial class MainWindow : Control
     private float _dragY;
     private Action? _done;
     private List<Row> _lastRows = new();
+    private PackIdentity? _identity;  // of the pack shown (or the pack of the model shown); null elsewhere
+    private string? _identityPath;  // the pack it was read for, and its stamp then: read again when either differs
+    private (long mtime, long size)? _identityStamp;
+    private string _nameHeld = "", _nameHint = "";  // the pack's name; what the field shows for want of one (the short id)
+    private bool _nameQuiet;  // the field is being set by the window, not typed in
 
     // ------------------------------------------------------------------------------------------ nodes
     private Backdrop _backdrop = null!;
     private Button _up = null!;
     private LineEdit _path = null!;
+    private LineEdit _nameEdit = null!;  // the pack's name, edited here; or in gray its short id, for want of one
+    private Button _nameButton = null!;  // ✎ Rename pack
     private HBoxContainer _bar = null!;
     private Control _modeSlot = null!;
+    private float _chipWidth;  // the mode chip's width, the same in every place, so the buttons start where they did
     private Label _modeNote = null!;
     private readonly Dictionary<string, Button> _buttons = new();
     private readonly List<Control> _barItems = new();
@@ -102,9 +111,12 @@ public partial class MainWindow : Control
         GetTree().AutoAcceptQuit = false;
         var window = GetWindow();
         // The display's scale: Windows reports it as a DPI (96 = 100 %, 168 = 175 %); screen_get_scale is 1 there.
-        Ui.Scale = Mathf.Max(Mathf.Max(DisplayServer.ScreenGetScale(), DisplayServer.ScreenGetDpi() / 96f), 1f);
-        if (DevHooks.Args().TryGetValue("scale", out var forced) && float.TryParse(forced, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var fs))
-            Ui.Scale = fs;
+        var dev = DevHooks.Args();
+        if (dev.TryGetValue("scale", out var forced) && float.TryParse(forced, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var fs))
+            _scaleForced = fs;
+        if (dev.TryGetValue("screen", out var fakeScreen) && fakeScreen.Split('x') is { Length: 2 } wh && int.TryParse(wh[0], out var fw) && int.TryParse(wh[1], out var fh))
+            _screenForced = new Vector2I(fw, fh);  // a smaller display, pretended, to check the fitting
+        Ui.Scale = _scaleForced ?? ScaleOf(DisplayServer.WindowGetCurrentScreen());
         window.ContentScaleFactor = Ui.Scale;  // every canvas unit becomes Scale pixels: layout and fonts scale together
         Ui.BuildTheme();
         window.Theme = Ui.Theme;
@@ -112,11 +124,11 @@ public partial class MainWindow : Control
         _settings = Settings.Load(ProjectSettings.GlobalizePath("user://settings.json"));
         Ui.Effects = _settings.Effects;
         Fx.Sfx.Enabled = _settings.Sounds;
-        var size = new Vector2I(_settings.WindowWidth > 0 ? _settings.WindowWidth : (int)(1200 * Ui.Scale), _settings.WindowHeight > 0 ? _settings.WindowHeight : (int)(780 * Ui.Scale));
-        window.Size = size;
-        window.MinSize = new Vector2I((int)(760 * Ui.Scale), (int)(460 * Ui.Scale));
-        var screen = DisplayServer.ScreenGetUsableRect();
-        window.Position = screen.Position + (screen.Size - size) / 2;
+        // the size kept is in canvas units, so it is the same size to the eye at another scale; an older file kept
+        // pixels, taken as at this scale. Either way the window is fitted to the display it opens on.
+        float was = _settings.WindowScale > 0 ? 1f : Ui.Scale;
+        _logicalSize = new Vector2(_settings.WindowWidth > 0 ? _settings.WindowWidth / was : 1200, _settings.WindowHeight > 0 ? _settings.WindowHeight / was : 780);
+        FitToScreen(center: true);
         if (_settings.WindowMaximized)
             window.Mode = Window.ModeEnum.Maximized;
         window.Title = "OverCompressing";
@@ -126,6 +138,82 @@ public partial class MainWindow : Control
         Build();
         PlayIntro();
         _ = Startup();
+    }
+
+    // ------------------------------------------------------------------------------------------ the display
+    private float? _scaleForced;  // dev hook --scale
+    private Vector2I? _screenForced;  // dev hook --screen=WxH
+    private Vector2 _logicalSize;  // the window's size in canvas units: what is kept, and what a new scale is applied to
+    private double _displayLooked;
+
+    /// <summary>The scale of a display: its DPI over 96 (Windows), or its scale (macOS); never under 1.</summary>
+    private static float ScaleOf(int screen)
+        => Mathf.Max(Mathf.Max(DisplayServer.ScreenGetScale(screen), DisplayServer.ScreenGetDpi(screen) / 96f), 1f);
+
+    /// <summary>The part of the display the window is on that windows may use (the taskbar left out).</summary>
+    private Rect2I Usable()
+    {
+        var r = DisplayServer.ScreenGetUsableRect(DisplayServer.WindowGetCurrentScreen());
+        return _screenForced is { } s ? new Rect2I(r.Position, new Vector2I(Mathf.Min(s.X, r.Size.X), Mathf.Min(s.Y, r.Size.Y))) : r;
+    }
+
+    /// <summary>Size the window to its logical size at the display's scale, no larger than the display it is on, and
+    /// keep it on that display (centered at the start): a size kept from a larger display, or from a lower scale, must
+    /// not run off the screen. The least size shrinks to the display too.</summary>
+    private void FitToScreen(bool center)
+    {
+        var window = GetWindow();
+        var usable = Usable();
+        var least = new Vector2I(Mathf.Min((int)(760 * Ui.Scale), usable.Size.X), Mathf.Min((int)(460 * Ui.Scale), usable.Size.Y));
+        var wanted = new Vector2I((int)(_logicalSize.X * Ui.Scale), (int)(_logicalSize.Y * Ui.Scale));
+        var size = new Vector2I(Mathf.Clamp(wanted.X, least.X, usable.Size.X), Mathf.Clamp(wanted.Y, least.Y, usable.Size.Y));
+        window.MinSize = least;
+        if (window.Size != size)
+            window.Size = size;
+        var pos = center ? usable.Position + (usable.Size - size) / 2 : window.Position;
+        pos = new Vector2I(Mathf.Clamp(pos.X, usable.Position.X, Mathf.Max(usable.Position.X, usable.End.X - size.X)),
+            Mathf.Clamp(pos.Y, usable.Position.Y, Mathf.Max(usable.Position.Y, usable.End.Y - size.Y)));
+        if (center || window.Position != pos)
+            window.Position = pos;
+    }
+
+    /// <summary>Once a second: the display's scale may have changed (the window moved to another display, or the
+    /// system's scaling or resolution changed underneath): then everything is drawn at the new scale, at the same size
+    /// to the eye, and the window is kept within the display.</summary>
+    private void WatchDisplay()
+    {
+        var window = GetWindow();
+        if (window.Mode != Window.ModeEnum.Windowed)
+            return;
+        double now = Time.GetTicksMsec() / 1000.0;
+        if (now - _displayLooked < 1.0)
+            return;
+        _displayLooked = now;
+        float scale = _scaleForced ?? ScaleOf(DisplayServer.WindowGetCurrentScreen());
+        if (Mathf.Abs(scale - Ui.Scale) > 0.01f)
+        {
+            Rescale(scale);
+            return;
+        }
+        _logicalSize = new Vector2(window.Size.X / Ui.Scale, window.Size.Y / Ui.Scale);  // as the user sized it
+        var usable = Usable();
+        if (window.Size.X > usable.Size.X || window.Size.Y > usable.Size.Y)
+            FitToScreen(center: false);
+    }
+
+    /// <summary>Draw everything at another scale: the canvas scale, the cursors and the icons (rendered from SVG at
+    /// the display's scale), the board's cells; the window keeps its size to the eye, fitted to the display.</summary>
+    private void Rescale(float scale)
+    {
+        Ui.Scale = scale;
+        GetWindow().ContentScaleFactor = scale;
+        Icons.Reset();
+        Input.SetCustomMouseCursor(Icons.Cursor(), Input.CursorShape.Arrow, new Vector2(4, 3) * Ui.Scale);
+        Input.SetCustomMouseCursor(Icons.CursorBeam(), Input.CursorShape.Ibeam, new Vector2(16, 16) * Ui.Scale);
+        _backdrop.Rescale();
+        FitToScreen(center: false);
+        if (_place is not null && !(_runner?.Running ?? false) && !_listingNow)
+            Refresh();  // the rows' icons again, at the new scale
     }
 
     private async Task Startup()
@@ -253,6 +341,25 @@ public partial class MainWindow : Control
         _path = Ui.Edit("", "A folder, a pack folder, or a pack file (.oczip)");
         _path.TextSubmitted += _ => GoToText();
         top.AddChild(_path);
+        // the pack's name, beside the path: always there, of one width, so that nothing moves (the owner's rule)
+        _nameEdit = new LineEdit { Alignment = HorizontalAlignment.Center, ContextMenuEnabled = true, Editable = false, SizeFlagsHorizontal = SizeFlags.ShrinkCenter };
+        _nameEdit.CustomMinimumSize = new Vector2(Mathf.Ceil(Ui.Measure("0") * NoteWidth) + Ui.Px(16), 0);
+        _nameEdit.TextSubmitted += text => _ = NamePack();
+        _nameEdit.TextChanged += _ => { if (!_nameQuiet) NameEdited(); };
+        _nameEdit.FocusEntered += () => { if (_nameHint.Length > 0 && _nameEdit.Text == _nameHint) _nameEdit.CallDeferred(LineEdit.MethodName.SelectAll); };
+        _nameEdit.GuiInput += e =>
+        {
+            if (e is InputEventKey { Pressed: true, Keycode: Key.Escape })  // back to what the pack is called
+            {
+                SetNameText(_nameHeld.Length > 0 ? _nameHeld : _nameHint);
+                NameEdited();
+                _nameEdit.AcceptEvent();
+            }
+        };
+        top.AddChild(_nameEdit);
+        _nameButton = Ui.Button(T.Get("name_pack"), () => _ = NamePack());
+        _nameButton.Disabled = true;
+        top.AddChild(_nameButton);
         var settings = Ui.Button(T.Get("settings"), () => _ = SettingsDialog(false));
         settings.TooltipText = T.Get("settings_title");
         top.AddChild(settings);
@@ -275,6 +382,10 @@ public partial class MainWindow : Control
         _commands["rename"] = () => _ = Rename();
         _commands["rebase"] = () => _ = Rebase();
         _commands["refresh"] = () => Refresh();
+        _commands["new_pack"] = () => _ = NewPack();
+        _commands["turn_pack"] = () => _ = TurnPack();
+        // the mode chip's width: the widest of its words, so the buttons start at the same place in every view
+        _chipWidth = Ui.Legend.Max(l => Ui.Measure($" {l.label} ", Ui.Display, Ui.SmallFontSize - 2)) + Ui.Px(7) * 2 + Ui.Px(4);
 
         // the filter, the views, the keys
         var tools = Ui.HBox(6);
@@ -452,8 +563,8 @@ public partial class MainWindow : Control
             _legendWord.AddThemeStyleboxOverride("normal", _legendBox);
             _legendWord.MouseFilter = MouseFilterEnum.Stop;
             _legendWord.MouseDefaultCursorShape = CursorShape.Help;
-            _legendWord.MouseEntered += () => { _legendHot = true; _legendWord.AddThemeColorOverride("font_color", Color.Color8(255, 255, 255)); Fx.Sfx.Tick(); ShowLegend(); };
-            _legendWord.MouseExited += () => { _legendHot = false; _legendWord.AddThemeColorOverride("font_color", Ui.Neon); HideLegendSoon(); };
+            _legendWord.MouseEntered += () => { _legendHot = true; Fx.Sfx.Tick(); ShowLegend(); };
+            _legendWord.MouseExited += () => { _legendHot = false; HideLegendSoon(); };
             _legend.AddChild(_legendWord);
             _legend.SizeFlagsHorizontal = SizeFlags.ExpandFill;
         }
@@ -478,25 +589,40 @@ public partial class MainWindow : Control
         _legendBox.BorderColor = new Color(c, _legendHot ? 0.95f : 0.45f);
         _legendBox.BgColor = new Color(c, _legendHot ? 0.14f : 0.04f);
         _legendBox.ShadowColor = new Color(c, _legendHot ? 0.3f : 0.12f);
+        // the word in the same hue as its frame (the owner's wish), white under the mouse
+        _legendWord.AddThemeColorOverride("font_color", _legendHot ? Color.Color8(255, 255, 255) : c.Lerp(Colors.White, 0.25f));
     }
 
-    /// <summary>The key, under the word: each kind as a row of the list looks, its tint under its word and icon.</summary>
+    /// <summary>The key, under the word, for the view shown: in a list, each kind as a row looks, its tint under its
+    /// word and icon; in the graph, a swatch card of the scale the nodes are filled by (a bar per class, shaded by
+    /// bits) and a sample node per container (the GGUF one turning, as in the graph).</summary>
     private void ShowLegend()
     {
+        var want = _graphBox.Visible ? "graph" : "list";
+        if (_legendPanel is not null && _legendFor != want)
+        {
+            _legendPanel.QueueFree();
+            _legendPanel = null;
+        }
         if (_legendPanel is null)
         {
+            _legendFor = want;
             _legendPanel = Ui.Card(12, 10);
             var solid = Ui.Glass(10, 12);
-            solid.BgColor = new Color(Ui.PanelSolid, 0.8f);  // over the board, the key must not blend with it
+            solid.BgColor = Ui.PanelSolid;  // opaque: over the board and the graph's panel, the key must not blend with what is under it
             _legendPanel.AddThemeStyleboxOverride("panel", solid);
             _legendPanel.MouseFilter = MouseFilterEnum.Stop;
+            _legendPanel.ZIndex = 50;  // above the graph's panel beside it, whatever the order of the children
             _legendPanel.MouseExited += HideLegendSoon;
             _legendPanel.MouseEntered += () => _legendPanel.Visible = true;
             var box = Ui.VBox(4);
             _legendPanel.AddChild(box);
-            box.AddChild(Ui.Note(T.Get("legend_note")));
+            if (want == "graph")
+                BuildGraphKey(box);
+            if (want != "graph")
+                box.AddChild(Ui.Note(T.Get("legend_note"), 220));  // as wide as the rows under it, no wider
             box.AddChild(Ui.Gap(2));
-            foreach (var (kind, label) in Ui.Legend.Append(("selected", T.Get("legend_selected"))))
+            foreach (var (kind, label) in want == "graph" ? Array.Empty<(string, string)>() : Ui.Legend.Append(("selected", T.Get("legend_selected"))))
             {
                 var row = new PanelContainer();
                 var tint = kind == "selected" ? Ui.Selection : Ui.KindTint[kind];
@@ -528,6 +654,111 @@ public partial class MainWindow : Control
         _legendPanel.GlobalPosition = new Vector2(Mathf.Max(at.X - _legendPanel.Size.X, 0), at.Y);
         _legendPanel.Modulate = new Color(1, 1, 1, 0);
         CreateTween().TweenProperty(_legendPanel, "modulate", Colors.White, 0.15);
+    }
+
+    private string? _legendFor;  // the view the key was built for
+
+    /// <summary>The graph's key: a bar per class, its steps from the most bits down (the shade a node of that
+    /// dtype gets), the bits under the bar's ends; then a sample node per container.</summary>
+    private void BuildGraphKey(VBoxContainer box)
+    {
+        box.AddChild(Ui.Note(T.Get("legend_graph"), 300));  // the card no wider than its bars and samples
+        box.AddChild(Ui.Gap(2));
+        var grid = new GridContainer { Columns = 2 };
+        grid.AddThemeConstantOverride("h_separation", Ui.Px(12));
+        grid.AddThemeConstantOverride("v_separation", Ui.Px(8));
+        box.AddChild(grid);
+        foreach (var cls in new[] { WeightClass.Lossless, WeightClass.NearLossless, WeightClass.LowLoss, WeightClass.Lossy, WeightClass.Other })
+        {
+            var name = Ui.Label(Weights.Label(cls), Ui.Text);
+            name.SizeFlagsVertical = SizeFlags.ShrinkCenter;
+            grid.AddChild(name);
+            var steps = cls == WeightClass.Other ? new[] { (bits: 0f, color: Ui.BitsUnknown) } : Ui.StepsOf(cls);
+            grid.AddChild(new Swatch { Steps = steps, CustomMinimumSize = new Vector2(Ui.Px(170), Ui.Px(34)) });
+        }
+        box.AddChild(Ui.Gap(4));
+        box.AddChild(Ui.Note(T.Get("legend_rings"), 300));
+        var row = Ui.HBox(14);
+        box.AddChild(row);
+        foreach (var cont in new[] { "safetensors", "gguf", "other" })
+        {
+            var cell = Ui.HBox(6);
+            cell.AddChild(new RingSample { Container = cont, CustomMinimumSize = new Vector2(Ui.Px(40), Ui.Px(40)) });
+            var l = Ui.Label(T.Get("ring_" + cont), Ui.Text);
+            l.SizeFlagsVertical = SizeFlags.ShrinkCenter;
+            cell.AddChild(l);
+            row.AddChild(cell);
+        }
+    }
+
+    /// <summary>A bar of the scale's steps for one class: the colors from the most bits (left) down, blended
+    /// between the steps, the bits written under the ends and the steps between.</summary>
+    private sealed partial class Swatch : Control
+    {
+        public (float bits, Color color)[] Steps = Array.Empty<(float, Color)>();
+
+        public override void _Draw()
+        {
+            float h = Ui.Px(13), w = Size.X;
+            int n = Steps.Length;
+            if (n == 1 && Steps[0].bits <= 0)  // no bits to write under it: the bar in the middle of the row
+            {
+                DrawSetTransform(new Vector2(0, (Size.Y - h) / 2 - Ui.Px(4)));
+                DrawRect(new Rect2(0, 0, w, h), new Color(Steps[0].color, 0.85f));
+                DrawRect(new Rect2(0, 0, w, h), new Color(1, 1, 1, 0.25f), false, 1);
+                return;
+            }
+            if (n == 1)
+                DrawRect(new Rect2(0, 0, w, h), new Color(Steps[0].color, 0.85f));
+            else
+            {
+                var cols = new Color[n];
+                for (int i = 0; i < n; i++)
+                    cols[i] = new Color(Steps[i].color, 0.85f);
+                // the bar as n-1 quads, each a blend from one step to the next
+                for (int i = 0; i < n - 1; i++)
+                {
+                    float x0 = w * i / (n - 1), x1 = w * (i + 1) / (n - 1);
+                    DrawPolygon(new Vector2[] { new(x0, 0), new(x1, 0), new(x1, h), new(x0, h) }, new[] { cols[i], cols[i + 1], cols[i + 1], cols[i] });
+                }
+            }
+            DrawRect(new Rect2(0, 0, w, h), new Color(1, 1, 1, 0.25f), false, 1);
+            var font = Ui.Font;
+            int size = Ui.SmallFontSize - 1;
+            for (int i = 0; i < n; i++)
+            {
+                if (Steps[i].bits <= 0)
+                    continue;
+                var text = Steps[i].bits >= 32 ? "32+" : Steps[i].bits == 8 ? "8+" : Steps[i].bits.ToString("0");
+                float tw = Ui.Measure(text, font, size);
+                float x = n == 1 ? w / 2 : w * i / (n - 1);
+                x = Mathf.Clamp(x - tw / 2, 0, w - tw);
+                DrawString(font, new Vector2(x, h + Ui.Px(14)), text, HorizontalAlignment.Left, -1, size, Ui.TextNote);
+            }
+        }
+    }
+
+    /// <summary>A node as the graph draws it, for one container: its ring (the GGUF one turning) round a plain fill.</summary>
+    private sealed partial class RingSample : Control
+    {
+        public string Container = "safetensors";
+        private double _t;
+
+        public override void _Process(double delta)
+        {
+            if (!IsVisibleInTree() || !Ui.Effects)
+                return;
+            _t += delta;
+            QueueRedraw();
+        }
+
+        public override void _Draw()
+        {
+            var c = Size / 2;
+            float r = Ui.Px(15);
+            DrawCircle(c, r, new Color(Ui.Neon, 0.14f));
+            GraphView.DrawContainerRing(this, c, r, Ui.Px(2.5f), Ui.Hdr(Ui.Neon, 1.1f), Container, 0, _t);
+        }
     }
 
     private async void HideLegendSoon()
@@ -581,6 +812,7 @@ public partial class MainWindow : Control
     {
         _time += delta;
         TickLegend();
+        WatchDisplay();
         if (_runner is { Running: true })
         {
             _runner.Poll();
@@ -1231,6 +1463,7 @@ public partial class MainWindow : Control
                 _path.Text = _place.Text();
             return;
         }
+        var identity = await IdentityOf(place, listing);
         _listingNow = false;
         Mark(listing.Rows, place);
         if (_place is null || !place.SamePlaceAs(_place))
@@ -1252,6 +1485,8 @@ public partial class MainWindow : Control
         foreach (var c in _modeSlot.GetChildren())
             c.QueueFree();
         var chip = Ui.Chip(Ui.Legend.First(l => l.kind == kind).label, Ui.KindColor[kind], bold: true);
+        chip.CustomMinimumSize = new Vector2(_chipWidth, 0);  // as wide in every place, so that the buttons start where they did
+        chip.HorizontalAlignment = HorizontalAlignment.Center;
         _modeSlot.AddChild(chip);
         if (Ui.Effects)
         {
@@ -1259,10 +1494,12 @@ public partial class MainWindow : Control
             CreateTween().TweenProperty(chip, "modulate", Colors.White, 0.5).SetTrans(Tween.TransitionType.Quad).SetEase(Tween.EaseType.Out);
         }
         _modeNote.Text = place.View == "model" && place.ReadOnly ? T.Get("mode_in_file") : "";
+        _identity = identity;
+        var label = SetNameField(place, identity);
         _seen = Stamp();
         _looked = Time.GetTicksMsec() / 1000.0;
         _path.Text = place.Text();
-        GetWindow().Title = $"OverCompressing {_versions} — {place.Text()}";
+        GetWindow().Title = $"OverCompressing {_versions} — {place.Text()}" + (label is not null ? $" [{label}]" : "");
         _views.Visible = place.View == "pack";
         if (place.View != "pack" && _viewMode == "graph")
         {
@@ -1276,6 +1513,187 @@ public partial class MainWindow : Control
         UpdateButtons();
         if (scroll >= 0 && VScroll() is { } bar2)
             bar2.Value = scroll;
+    }
+
+    /// <summary>The name and id of the pack shown, or of the pack of the model shown: from the pack listing, else (a
+    /// model) as read last for that pack while its stamp is the same, else read now (one more run of list --json).
+    /// Null outside a pack; a pack that cannot be read has none (it still opens).</summary>
+    private async Task<PackIdentity?> IdentityOf(Place place, Listing listing)
+    {
+        if (!place.Pack || place.Path is null)
+            return null;
+        var stamp = Place.PackStamp(place.Path);
+        if (listing.Identity is null && _identity is not null && _identityPath is not null && Place.SamePath(_identityPath, place.Path) && Equals(_identityStamp, stamp))
+            return _identity;
+        PackIdentity identity;
+        if (listing.Identity is not null)
+            identity = listing.Identity;
+        else
+        {
+            try { identity = (await _reader.ReadPackAsync(place.Path)).Identity; }
+            catch (Exception) { identity = new PackIdentity(null, null, null); }
+        }
+        _identityPath = place.Path;
+        _identityStamp = stamp;
+        return identity;
+    }
+
+    /// <summary>The field beside the path, for the place shown: the pack's name, or in gray its short id (`unnamed`
+    /// without one), editable in a pack folder, read-only in a pack file, empty and off elsewhere. The label shown, or
+    /// null outside a pack.</summary>
+    private string? SetNameField(Place place, PackIdentity? identity)
+    {
+        var label = identity is null ? null : identity.Label ?? T.Get("unnamed");
+        _nameHeld = identity?.Name ?? "";
+        _nameHint = identity is not null && identity.Name is null ? label! : "";
+        bool shown = identity is not null;
+        _nameEdit.Editable = shown && !place.ReadOnly;
+        _nameEdit.Modulate = new Color(1, 1, 1, shown ? 1f : 0.45f);
+        _nameEdit.MouseFilter = shown ? MouseFilterEnum.Stop : MouseFilterEnum.Ignore;
+        _nameEdit.FocusMode = shown ? FocusModeEnum.All : FocusModeEnum.None;
+        _nameEdit.SelectAllOnFocus = _nameHint.Length > 0;
+        // the whole of a name too long for the field, on hover
+        _nameEdit.TooltipText = label is not null && Ui.Measure(label) > Ui.Measure("0") * (NoteWidth - 2) ? label : "";
+        SetNameText(_nameHeld.Length > 0 ? _nameHeld : _nameHint);
+        NameEdited();
+        return label;
+    }
+
+    private void SetNameText(string text)
+    {
+        _nameQuiet = true;
+        _nameEdit.Text = text;
+        _nameEdit.CaretColumn = text.Length;
+        _nameQuiet = false;
+    }
+
+    /// <summary>The name typed beside the path ("": none), if that is a change; else null. Without a name, the empty
+    /// field and the short id itself are no change.</summary>
+    private string? NameChange()
+    {
+        var text = _nameEdit.Text.Trim();
+        return text == _nameHeld || (_nameHeld.Length == 0 && text == _nameHint) ? null : text;
+    }
+
+    /// <summary>The name beside the path was typed in, or the place changed: gray while it is the short id; Rename
+    /// pack on while it is a change that can be made (never while something runs).</summary>
+    private void NameEdited()
+    {
+        bool gray = _nameHint.Length > 0 && _nameEdit.Text == _nameHint;
+        _nameEdit.AddThemeColorOverride("font_color", gray ? Ui.TextDim : Ui.Text);
+        _nameEdit.AddThemeColorOverride("font_uneditable_color", gray ? Ui.TextDim : Ui.Text);
+        _nameButton.Disabled = !(_nameEdit.Editable && NameChange() is not null && !(_runner?.Running ?? true));
+    }
+
+    /// <summary>Give the pack folder shown the name typed beside the path, or none if that was emptied.</summary>
+    private async Task NamePack()
+    {
+        var place = _place;
+        var text = NameChange();
+        if (place is null || text is null || !_nameEdit.Editable || (_runner?.Running ?? true))
+            return;
+        var problem = text.Length > 0 ? Rules.PackNameProblem(text) : null;
+        if (problem is not null)
+        {
+            await OcDialog.Info(this, T.Get("name_pack"), T.Sentence(problem));
+            return;
+        }
+        var argv = new List<string> { "name", place.Path!, text.Length > 0 ? "--to=" + text : "--none" };
+        Start(new[] { new Job(argv, T.Get("naming_pack")) }, (Action)(() => Go(place)));
+    }
+
+    /// <summary>Make a new pack folder inside the folder shown, and open it.</summary>
+    private async Task NewPack()
+    {
+        if (_place is not { View: "folder", Path: not null } || (_runner?.Running ?? true))
+            return;
+        var folder = _place.Path;
+        var answer = await AskNewPack(T.Get("new_pack"), T.Get("new_pack_what"), folder, inFolder: true);
+        if (answer is not null)
+            MakePack(Path.Combine(folder, answer.Value.folder!), answer.Value.name);
+    }
+
+    /// <summary>Make the folder shown a pack folder, if it is empty (what systems leave in folders does not count), and
+    /// open it. One that cannot be is said so, with no dialog.</summary>
+    private async Task TurnPack()
+    {
+        if (_place is not { View: "folder", Path: not null } || (_runner?.Running ?? true))
+            return;
+        var folder = _place.Path;
+        var problem = Place.NewPackProblem(folder);
+        if (problem is not null)
+        {
+            await OcDialog.Info(this, T.Get("turn_pack"), T.Sentence(problem));
+            return;
+        }
+        var answer = await AskNewPack(T.Get("turn_pack"), T.Get("turn_pack_what"), folder);
+        if (answer is not null)
+            MakePack(folder, answer.Value.name);
+    }
+
+    /// <summary>init: the folder becomes a pack folder (named, if a name was given), then opens.</summary>
+    private void MakePack(string path, string name)
+    {
+        var argv = new List<string> { "init", path };
+        if (name.Length > 0)
+            argv.Add("--name=" + name);
+        var shown = name.Length > 0 ? name : Path.GetFileName(path.TrimEnd('\\', '/')) is { Length: > 0 } last ? last : path;
+        Start(new[] { new Job(argv, T.Get("making_pack", ("name", shown))) }, async () =>
+        {
+            Go(new Place(path, pack: true));
+            await OcDialog.Info(this, T.Get("new_pack"), T.Get("done_make_pack", ("path", T.Short(path))));
+        });
+    }
+
+    /// <summary>(the new folder's name, or null; the pack's name, or "") the user enters, checked, or null. A folder
+    /// name that is empty, holds a path, or is taken, and a pack name the tool would refuse, are said in the dialog.</summary>
+    private async Task<(string? folder, string name)?> AskNewPack(string title, string what, string path, bool inFolder = false)
+    {
+        var d = new OcDialog(title);
+        d.Body.AddChild(Ui.Heading(what));
+        d.Body.AddChild(OcDialog.PathLine(path));
+        LineEdit? folder = null;
+        if (inFolder)
+        {
+            d.Body.AddChild(Ui.Gap(6));
+            d.Body.AddChild(Ui.Label(T.Get("folder_prompt"), Ui.Text));
+            folder = Ui.Edit("");
+            d.Body.AddChild(folder);
+        }
+        d.Body.AddChild(Ui.Gap(6));
+        d.Body.AddChild(Ui.Label(T.Get("pack_name_prompt"), Ui.Text));
+        var name = Ui.Edit("");
+        d.Body.AddChild(name);
+        d.Body.AddChild(Ui.Note(T.Get("pack_name_note")));
+        (string?, string)? result = null;
+        string? ProblemWith(string folderName)
+        {
+            if (folderName.Length == 0)
+                return T.Get("need_folder");
+            if (folderName is "." or ".." || folderName.Contains('/') || folderName.Contains('\\') || Path.GetFileName(folderName) != folderName)
+                return T.Get("folder_bad");
+            var full = Path.Combine(path, folderName);
+            if (File.Exists(full) || Directory.Exists(full))
+                return T.Get("folder_exists");
+            return Place.NewPackProblem(full);
+        }
+        d.Accepting = () =>
+        {
+            var folderName = folder?.Text.Trim() ?? "";
+            var packName = name.Text.Trim();
+            var problem = (inFolder ? ProblemWith(folderName) : null) ?? (packName.Length > 0 ? Rules.PackNameProblem(packName) : null);
+            if (problem is not null)
+            {
+                d.ShowError(problem);
+                return false;
+            }
+            result = (inFolder ? folderName : null, packName);
+            return true;
+        };
+        d.FirstFocus = folder ?? name;
+        if (!await d.ShowAsync(this))
+            return null;
+        return result;
     }
 
     /// <summary>List the place again, keeping what is selected and where the list is scrolled.</summary>
@@ -1422,8 +1840,10 @@ public partial class MainWindow : Control
             Go(_place.Child(row));
     }
 
-    /// <summary>Refresh, Pack in and Add file can always be used (where the place can be changed); the others act on
-    /// what is selected (Rename on one row), so they are off while nothing is.</summary>
+    /// <summary>Refresh, Pack in, Add file and what makes a pack act on the place, so they can always be used (where
+    /// the place can be changed); the others act on what is selected (Rename on one row), so they are off while nothing
+    /// is. Rename pack, beside the path, is on while the name there has been changed. Everything is off while a batch
+    /// runs (JobRunner.Running: from its start to its end).</summary>
     private void UpdateButtons()
     {
         var place = _place;
@@ -1436,7 +1856,9 @@ public partial class MainWindow : Control
             ["refresh"] = true, ["pack_in"] = writable, ["add_file"] = writable, ["pack_to"] = onDisk && count > 0,
             ["remove"] = (onDisk || writable) && count > 0, ["save"] = count > 0, ["extract"] = count > 0,
             ["verify"] = count > 0, ["rename"] = writable && count == 1, ["rebase"] = writable && count > 0,
+            ["new_pack"] = onDisk, ["turn_pack"] = onDisk,
         };
+        NameEdited();
         foreach (var (key, b) in _buttons)
             b.Disabled = !usable[key] || running;
         for (int i = 0; i < _menu.ItemCount; i++)
@@ -1737,7 +2159,7 @@ public partial class MainWindow : Control
         var answer = await AskPack(name, T.Get("name_what", ("files", T.Count(count, "file")), ("size", T.SizeText(size))), source, files, here);
         if (answer is null)
             return;
-        var (model, mode, where, replace, rebuild) = answer.Value;
+        var (model, mode, where, replace, rebuild, packName) = answer.Value;
         if (here is null)
             _settings.PackMode = mode;
         if (mode == "folder")
@@ -1748,6 +2170,8 @@ public partial class MainWindow : Control
             argv.Add("--replace");
         if (!rebuild)
             argv.Add("--no-quant");
+        if (packName.Length > 0)
+            argv.Add("--pack-name=" + packName);
         Start(new[] { new Job(argv, T.Get("packing", ("name", model))) }, async () =>
         {
             if (mode == "file" && place.View == "folder" && Place.SamePath(place.Path!, Path.GetDirectoryName(where) ?? ""))
@@ -1760,20 +2184,34 @@ public partial class MainWindow : Control
         });
     }
 
-    /// <summary>(model name, "folder" or "file", the pack folder or new pack file, replace, rebuild quantized weights)
-    /// the user enters, checked, or null. here: the pack folder the list shows; the choice is then this pack folder
-    /// (the default) or a new pack file, a pack of its own. The tick is on every time (not kept): off is --no-quant.</summary>
-    private async Task<(string name, string mode, string where, bool replace, bool rebuild)?> AskPack(string defaultName, string what, string source, List<string> files, string? here)
+    /// <summary>(model name, "folder" or "file", the pack folder or new pack file, replace, rebuild quantized weights,
+    /// the name of a new pack or "") the user enters, checked, or null. here: the pack folder the list shows; the choice
+    /// is then this pack folder (the default) or a new pack file, a pack of its own. The tick is on every time (not
+    /// kept): off is --no-quant. A pack name is for the pack this makes: a pack folder there already keeps its own.</summary>
+    private async Task<(string name, string mode, string where, bool replace, bool rebuild, string packName)?> AskPack(string defaultName, string what, string source, List<string> files, string? here)
     {
         var d = new OcDialog(T.Get("name_title"));
         d.Body.AddChild(Ui.Heading(what));
         d.Body.AddChild(OcDialog.PathLine(source));
-        d.Body.AddChild(Ui.Gap(6));
-        d.Body.AddChild(Ui.Label(T.Get("name_prompt"), Ui.Text));
+        d.Body.AddChild(Ui.Gap(4));
+        // wide and flat (owner, 2026-11-02: at 175 % on a 1080p display this dialog ran off the window, then its glow
+        // was cut): two columns, the model and where it goes at the left, the new pack's name and the options at the
+        // right; a label and its field share a row; notes a size down
+        var columns = Ui.HBox(22);
+        d.Body.AddChild(columns);
+        var left = Ui.VBox(6);
+        left.SizeFlagsHorizontal = SizeFlags.ExpandFill;
+        left.CustomMinimumSize = new Vector2(Ui.Px(430), 0);
+        var right = Ui.VBox(6);
+        right.SizeFlagsHorizontal = SizeFlags.ExpandFill;
+        right.CustomMinimumSize = new Vector2(Ui.Px(380), 0);
+        columns.AddChild(left);
+        columns.AddChild(Ui.VSep());
+        columns.AddChild(right);
         var name = Ui.Edit(defaultName);
-        d.Body.AddChild(name);
-        d.Body.AddChild(Ui.Gap(6));
-        d.Body.AddChild(Ui.Label(T.Get("into"), Ui.Text));
+        left.AddChild(Ui.Labelled(T.Get("name_prompt"), name));
+        left.AddChild(Ui.Gap(2));
+        left.AddChild(Ui.Label(T.Get("into"), Ui.Text));
         var mode = here is not null ? "folder" : _settings.PackMode;
         var newFile = Path.Combine(files.Count > 0 ? source : Path.GetDirectoryName(source) ?? source, defaultName.Split('/').Last() + Place.Oczip);
         var paths = new Dictionary<string, string> { ["folder"] = here ?? _settings.PackTarget, ["file"] = newFile };
@@ -1802,15 +2240,14 @@ public partial class MainWindow : Control
             var r = Ui.Radio(T.Get(choice), group, key == mode);
             r.Pressed += Switch;
             radios[key] = r;
-            d.Body.AddChild(r);
-            var note = Ui.Note(T.Get(choice + "_note"));
+            left.AddChild(r);
             var indent = Ui.HBox(0);
             indent.AddChild(new Control { CustomMinimumSize = new Vector2(Ui.Px(26), 0) });
-            indent.AddChild(note);
-            d.Body.AddChild(indent);
+            indent.AddChild(Ui.Note(T.Get(choice + "_note"), 380));
+            left.AddChild(indent);
         }
         var row = Ui.HBox(6);
-        d.Body.AddChild(row);
+        left.AddChild(row);
         row.AddChild(target);
         browse = Ui.Button(T.Get("browse"), async () =>
         {
@@ -1825,20 +2262,25 @@ public partial class MainWindow : Control
         });
         row.AddChild(browse);
         Lock();
-        d.Body.AddChild(Ui.Gap(8));
+        var packName = Ui.Edit("");
+        right.AddChild(Ui.Label(T.Get("pack_name_to"), Ui.Text));
+        right.AddChild(packName);
+        right.AddChild(Ui.Note(T.Get("pack_name_note"), 380));
+        right.AddChild(Ui.Gap(4));
         var rebuild = Ui.Check(T.Get("quant_tick"), true);
-        d.Body.AddChild(rebuild);
+        right.AddChild(rebuild);
         var quantNote = Ui.HBox(0);
         quantNote.AddChild(new Control { CustomMinimumSize = new Vector2(Ui.Px(26), 0) });
-        quantNote.AddChild(Ui.Note(T.Get("quant_note")));
-        d.Body.AddChild(quantNote);
-        d.Body.AddChild(Ui.Gap(4));
-        d.Body.AddChild(Ui.Note(T.Get("name_hint") + (here is not null ? "\n" + T.Get("file_hint_here") : "")));
-        (string, string, string, bool, bool)? result = null;
+        quantNote.AddChild(Ui.Note(T.Get("quant_note"), 354));
+        right.AddChild(quantNote);
+        right.AddChild(Ui.Gap(4));
+        right.AddChild(Ui.Note(T.Get("name_hint") + (here is not null ? " " + T.Get("file_hint_here") : ""), 380));
+        (string, string, string, bool, bool, string)? result = null;
         d.AcceptingAsync = async () =>
         {
             var model = name.Text.Trim();
             var where = target.Text.Trim();
+            var newName = packName.Text.Trim();
             var m = Current();
             var problem = Rules.NameProblem(model) ?? (where.Length == 0 ? T.Get("need_target") : null);
             if (problem is null && m == "file")
@@ -1855,6 +2297,8 @@ public partial class MainWindow : Control
                 problem = Place.IsOczip(where) ? T.Get("target_oczip")
                     : Place.Holds(source, where) && files.Count == 0 ? $"{source} holds {where}" : Place.PlaceProblem(source);
             }
+            if (problem is null && newName.Length > 0)  // a name is for the pack this makes
+                problem = Rules.PackNameProblem(newName) ?? (m == "folder" && File.Exists(Path.Combine(where, Place.Marker)) ? T.Get("pack_name_held") : null);
             if (problem is not null)
             {
                 d.ShowError(problem);
@@ -1871,7 +2315,7 @@ public partial class MainWindow : Control
                         return false;
                 }
             }
-            result = (model, m, where, m == "folder" && held, rebuild.ButtonPressed);
+            result = (model, m, where, m == "folder" && held, rebuild.ButtonPressed, newName);
             return true;
         };
         d.FirstFocus = name;
@@ -2306,7 +2750,7 @@ public partial class MainWindow : Control
         d.Body.AddChild(note);
         var text = new TextEdit
         {
-            Text = damage.Text, Editable = false, CustomMinimumSize = new Vector2(Ui.Px(820), Ui.Px(380)), SizeFlagsVertical = SizeFlags.ExpandFill,
+            Text = damage.Text, Editable = false, CustomMinimumSize = new Vector2(Ui.Px(820), Ui.Px(240)), SizeFlagsVertical = SizeFlags.ExpandFill,
             ContextMenuEnabled = true, ScrollFitContentHeight = false, WrapMode = TextEdit.LineWrappingMode.None,
         };
         text.AddThemeFontOverride("font", Ui.Mono);
@@ -2427,6 +2871,7 @@ public partial class MainWindow : Control
         _done = done;
         foreach (var b in _buttons.Values)
             b.Disabled = true;
+        _nameButton.Disabled = true;
         _runner.Start(jobs);
     }
 
@@ -2604,8 +3049,9 @@ public partial class MainWindow : Control
         _settings.WindowMaximized = window.Mode == Window.ModeEnum.Maximized;
         if (!_settings.WindowMaximized)
         {
-            _settings.WindowWidth = window.Size.X;
-            _settings.WindowHeight = window.Size.Y;
+            _settings.WindowWidth = (int)(window.Size.X / Ui.Scale);  // in canvas units: the same size to the eye at another scale
+            _settings.WindowHeight = (int)(window.Size.Y / Ui.Scale);
+            _settings.WindowScale = Ui.Scale;
         }
         _settings.Save();
     }
@@ -2655,7 +3101,7 @@ public partial class MainWindow : Control
             python.Text = found.Python;
         }
         d.Body.AddChild(Ui.Gap(4));
-        var result = Ui.Label("", Ui.TextDim, wrap: true);
+        var result = Ui.Label("", Ui.TextNote, wrap: true);
         var checkRow = Ui.HBox(8);
         d.Body.AddChild(checkRow);
         checkRow.AddChild(Ui.Button(T.Get("settings_check"), async () => await Check()));
@@ -2747,10 +3193,24 @@ public partial class MainWindow : Control
     }
 
     public void DevCancel() => Cancel();
+    public void DevRescale(float scale) { _scaleForced = scale; _displayLooked = 0; }
+    public string DevWindowInfo() { var w = GetWindow(); return $"scale={Ui.Scale} size={w.Size} pos={w.Position} min={w.MinSize} usable={Usable()} logical={_logicalSize}"; }
+    /// <summary>Dev hook: type into the name field beside the path (as a hand would), and submit it or not.</summary>
+    public void DevName(string text, bool submit)
+    {
+        _nameEdit.GrabFocus();
+        _nameEdit.Text = text;
+        NameEdited();
+        if (submit)
+            _ = NamePack();
+    }
+    public void DevNameEscape() { SetNameText(_nameHeld.Length > 0 ? _nameHeld : _nameHint); NameEdited(); }
+    public string DevNameInfo() => $"text='{_nameEdit.Text}' held='{_nameHeld}' hint='{_nameHint}' editable={_nameEdit.Editable} tip='{_nameEdit.TooltipText}' button={(_nameButton.Disabled ? "off" : "on")} running={_runner?.Running} buttons={string.Join(",", _buttons.Where(kv => !kv.Value.Disabled).Select(kv => kv.Key))} title='{GetWindow().Title}' where='{_status.Text}'";
     public void DevLegend() => ShowLegend();
     public void DevBoardOnly() { _ui.Visible = false; _circuit.Intensity = 2.5f; _circuit.Animated = false; _circuit.QueueRedraw(); }
     public string DevTrailInfo() => _trail.Info;
-    public void DevGo(string text) { var p = Place.FromText(text); if (p is not null) Go(p); }
+    public void DevGo(string text) { var p = text.Equals("drives", StringComparison.OrdinalIgnoreCase) ? new Place() : Place.FromText(text); if (p is not null) Go(p); }
+    public void DevPick(string id) { if (_items.ContainsKey(id)) { _anchor = id; Select(new HashSet<string> { id }); } }
     public void DevClose() => Close();
 
     public void DevMenu()
@@ -2790,6 +3250,12 @@ public partial class MainWindow : Control
             case "rename": _ = Rename(); break;
             case "remove": _ = Remove(); break;
             case "settings": _ = SettingsDialog(false); break;
+            case "turn": _ = TurnPack(); break;
+            case "newpack": _ = NewPack(); break;
+            case "packin":  // the pack dialog as + Pack in shows it (without the native folder picker first)
+                _ = AskPack("mlx-community__Qwen2.5-0.5B-Instruct-bf16", T.Get("name_what", ("files", "11 files"), ("size", "953.3 MiB")),
+                    @"V:\OverCompressing\models\mlx-community__Qwen2.5-0.5B-Instruct-bf16", new List<string>(), _place?.Path ?? "");
+                break;
             case "busy":
                 _busy.Open("▶ Packing Qwen/Qwen2.5-7B  (1/2)");
                 _busy.SetLine("model-00002-of-00004.safetensors   safetensors+ans16   3,685.7 MiB ->  1,086.0 MiB   29.47%");

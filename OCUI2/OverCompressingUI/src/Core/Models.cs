@@ -125,11 +125,20 @@ public sealed class ModelSummary
 
 public sealed record KeptBlob(string Sha256, long Size, string? Model, string? Path, List<string> NeededBy);
 
+/// <summary>A pack's name and id (ocpack.json, only ever shown), and the label it is shown by: the name, else the
+/// first 8 hex digits of the id; null for an older pack, or one whose fields cannot be shown (list --json since
+/// CLI 0.7). Never written here: init, name and pack --pack-name set them.</summary>
+public sealed record PackIdentity(string? Name, string? Id, string? Label)
+{
+    public static PackIdentity From(JsonObject o) => new(o["name"]?.ToString(), o["id"]?.ToString(), o["label"]?.ToString());
+}
+
 /// <summary>What list shows of a pack (pack_summary).</summary>
 public sealed class PackSummary
 {
     public string Pack = "";
     public string Kind = "";
+    public PackIdentity Identity = new(null, null, null);
     public List<ModelSummary> Models = new();
     public List<KeptBlob> Kept = new();
     public int UnusedBlobs;
@@ -148,6 +157,7 @@ public sealed class PackSummary
             Blobs = (int)(Json.Long(o["blobs"]) ?? 0),
             Stored = Json.Long(o["stored"]) ?? 0,
             Unreadable = Json.Strings(o["unreadable"]),
+            Identity = PackIdentity.From(o),
         };
         if (o["models"] is JsonArray models)
             s.Models = models.OfType<JsonObject>().Select(ModelSummary.From).ToList();

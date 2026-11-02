@@ -38,7 +38,12 @@ public sealed class JobRunner
         Tool = tool;
     }
 
-    public bool Running => _proc is not null;
+    /// <summary>Whether a batch runs: from Start to its end (finished or cancelled), not only while a child process
+    /// exists. Between Start and the first process, while a failed job's Retry hook asks the user, and between one job
+    /// and the next, the window's buttons must stay off: a button update then (a queued selection event, the watch,
+    /// the name field) once turned them back on (found by the downstream team on the Tkinter window).</summary>
+    public bool Running => _active;
+    private bool _active;
     public bool Cancelling { get; private set; }
     public Job? Current { get; private set; }
     public int JobNumber { get; private set; }
@@ -74,6 +79,7 @@ public sealed class JobRunner
         JobNumber = 0;
         JobTotal = _jobs.Count;
         Cancelling = false;
+        _active = true;
         NextJob();
     }
 
@@ -187,10 +193,7 @@ public sealed class JobRunner
         var output = Output.ToString();
         if (Cancelling)
         {
-            OnLog?.Invoke(T.Get("cancelled") + "\n", null);
-            _jobs.Clear();
-            Cancelling = false;
-            OnCancelled?.Invoke();
+            Cancelled();
             return;
         }
         var job = Current!;
@@ -208,6 +211,11 @@ public sealed class JobRunner
     private async Task Retry(Job job, int code, string output, DamageReport? damage)
     {
         var retry = job.Retry is null ? null : await job.Retry(job, Error);
+        if (Cancelling)  // cancelled while the question was up: nothing runs again
+        {
+            Cancelled();
+            return;
+        }
         if (retry is null)
         {
             Finish(false, job, code, output, damage);
@@ -227,20 +235,28 @@ public sealed class JobRunner
     {
         _jobs.Clear();
         Cancelling = false;
+        _active = false;
         OnFinished?.Invoke(ok, failed, code, output, damage);
     }
 
-    /// <summary>Cancel after the current step (the runner stops as on Ctrl+C); the second time, stop now.</summary>
+    private void Cancelled()
+    {
+        OnLog?.Invoke(T.Get("cancelled") + "\n", null);
+        _jobs.Clear();
+        Cancelling = false;
+        _active = false;
+        OnCancelled?.Invoke();
+    }
+
+    /// <summary>Cancel after the current step (the runner stops as on Ctrl+C); the second time, stop now. With no
+    /// process (a question up between jobs), the batch ends once it is answered.</summary>
     public void Cancel()
     {
-        if (_proc is null)
+        if (!_active || Cancelling)
             return;
-        if (!Cancelling)
-        {
-            Cancelling = true;
-            _jobs.Clear();
-            _proc.Cancel();
-        }
+        Cancelling = true;
+        _jobs.Clear();
+        _proc?.Cancel();
     }
 
     public void Kill()

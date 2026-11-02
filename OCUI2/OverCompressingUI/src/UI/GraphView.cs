@@ -29,6 +29,7 @@ public partial class GraphView : Control
     }
 
     private const float Band = 16f;  // the ring of text around a node: from the ring to the outside of the glyphs
+    private const float Strip = 28f;  // the hint along the bottom (the key is in the Colors word)
     private const float MaxArc = 3.5f;  // radians: the text takes at most 200° of the circle, over the top
 
     private sealed class Edge
@@ -89,7 +90,7 @@ public partial class GraphView : Control
                 fresh = true;
             n.Row = r;
             double stored = Math.Max(r.Stored ?? r.Size ?? 1, 1);
-            n.Radius = Ui.Px(26) + Ui.Px(6) * (float)Math.Log10(stored / (1 << 20) + 1);
+            n.Radius = Ui.Px(31) + Ui.Px(7.2f) * (float)Math.Log10(stored / (1 << 20) + 1);  // a fifth larger than at first (owner: the smallest were too small)
             (n.Label, n.TextSize) = FitRing(ShortName(r.Name), n.Radius);
             _nodes.Add(n);
             _byId[n.Id] = n;
@@ -255,11 +256,11 @@ public partial class GraphView : Control
             maxY = Math.Max(maxY, n.Anchor.Y + half);
         }
         float margin = Ui.Px(24);
-        var avail = new Vector2(Size.X - 2 * margin, Size.Y - 2 * margin - Ui.Px(28));
+        var avail = new Vector2(Size.X - 2 * margin, Size.Y - 2 * margin - Ui.Px(Strip));
         var need = new Vector2(Math.Max(maxX - minX, 1), Math.Max(maxY - minY, 1));
         _zoom = Mathf.Clamp(Math.Min(avail.X / need.X, avail.Y / need.Y), 0.25f, 1f);
         var center = new Vector2((minX + maxX) / 2, (minY + maxY) / 2);
-        _pan = new Vector2(Size.X / 2, (Size.Y - Ui.Px(28)) / 2) - center * _zoom;
+        _pan = new Vector2(Size.X / 2, (Size.Y - Ui.Px(Strip)) / 2) - center * _zoom;
     }
 
     // ------------------------------------------------------------------------------------------ life
@@ -378,8 +379,8 @@ public partial class GraphView : Control
         var parts = new List<string> { r.Name };
         if (r.Files is not null)
             parts.Add(T.Count(r.Files.Value, "file"));
-        if (r.Size is not null)
-            parts.Add($"{T.SizeText(r.Size)} → {T.SizeText(r.Stored)} ({r.Ratio})");
+        if (r.Weights is { WeightBytes: > 0 } w)  // the sizes are on the node itself; the color says the class
+            parts.Add($"{w.Container}  ·  {w.Shares()}");
         if (r.Needs.Length > 0)
             parts.Add("needs " + r.Needs);
         if (r.Summary?.NeededBy.Count > 0)
@@ -477,23 +478,25 @@ public partial class GraphView : Control
             bool ghost = _removed.Contains(n.Id);
             bool selected = _selected.Contains(n.Id);
             bool dim = _matched.Count > 0 && !ghost && !_matched.Contains(n.Id);
-            var fill = ghost ? new Color(1, 1, 1, 0.05f) : new Color(Ui.KindColor["model"], dim ? 0.08f : 0.22f);
+            // the fill: the weights' class (the owner's scale, cold to warm as the bits go down); the ring: the
+            // container, a solid ring for safetensors, a ring of dashes that turns for GGUF, a faint dotted one else
+            var mix = n.Row.Weights ?? WeightMix.None;
+            var hue = ghost ? Ui.TextFaint : mix.Class == WeightClass.Other ? Ui.BitsUnknown : Ui.BitsColor(mix.Bits ?? ClassBits(mix.Class));
+            var fill = ghost ? new Color(1, 1, 1, 0.05f) : new Color(hue, dim ? 0.08f : 0.24f);
             float pulse = Ui.Effects ? 0.5f + 0.5f * Mathf.Sin((float)_time * 2.2f + n.Phase) : 0.5f;
-            var ring = ghost ? new Color(1, 1, 1, 0.25f) : n.Row.Damaged ? Ui.Hdr(Ui.Damaged, 1.3f) : selected ? Ui.Hdr(Ui.Neon, 1.4f + 0.6f * pulse)
-                : Ui.Hdr(Ui.KindColor["model"], dim ? 0.4f : 0.9f + 0.4f * pulse);
+            var ring = ghost ? new Color(1, 1, 1, 0.25f) : n.Row.Damaged ? Ui.Hdr(Ui.Damaged, 1.3f) : selected ? Ui.Hdr(hue, 1.5f + 0.6f * pulse)
+                : Ui.Hdr(hue, dim ? 0.4f : 0.9f + 0.4f * pulse);
             if (selected && !ghost)
                 DrawCircle(p, r + (Ui.Px(6) + Ui.Px(4) * pulse) * _zoom, new Color(Ui.Neon, 0.16f + 0.1f * pulse));
             DrawCircle(p, r, new Color(Ui.Bg, 0.95f));
             DrawCircle(p, r, fill);
+            float rw = (_hovered == n ? Ui.Px(3) : Ui.Px(2)) * _zoom;
             if (ghost)
                 DrawArc(p, r, 0, Mathf.Tau, 32, ring, Ui.Px(1.2f), true);
             else
-                DrawArc(p, r, 0, Mathf.Tau, 48, ring, (_hovered == n ? Ui.Px(3) : Ui.Px(2)) * _zoom, true);
-            if (!ghost && n.Row.Ratio.Length > 0)
-            {
-                var rs = font.GetStringSize(n.Row.Ratio, HorizontalAlignment.Left, -1, size);
-                DrawString(font, p - rs / 2 + new Vector2(0, rs.Y * 0.78f), n.Row.Ratio, HorizontalAlignment.Left, -1, size, new Color(Ui.Text, dim ? 0.4f : 0.9f));
-            }
+                DrawContainerRing(this, p, r, rw, ring, mix.Container, n.Phase, _time);
+            if (!ghost && n.Row.Size is not null)
+                DrawSizes(n, p, r, font, dim);
             if (!Lit(n))
                 DrawRing(n, font, lit: false);
         }
@@ -501,11 +504,83 @@ public partial class GraphView : Control
             if (Lit(n))
                 DrawRing(n, font, lit: true);
 
-        // the hint, centered along the bottom
+        // the key and the hint, centered along the bottom
+        DrawLegend(font, size);
+    }
+
+    /// <summary>Inside a node: what the model takes on disk, a small arrow down with the ratio beside it, and what it
+    /// takes in the pack (the owner found a lone percentage dull). The text is sized to the circle: down to 8 px,
+    /// and the pack's size alone when even that will not fit.</summary>
+    private void DrawSizes(Node n, Vector2 p, float r, Font font, bool dim)
+    {
+        var top = T.SizeText(n.Row.Size);
+        var bottom = T.SizeText(n.Row.Stored);
+        var ratio = n.Row.Ratio;
+        float chord = r * 1.72f;  // the width across the circle at the rows' height
+        int size = 12;
+        for (; size > 8; size--)
+            if (Math.Max(Ui.Measure(top, font, size), Ui.Measure(bottom, font, size)) <= chord)
+                break;
+        var text = new Color(Ui.Text, dim ? 0.4f : 0.92f);
+        var faint = new Color(Ui.TextNote, dim ? 0.35f : 0.8f);
+        float lineH = font.GetHeight(size);
+        float rowGap = Math.Max(lineH * 1.05f, r * 0.42f);
+        if (r < Ui.Px(22) * _zoom)  // too small for three rows: the pack's size alone
+        {
+            var bs = font.GetStringSize(bottom, HorizontalAlignment.Left, -1, size);
+            DrawString(font, p - bs / 2 + new Vector2(0, bs.Y * 0.78f), bottom, HorizontalAlignment.Left, -1, size, text);
+            return;
+        }
+        var ts = font.GetStringSize(top, HorizontalAlignment.Left, -1, size);
+        DrawString(font, new Vector2(p.X - ts.X / 2, p.Y - rowGap + ts.Y * 0.3f), top, HorizontalAlignment.Left, -1, size, text);
+        // the arrow: a short shaft with a chevron, the ratio at its right
+        int small = Math.Max(size - 1, 7);  // the ratio: one size under the sizes (owner)
+        var rs = font.GetStringSize(ratio, HorizontalAlignment.Left, -1, small);
+        float ah = lineH * 0.7f, aw = lineH * 0.42f;
+        float totalW = aw + Ui.Px(4) + rs.X;
+        float ax = p.X - totalW / 2 + aw / 2;
+        var tip = new Vector2(ax, p.Y + ah / 2);
+        var arrow = new Color(Ui.Neon, dim ? 0.4f : 0.9f);
+        DrawLine(new Vector2(ax, p.Y - ah / 2), tip, arrow, Math.Max(1f, Ui.Px(1.2f) * _zoom), true);
+        DrawPolyline(new[] { tip + new Vector2(-aw / 2, -aw / 2), tip, tip + new Vector2(aw / 2, -aw / 2) }, arrow, Math.Max(1f, Ui.Px(1.2f) * _zoom), true);
+        DrawString(font, new Vector2(ax + aw / 2 + Ui.Px(4), p.Y + rs.Y * 0.3f), ratio, HorizontalAlignment.Left, -1, small, faint);
+        var bs2 = font.GetStringSize(bottom, HorizontalAlignment.Left, -1, size);
+        DrawString(font, new Vector2(p.X - bs2.X / 2, p.Y + rowGap + bs2.Y * 0.3f), bottom, HorizontalAlignment.Left, -1, size, text);
+    }
+
+    private static float ClassBits(WeightClass cls) => cls switch { WeightClass.Lossless => 16, WeightClass.NearLossless => 6, WeightClass.LowLoss => 4, _ => 2 };
+
+    /// <summary>The ring of a node, by its container: safetensors a solid ring; GGUF a ring of dashes that turns
+    /// slowly, a brighter one running round it (the owner wanted the kinds told apart by motion, not a dead style);
+    /// other a faint, finer dotted ring. Still with effects off. Also draws the samples in the Colors key.</summary>
+    public static void DrawContainerRing(CanvasItem on, Vector2 p, float r, float width, Color ring, string container, float phase, double time)
+    {
+        if (container == "safetensors")
+        {
+            on.DrawArc(p, r, 0, Mathf.Tau, 48, ring, width, true);
+            return;
+        }
+        int dashes = container == "gguf" ? 12 : 28;
+        float fill = container == "gguf" ? 0.62f : 0.4f;
+        float turn = Ui.Effects ? (float)(time * (container == "gguf" ? 0.35 : 0.12)) + phase : phase;
+        float step = Mathf.Tau / dashes;
+        for (int i = 0; i < dashes; i++)
+        {
+            float a0 = turn + i * step;
+            // one dash in the round is brighter, and the brightness runs from dash to dash
+            float run = Ui.Effects ? 0.5f + 0.5f * Mathf.Cos((float)time * 1.6f - i * step * 1.0f) : 0.5f;
+            var c = container == "gguf" ? ring with { A = ring.A * (0.55f + 0.45f * run) } : ring with { A = ring.A * 0.55f };
+            on.DrawArc(p, r, a0, a0 + step * fill, 6, c, container == "gguf" ? width : Math.Max(width * 0.7f, 1f), true);
+        }
+    }
+
+    /// <summary>The hint along the bottom (the key to the colors is in the ◧ Colors word, as for the list).</summary>
+    private void DrawLegend(Font font, int size)
+    {
+        _strip ??= Ui.Flat(new Color(Ui.Bg, 0.85f), 5, new Color(Ui.Neon, 0.25f), 1, 0);
         var hint = T.Get("graph_hint") + "   ·   " + T.Get("graph_legend");
         var hs = font.GetStringSize(hint, HorizontalAlignment.Left, -1, size);
         var hp = new Vector2(Math.Max((Size.X - hs.X) / 2, Ui.Px(10)), Size.Y - Ui.Px(10));
-        _strip ??= Ui.Flat(new Color(Ui.Bg, 0.85f), 5, new Color(Ui.Neon, 0.25f), 1, 0);
         DrawStyleBox(_strip, new Rect2(hp.X - Ui.Px(8), hp.Y - hs.Y - Ui.Px(2), hs.X + Ui.Px(16), hs.Y + Ui.Px(8)));
         DrawString(font, new Vector2(hp.X, hp.Y - Ui.Px(2)), hint, HorizontalAlignment.Left, -1, size, Ui.TextDim);
     }

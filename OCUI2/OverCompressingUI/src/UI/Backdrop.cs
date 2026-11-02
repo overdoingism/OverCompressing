@@ -27,6 +27,7 @@ public partial class Backdrop : ColorRect
     }
 
     public void SetIntensity(float v) => _material.SetShaderParameter("intensity", v);
+    public void Rescale() => _material.SetShaderParameter("cell_px", 34f * Ui.Scale);
 
     public override void _Process(double delta)
     {

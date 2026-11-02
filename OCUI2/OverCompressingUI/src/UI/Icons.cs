@@ -7,24 +7,40 @@ namespace OverCompressingUI.UI;
 /// <summary>Small icons drawn from SVG at the window's scale (crisp on any display), cached by name.</summary>
 public static class Icons
 {
-    private static readonly Dictionary<string, ImageTexture> Cache = new();
+    private static readonly Dictionary<string, (string svg, int size, ImageTexture tex)> Cache = new();
 
     public static ImageTexture FromSvg(string key, string svg, int size)
     {
         if (Cache.TryGetValue(key, out var cached))
-            return cached;
+            return cached.tex;
+        var tex = ImageTexture.CreateFromImage(Render(svg, size));
+        if (size > 1)
+            tex.SetSizeOverride(new Vector2I(size, size));  // rasterized at the display's scale, drawn at its canvas size
+        Cache[key] = (svg, size, tex);
+        return tex;
+    }
+
+    private static Image Render(string svg, int size)
+    {
         var img = new Image();
-        var err = img.LoadSvgFromString(svg, Ui.Scale);
-        if (err != Error.Ok)
+        if (img.LoadSvgFromString(svg, Ui.Scale) != Error.Ok)
         {
             img = Image.CreateEmpty(size, size, false, Image.Format.Rgba8);
             img.Fill(new Color(0, 0, 0, 0));
         }
-        var tex = ImageTexture.CreateFromImage(img);
-        if (size > 1)
-            tex.SetSizeOverride(new Vector2I(size, size));  // rasterized at the display's scale, drawn at its canvas size
-        Cache[key] = tex;
-        return tex;
+        return img;
+    }
+
+    /// <summary>The display's scale changed: every icon rendered so far is rendered again at the new scale, in place,
+    /// so the theme, the rows and the buttons that hold it show it crisp without being rebuilt.</summary>
+    public static void Reset()
+    {
+        foreach (var (svg, size, tex) in Cache.Values)
+        {
+            tex.SetImage(Render(svg, size));
+            if (size > 1)
+                tex.SetSizeOverride(new Vector2I(size, size));
+        }
     }
 
     private static string Hex(Color c) => "#" + c.ToHtml(false);

@@ -76,6 +76,10 @@ observations and suggestions for its owner. 對原專案的觀察與建議（未
     client say what is happening. Low cost, and the one place where the tool is silent for minutes.
     **Done the same day at the owner's word** (the one edit outside `OCUI2/`): the line is now `slow: exact rebuild of
     <file>, region at <offset>`, and the Tkinter window's busy window got the same note as this one (`exact_slow`).
+12b. **Quantized dtypes in a manifest are GGUF type numbers.** A manifest's tensor table writes `F32`, `BF16`, `F16`
+    by name but a quantized tensor as `ggml_type_12` (Q4_K), `ggml_type_8` (Q8_0) and so on. A reader needs the
+    GGML type table to show them (the window keeps one, `Core/Weights.cs`); the name itself (`Q4_K`) would read at
+    once in the manifest and in any tool that lists it. Found while coloring the graph by weight class (2026-11-02).
 12. **`list` names a folder's model after the folder as it is.** `pack <Org__Name folder>` without `--name` makes the
     model `Org__Name`, not `Org/Name` (`name = args.name or os.path.basename(source)`; the help says "the folder's
     name"). Consistent with the documentation; noted because the test packs here were first built with `--name` and

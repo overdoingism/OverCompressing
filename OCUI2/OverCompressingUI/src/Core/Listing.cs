@@ -28,6 +28,7 @@ public sealed class Row
     public ModelSummary? Summary;  // a model row
     public FileSummary? File;  // a file row
     public Dictionary<string, long> Blobs = new();  // a model row: sha -> stored, to sum a selection counting each once
+    public WeightMix? Weights;  // a model row: how its weights are kept (the graph's colors)
 
     public bool IsContainer => Kind is "folder" or "drive" or "pack" or "oczip" or "model";
     public string BaseChoice => File?.BaseChoice ?? Summary?.BaseChoice ?? "auto";
@@ -46,7 +47,8 @@ public sealed class Row
     };
 }
 
-public sealed record Listing(List<Row> Rows, string? Where);
+/// <summary>What a place holds, what to say about it, and (a pack listing) the pack's name and id.</summary>
+public sealed record Listing(List<Row> Rows, string? Where, PackIdentity? Identity = null);
 
 /// <summary>What a place holds, as rows: a folder from disk, a pack and a model through the tool.</summary>
 public static class Lister
@@ -126,15 +128,15 @@ public static class Lister
     public static async Task<Listing> ListPackAsync(Place place, PackReader reader)
     {
         var summary = await reader.ReadPackAsync(place.Path!);
-        // each model's blobs come with the listing (list --json "blobs"); an older tool leaves them out, then the
-        // manifests are read here instead
-        var (manifests, blobSizes) = summary.Models.Any(m => m.Blobs.Count > 0)
-            ? (new Dictionary<string, PackReader.Manifest>(), new Dictionary<string, long>())
-            : await Task.Run(() =>
-            {
-                try { return (PackReader.ReadManifests(place.Path!), PackReader.BlobSizes(place.Path!)); }
-                catch (Exception) { return (new Dictionary<string, PackReader.Manifest>(), new Dictionary<string, long>()); }
-            });
+        // the manifests are read for the weight classes (their tensor tables; list --json has no dtypes); each
+        // model's blobs come with the listing (list --json "blobs"), and an older tool that leaves them out has them
+        // read from the manifests and the blob files instead
+        bool blobsListed = summary.Models.Any(m => m.Blobs.Count > 0);
+        var (manifests, blobSizes) = await Task.Run(() =>
+        {
+            try { return (PackReader.ReadManifests(place.Path!), blobsListed ? new Dictionary<string, long>() : PackReader.BlobSizes(place.Path!)); }
+            catch (Exception) { return (new Dictionary<string, PackReader.Manifest>(), new Dictionary<string, long>()); }
+        });
         var names = summary.Models.Select(m => m.Name).ToHashSet();
         var rows = new List<Row>();
         foreach (var m in summary.Models)
@@ -152,11 +154,14 @@ public static class Lister
             else if (manifests.TryGetValue(m.Name, out var manifest))
                 foreach (var f in manifest.Files)
                     row.Blobs[f.Sha256] = blobSizes.TryGetValue(f.Sha256, out var s) ? s : 0;
+            row.Weights = manifests.TryGetValue(m.Name, out var mf) ? Weights.Of(mf) : null;
             rows.Add(row);
         }
         long size = summary.Models.Sum(m => m.Size);
-        var where = T.Get("where_pack", ("kind", summary.Kind), ("models", T.Count(rows.Count, "model")), ("size", T.SizeText(size)),
-            ("stored", T.SizeText(summary.Stored)), ("ratio", T.Percent(summary.Stored, size)), ("blobs", T.Count(summary.Blobs, "blob")));
+        var where = rows.Count > 0 || summary.Blobs > 0
+            ? T.Get("where_pack", ("kind", summary.Kind), ("models", T.Count(rows.Count, "model")), ("size", T.SizeText(size)),
+                ("stored", T.SizeText(summary.Stored)), ("ratio", T.Percent(summary.Stored, size)), ("blobs", T.Count(summary.Blobs, "blob")))
+            : T.Get("where_empty", ("kind", summary.Kind));  // a pack with nothing in it yet (init): not "0 B → 0 B ()"
         if (summary.Kept.Count > 0)
         {
             var users = summary.Kept.SelectMany(k => k.NeededBy).Distinct().OrderBy(n => n, StringComparer.Ordinal);
@@ -167,7 +172,7 @@ public static class Lister
         if (summary.Problems.Count > 0)
             where = T.Get("bad_manifests", ("count", T.Count(summary.Problems.Count, "manifest")),
                 ("first", $"{summary.Problems[0].path}: {summary.Problems[0].problem}")) + " · " + where;
-        return new Listing(rows, where);
+        return new Listing(rows, where, summary.Identity);
     }
 
     /// <summary>The rows of one model of a pack: one per file, with how it is stored and what it is coded against.</summary>

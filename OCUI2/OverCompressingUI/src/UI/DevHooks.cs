@@ -14,13 +14,21 @@ namespace OverCompressingUI.UI;
 ///   --wait=&lt;seconds&gt;    how long to wait before the screenshot (default 2.5)
 ///   --view=list|base|graph  the pack view to switch to first
 ///   --select=&lt;n&gt;        select the first n rows first
-///   --dialog=&lt;name&gt;     open a dialog first: pack, extract, export, rebase, rename, settings, remove, damage, damage-here
+///   --dialog=&lt;name&gt;     open a dialog first: pack, extract, export, rebase, rename, settings, remove, damage, damage-here,
+///                        turn (+ Turn folder into pack), newpack (+ New pack folder)
+///   --screen=WxH         pretend the display is this small (the window is fitted to it); --scale=&lt;s&gt; forces the scale
 ///   --tool=&lt;path&gt;       run this llm_archive.py instead of the one found (a test copy that fakes "does not rebuild here")
 ///   --answer=yes,no,...  the next dialogs answer themselves, in this order (a question of a job, say); the rest stay
 ///   --script=&lt;file&gt;     steps, one per line, run one after another before the screenshot: "cmd|arg|arg" (a job of the
 ///                        tool, waited for), "answer:yes,no" (queued for the dialogs to come), "cancel:&lt;s&gt;" (the next
 ///                        job is cancelled after s seconds), "flag:on|off" (an OFF file beside the --tool copy, read by
-///                        it), "shot:&lt;png&gt;", "wait:&lt;s&gt;", "go:&lt;place&gt;"; "#" starts a comment
+///                        it), "shot:&lt;png&gt;", "wait:&lt;s&gt;", "go:&lt;place&gt;", "dialog:&lt;name&gt;" (as --dialog, not waited
+///                        for), "type:&lt;text&gt;" (into the pack name field beside the path), "name:&lt;text&gt;" (typed and
+///                        submitted, as Enter would), "esc" (the field back to the pack's name), "info" (the field, the
+///                        buttons on, the title and the status line, printed), "bg:cmd|arg" (jobs not waited for),
+///                        "until-dialog" (wait for one to open), "select:&lt;n&gt;", "fill:a|b" (the open dialog's text
+///                        fields), "accept" / "dismiss" (the open dialog), "idle" (wait until nothing runs); "&lt;br&gt;" in
+///                        a text is a line break; "#" starts a comment
 ///   --stay               do not quit after the screenshot
 /// </summary>
 public static class DevHooks
@@ -160,6 +168,12 @@ public static class DevHooks
         }
     }
 
+    private static readonly HashSet<string> Ops = new()
+    {
+        "answer", "cancel", "flag", "shot", "wait", "go", "dialog", "type", "name", "esc", "info", "bg", "idle", "until-dialog",
+        "select", "pick", "fill", "accept", "dismiss", "rescale",
+    };
+
     private static async Task RunScript(MainWindow window, string path, string tool)
     {
         foreach (var raw in File.ReadAllLines(path))
@@ -169,11 +183,73 @@ public static class DevHooks
                 continue;
             GD.Print($"script: {line}");
             var colon = line.IndexOf(':');
-            var (op, arg) = colon > 0 && !line.Contains('|') ? (line[..colon], line[(colon + 1)..].Trim()) : ("", line);
+            var head = colon > 0 ? line[..colon] : line;
+            var (op, arg) = Ops.Contains(head) ? (head, colon > 0 ? line[(colon + 1)..].Trim() : "") : ("", line);
+            arg = arg.Replace("<br>", "\n");  // a line break in a text (a backslash escape would break paths)
             switch (op)
             {
+                case "bg":  // jobs started and not waited for (then "until-dialog", "select", "info", "idle" look at them running)
+                    window.DevStartJobs(arg.Split("&&").Select(j => j.Trim().Split('|')).ToList());
+                    break;
+                case "idle":
+                    await Idle(window);
+                    break;
+                case "until-dialog":
+                    while (OcDialog.Open.Count == 0)
+                        await window.ToSignal(window.GetTree(), SceneTree.SignalName.ProcessFrame);
+                    await window.ToSignal(window.GetTree().CreateTimer(0.3), SceneTreeTimer.SignalName.Timeout);
+                    break;
+                case "select":
+                    window.DevSelectFirst(int.Parse(arg));
+                    break;
+                case "rescale":  // pretend the display's scale changed (as moving to another display would)
+                    window.DevRescale(float.Parse(arg, System.Globalization.CultureInfo.InvariantCulture));
+                    await window.ToSignal(window.GetTree().CreateTimer(1.5), SceneTreeTimer.SignalName.Timeout);
+                    break;
+                case "pick":  // select the row named
+                    window.DevPick(arg);
+                    break;
+                case "fill":  // the open dialog's text fields, top to bottom, "|" apart ("" leaves one as it is)
+                {
+                    var edits = OcDialog.Open.Last().DevEdits();
+                    var texts = arg.Split('|');
+                    for (int i = 0; i < texts.Length && i < edits.Count; i++)
+                        if (texts[i].Length > 0)
+                            edits[i].Text = texts[i];
+                    await window.ToSignal(window.GetTree(), SceneTree.SignalName.ProcessFrame);
+                    break;
+                }
+                case "accept":
+                    OcDialog.Open.Last().DevAccept();
+                    await window.ToSignal(window.GetTree().CreateTimer(0.5), SceneTreeTimer.SignalName.Timeout);
+                    break;
+                case "dismiss":
+                    OcDialog.Open.Last().DevDismiss();
+                    await window.ToSignal(window.GetTree().CreateTimer(0.3), SceneTreeTimer.SignalName.Timeout);
+                    break;
                 case "answer":
                     Answers(arg);
+                    break;
+                case "dialog":
+                    window.DevOpenDialog(arg);
+                    await window.ToSignal(window.GetTree().CreateTimer(0.8), SceneTreeTimer.SignalName.Timeout);
+                    break;
+                case "type":
+                    window.DevName(arg, submit: false);
+                    await window.ToSignal(window.GetTree(), SceneTree.SignalName.ProcessFrame);
+                    break;
+                case "name":
+                    window.DevName(arg, submit: true);
+                    await window.ToSignal(window.GetTree().CreateTimer(0.5), SceneTreeTimer.SignalName.Timeout);
+                    await Idle(window);
+                    break;
+                case "esc":
+                    window.DevNameEscape();
+                    await window.ToSignal(window.GetTree(), SceneTree.SignalName.ProcessFrame);
+                    break;
+                case "info":
+                    GD.Print("info: " + window.DevNameInfo());
+                    GD.Print("window: " + window.DevWindowInfo());
                     break;
                 case "cancel":
                     _ = CancelLater(window, double.Parse(arg, System.Globalization.CultureInfo.InvariantCulture));

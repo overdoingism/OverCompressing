@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Collections.Generic;
 using Godot;
 
@@ -17,6 +18,7 @@ public static class Ui
     public static readonly Color PanelBorder = new(0f, 0.94f, 1f, 0.22f);
     public static readonly Color Text = new("#e8f1ff");
     public static readonly Color TextDim = new("#8fa3c7");
+    public static readonly Color TextNote = new("#b9dce6");  // a dialog's notes: as bright as the text but tinted cyan, so they read apart from the white labels (owner: brightness alone lost the distinction)
     public static readonly Color TextFaint = new("#5a6a8a");
     public static readonly Color Neon = new("#00f0ff");       // cyan
     public static readonly Color Neon2 = new("#ff2bd6");      // magenta
@@ -47,6 +49,38 @@ public static class Ui
         ["folder"] = new Color("#ffe600"), ["drive"] = new Color("#ffe600"), ["pack"] = new Color("#a98bff"),
         ["oczip"] = new Color("#3fc3ff"), ["model"] = new Color("#39ff14"), ["weights"] = new Color("#ff3860"), ["file"] = new Color("#9fb3d9"),
     };
+    /// <summary>The graph's fill: a scale from cold to warm as the bits a model's weights are kept in go down, nine
+    /// steps that shade the owner's five classes from within (32 a deeper blue than 16; 8 and up bluer than 6; 5
+    /// greener than 4; 3 more orange than 2 and 1); gray for what cannot be told.</summary>
+    public static readonly (float bits, Color color)[] BitsScale =
+    {
+        (32, new("#6fb8ff")), (16, new("#8fd8ff")), (8, new("#3ae6b4")), (6, new("#3ee68c")), (5, new("#e0d44a")),
+        (4, new("#ffc542")), (3, new("#ff8a3c")), (2, new("#ff5e45")), (1, new("#ff3d5a")),
+    };
+    public static readonly Color BitsUnknown = new("#8c97b0");
+
+    /// <summary>The color for weights kept in `bits` bits (null: unknown): the step at or just under them.</summary>
+    public static Color BitsColor(float? bits)
+    {
+        if (bits is null)
+            return BitsUnknown;
+        foreach (var (b, c) in BitsScale)
+            if (bits.Value >= b)
+                return c;
+        return BitsScale[^1].color;
+    }
+
+    /// <summary>A class's representative color (its legend title, a node whose dominant dtype is not known).</summary>
+    public static Color WeightColor(Core.WeightClass cls) => cls switch
+    {
+        Core.WeightClass.Lossless => BitsColor(16), Core.WeightClass.NearLossless => BitsColor(6),
+        Core.WeightClass.LowLoss => BitsColor(4), Core.WeightClass.Lossy => BitsColor(2), _ => BitsUnknown,
+    };
+
+    /// <summary>The steps of the scale that fall in a class, from the most bits down: the swatch card's bars.</summary>
+    public static (float bits, Color color)[] StepsOf(Core.WeightClass cls)
+        => BitsScale.Where(s => Core.Weights.ClassOf(s.bits) == cls).ToArray();
+
     public static readonly (string kind, string label)[] Legend =
         { ("folder", "Folder"), ("pack", "Pack folder"), ("oczip", "Pack file"), ("model", "Model"), ("weights", "Weights") };
 
@@ -55,6 +89,7 @@ public static class Ui
     public static int SmallFontSize = 12;
     public static Font Font = null!;
     public static Font Bold = null!;
+    public static Font NoteFont = null!;
     public static Font Display = null!;
     public static Font Mono = null!;
     public static Theme Theme = null!;
@@ -89,7 +124,7 @@ public static class Ui
             return sys;
         }
         font.Antialiasing = TextServer.FontAntialiasing.Gray;
-        font.Hinting = TextServer.Hinting.Light;
+        font.Hinting = TextServer.Hinting.Light;  // Normal was tried for sharpness (2026-11-02): the spacing went uneven, and the blur had another cause (OcDialog's ground)
         font.SubpixelPositioning = TextServer.SubpixelPositioning.Auto;
         font.Fallbacks = fallbacks;
         var v = new FontVariation { BaseFont = font };
@@ -127,6 +162,7 @@ public static class Ui
     {
         Font = Bundled("Exo2[wght].ttf", 500);
         Bold = Bundled("Exo2[wght].ttf", 700);
+        NoteFont = Bundled("Exo2[wght].ttf", 560);  // a touch heavier than the text: small gray lines read better (a variable font takes any weight)
         Display = Bundled("Orbitron[wght].ttf", 600);
         Mono = Bundled("ShareTechMono-Regular.ttf", 400, mono: true);
         var t = new Theme { DefaultFont = Font, DefaultFontSize = FontSize };
@@ -181,7 +217,7 @@ public static class Ui
         t.SetConstant("h_separation", "CheckBox", Px(7));
 
         // line edits
-        var edit = Flat(new Color(0, 0, 0, 0.35f), 6, new Color(Neon, 0.18f), 1, 0);
+        var edit = Flat(new Color(0.03f, 0.06f, 0.12f, 0.75f), 6, new Color(Neon, 0.42f), 1, 0);  // seen without the focus too: an empty field in a dialog was invisible on its dark card (owner, 2026-11-02)
         edit.ContentMarginLeft = edit.ContentMarginRight = Px(10);
         edit.ContentMarginTop = edit.ContentMarginBottom = Px(6);
         var editFocus = (StyleBoxFlat)edit.Duplicate();
@@ -441,7 +477,26 @@ public static class Ui
         return l;
     }
 
-    public static Label Note(string text) => Label(text, TextDim, wrap: true);
+    public static int NoteFontSize => SmallFontSize + 1;  // 13: a size down from the text, not two (12 read as strain)
+
+    /// <summary>A hint: quieter than the text and a size down, wrapped at `width` (so a dialog stays short, and a
+    /// column keeps its width).</summary>
+    public static Label Note(string text, int width = 460)
+    {
+        var l = Label(text, TextNote, wrap: true, size: NoteFontSize);
+        l.AddThemeFontOverride("font", NoteFont);
+        l.CustomMinimumSize = new Vector2(Px(width), 0);
+        return l;
+    }
+
+    /// <summary>A note on one line, beside what it explains (never wrapped).</summary>
+    public static Label Hint(string text)
+    {
+        var l = Label(text, TextNote, size: NoteFontSize);
+        l.AddThemeFontOverride("font", NoteFont);
+        l.SizeFlagsVertical = Control.SizeFlags.ShrinkCenter;
+        return l;
+    }
 
     public static Label Heading(string text) => Label(text, Text, bold: true, wrap: true, size: FontSize + 1);
 
@@ -450,6 +505,18 @@ public static class Ui
         var e = new LineEdit { Text = text, PlaceholderText = placeholder, SizeFlagsHorizontal = Control.SizeFlags.ExpandFill, ContextMenuEnabled = true };
         e.CustomMinimumSize = new Vector2(Px(320), 0);
         return e;
+    }
+
+    /// <summary>A label and its field on one row (a dialog kept short): the field takes the rest of the width.</summary>
+    public static HBoxContainer Labelled(string text, Control field)
+    {
+        var row = HBox(8);
+        row.AddChild(Label(text, Text));
+        field.SizeFlagsHorizontal = Control.SizeFlags.ExpandFill;
+        if (field is LineEdit e)
+            e.CustomMinimumSize = new Vector2(Px(200), 0);
+        row.AddChild(field);
+        return row;
     }
 
     public static HBoxContainer HBox(int sep = 6) { var h = new HBoxContainer(); h.AddThemeConstantOverride("separation", Px(sep)); return h; }

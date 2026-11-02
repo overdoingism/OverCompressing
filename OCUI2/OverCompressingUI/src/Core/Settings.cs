@@ -18,8 +18,9 @@ public sealed class Settings
     public string ExtractLayout { get; set; } = "last";
     public string ViewMode { get; set; } = "list";
     public string? LastPlace { get; set; }
-    public int WindowWidth { get; set; }
+    public int WindowWidth { get; set; }  // in canvas units (the display's scale taken out), since 0.7; pixels before
     public int WindowHeight { get; set; }
+    public float WindowScale { get; set; }  // the scale the size was saved at: 0 means an older file, in pixels
     public bool WindowMaximized { get; set; }
     public float LogShare { get; set; } = 0.26f;
     public string SortBy { get; set; } = "name";

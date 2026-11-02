@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 
@@ -11,7 +12,15 @@ public sealed class Place
     public const string Oczip = ".oczip";
     public const string Marker = "ocpack.json";
     public const string LockName = ".overcompressing.lock";
+    public const string Kit = "_kit";
     public static readonly string[] WeightSuffixes = { ".safetensors", ".sft", ".gguf", ".bin", ".pt", ".pth", ".ckpt", ".onnx", ".h5", ".msgpack" };
+    /// <summary>What systems leave in folders (compared ignoring case): not content, so a folder holding only these can
+    /// become a pack (the tool's LEFT_BY_SYSTEMS; names starting with ".trash-" too).</summary>
+    public static readonly HashSet<string> LeftBySystems = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "thumbs.db", "ehthumbs.db", "desktop.ini", ".ds_store", ".directory", "$recycle.bin", "lost+found",
+        "system volume information", ".spotlight-v100", ".fseventsd", ".trashes",
+    };
 
     public string? Path { get; }
     public bool Pack { get; }
@@ -146,6 +155,34 @@ public sealed class Place
         return $"{path} is inside the pack folder {inside}";
     }
 
+    /// <summary>Why `root` cannot become a pack folder (the tool's new_pack_problem, for the dialogs to say so before a
+    /// run; the tool judges last): it is a pack folder already, lies inside one, is a file, or holds anything but _kit,
+    /// the lock and what systems leave in folders. Null if it can: it need not exist.</summary>
+    public static string? NewPackProblem(string root)
+    {
+        root = NormPath(root).TrimEnd('\\', '/');
+        if (File.Exists(System.IO.Path.Combine(root, Marker)))
+            return $"{root} is a pack folder already";
+        if (PackFolderOf(root) is { } inside)
+            return $"{root} is inside the pack folder {inside}: pack into that pack folder, or one of its own";
+        if (File.Exists(root))
+            return $"{root} is not a folder";
+        if (Directory.Exists(root))
+        {
+            List<string> others;
+            try
+            {
+                others = Directory.EnumerateFileSystemEntries(root).Select(p => System.IO.Path.GetFileName(p))
+                    .Where(n => n != Kit && n != LockName && !LeftBySystems.Contains(n) && !n.StartsWith(".trash-", StringComparison.OrdinalIgnoreCase))
+                    .OrderBy(n => n, StringComparer.Ordinal).ToList();
+            }
+            catch (Exception e) { return $"{root}: {e.Message}"; }
+            if (others.Count > 0)
+                return $"{root} is not a pack folder (no {Marker} in it) and holds other files, e.g. {others[0]}: give a new or empty folder";
+        }
+        return null;
+    }
+
     /// <summary>Whether `path` lies inside `folder` (or is it).</summary>
     public static bool Holds(string folder, string path)
     {
@@ -199,6 +236,29 @@ public static class Rules
         }
         if (repo.Replace("/", "__").Length > 200)
             return $"bad model name '{repo}': too long";
+        return null;
+    }
+
+    public const int PackNameMax = 100;  // characters: of a pack's name (the tool's PACK_NAME_MAX)
+
+    /// <summary>Null if `name` can name a pack (the tool's pack_name_problem), else why not: it is only ever shown, so
+    /// any text will do that shows as one line.</summary>
+    public static string? PackNameProblem(string? name)
+    {
+        if (string.IsNullOrEmpty(name))
+            return "a pack name cannot be empty";
+        if (name != name.Trim())
+            return $"bad pack name '{name}': it may not start or end with a space";
+        if (name.EnumerateRunes().Count() > PackNameMax)
+            return $"bad pack name '{name}': at most {PackNameMax} characters";
+        foreach (var r in name.EnumerateRunes())
+        {
+            var c = System.Text.Rune.GetUnicodeCategory(r);
+            if (c is System.Globalization.UnicodeCategory.Control or System.Globalization.UnicodeCategory.Format or System.Globalization.UnicodeCategory.Surrogate
+                or System.Globalization.UnicodeCategory.PrivateUse or System.Globalization.UnicodeCategory.OtherNotAssigned
+                or System.Globalization.UnicodeCategory.LineSeparator or System.Globalization.UnicodeCategory.ParagraphSeparator)
+                return $"bad pack name '{name}': it may not hold control characters or line breaks";
+        }
         return null;
     }
 

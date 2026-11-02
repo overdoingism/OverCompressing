@@ -44,8 +44,8 @@ it as garbage. The fonts are imported resources: a first run from the editor bin
 The window is checked by running it and reading a screenshot. From `OverCompressingUI/`: `dotnet build -c Debug`, then
 `engine\godot\...\Godot_v4.7.2-stable_mono_win64_console.exe --path . ++ <place> --shot=<png> --wait=<s>`. Everything
 after `++` is the window's (`DevHooks.cs`): a place to start in, then `--view=list|base|graph`, `--select=<n>`,
-`--dialog=pack|extract|export|rebase|rename|remove|verify|settings|busy|damage`, `--job=cmd|arg|arg`, `--cancel=<s>`,
-`--menu`, `--trash=<path>`, `--shot2=<png> --wait2=<s>`, `--scale=<f>`, `--go=<place>`, `--close`, `--tool=<llm_archive.py>` (a test
+`--dialog=pack|extract|export|rebase|rename|remove|verify|settings|busy|damage|damage-here|turn|newpack`, `--job=cmd|arg|arg`, `--cancel=<s>`,
+`--menu`, `--trash=<path>`, `--shot2=<png> --wait2=<s>`, `--scale=<f>`, `--screen=WxH` (a display pretended that small), `--go=<place>`, `--close`, `--tool=<llm_archive.py>` (a test
 copy of the tool, the settings untouched), `--answer=yes,no@shot.png,...` (the next dialogs answer themselves, after a screenshot each), `--script=<file>` (jobs,
 answers, cancels and screenshots one per line; the comment at the top of `DevHooks.cs` has the words). Do that after
 every change, at 100 % and at a high display scale; drive dialogs through their buttons or `--answer`, not through keys.
@@ -74,6 +74,50 @@ free bandwidth on a dozen clones while every rebuild stayed in the history for g
   (`exact_slow`, with the count so far): the tool's progress stands still for minutes there, and a cut line is not enough.
 - Synced with upstream through format 5 (CLI 0.6). The Tkinter window (`../tools/llm_archive_gui.py`) is the
   reference for behaviour and words; `inexact` is `code`, never text.
+- The graph's colors (owner, 2026-11-02): a node's fill is a nine-step scale by the nominal bits of the dtype most
+  of its weights are in (`Ui.BitsScale`, `Core/Weights.cs`, from the manifests' tensor tables; counted as numbers by
+  each tensor's shape, since a small model's 8-bit embedding takes most of a Q4 file's bytes), cold to warm as the
+  bits go down and shading the owner's five classes from within: ≥ 16-bit (32 a deeper blue than 16), 6–15-bit
+  (8 and up, FP8 included, bluer than 6), 4–5-bit (5 greener than 4), < 4-bit (3 more orange than 2 and 1), other
+  gray (no weights, a .bin/.pt without a table, an unknown type). The classes are named by their bits only: the
+  words lossless / lossy were the owner's and Claude's while discussing, not for the window (a model trained at that
+  precision is not lossy). The class is
+  the majority of the weights; the shade is the leading dtype within it (`WeightMix.Bits`). The ring is the
+  container: safetensors solid, GGUF a ring of dashes that turns with a brightness running round it, other a faint
+  dotted ring (`GraphView.DrawContainerRing`; the owner wanted the kinds told apart by motion, not a dead style). The
+  key is the ◧ Colors word's card, which follows the view (`ShowLegend`, `_legendFor`): in the graph a swatch card,
+  a bar per class blended between its steps with the bits under them (`Swatch`), and a sample node per container,
+  the GGUF one turning (`RingSample`); in a list the row kinds as before. The graph's bottom strip keeps only the
+  hint, and the card is no wider than its bars. The Colors word itself takes the hue its frame cycles through
+  (owner). A node carries what the model takes on disk, a small arrow down with the ratio beside it, and what it
+  takes in the pack (`DrawSizes`; a lone percentage read as dull); the tooltip and the panel name the container and
+  the dtype shares (`WeightMix.Shares`), not the class (the color is the hint, the owner said) nor the sizes. GPTQ/AWQ packed weights
+  (I32 tensors named `qweight`) count as 4-bit. The manifests are read for every pack listing now.
+- Synced with upstream through CLI 0.7 (pack folders made and named; 2026-11-02): `init <folder> [--name]` and
+  `name <pack> (--to NAME | --none)` run as jobs; `list --json` carries `name`, `id`, `label` (`PackIdentity`), which the
+  window shows and never writes itself. A folder view has **+ Pack to, + Turn folder into pack, + New pack folder**
+  (the owner's order), the latter two acting on the place (on wherever Pack to can be used); Turn says why a folder
+  cannot become a pack (`Place.NewPackProblem`, the tool's rule: empty but for `_kit`, the lock and what systems leave
+  in folders, no pack above) before any dialog, New pack refuses an empty, path-like or taken folder name in the
+  dialog. Beside the path, in every place, a field of one width (`NoteWidth`, 28 characters, centered) shows the
+  pack's name, or in gray its short id (`unnamed` for a pack without one), editable in a pack folder (and its models),
+  read-only in a pack file, empty and off elsewhere; ✎ Rename pack beside it is on while the text is a change
+  (`NameChange`; the empty field and the short id are none without a name), Enter or the button runs `name`, Esc puts
+  the name back, a name too long for the field shows whole on hover; the window's title ends with ` [label]`. The
+  mode chip has one width in every place (`_chipWidth`, the widest word), so the buttons start where they did. The
+  pack dialog has "Name of a new pack (optional)" (`--pack-name`, refused in the dialog for a pack folder that is
+  there: `pack_name_held`). An empty pack's line reads `where_empty`. `JobRunner.Running` is true from `Start` to the
+  batch's end (not only while a child process exists): a button update in the gap before the first process, while a
+  failed job's question is up, or between jobs (a selection, the watch, the name field) must turn nothing on (the
+  downstream team found that gap on the Tkinter window); a cancel while the question is up ends the batch once it is
+  answered. The window's size is kept in canvas units with the scale it was saved at (`WindowScale`; an older file's
+  pixels are taken as at this scale) and fitted to the display it opens on (`FitToScreen`); once a second
+  (`WatchDisplay`) the display's scale is read again, and a change (another display, or the system's scaling changed
+  underneath) redraws everything at the new scale (`Rescale`: the canvas scale, the cursors, every icon re-rendered in
+  place by `Icons.Reset`, the board's cells) at the same size to the eye, kept within the display; a display grown
+  smaller shrinks the window into it. Dev hooks for all this: `--dialog=turn|newpack`, `--screen=WxH`, and the script
+  words `type:`, `name:`, `esc`, `info`, `bg:`, `until-dialog`, `select:`, `pick:`, `fill:`, `accept`, `dismiss`,
+  `idle`, `rescale:`.
 - Every change runs `python -I -X utf8 -u -c <runner> <tools dir> <command...> --json --progress` in a child process
   at below-normal priority (`CliProcess`); the runner is the Tkinter window's `RUNNER`, verbatim: closing the child's
   stdin cancels as Ctrl+C would, "Stop now" is `taskkill /T /F`. Output is read on threads and drained each frame.
@@ -84,10 +128,31 @@ free bandwidth on a dozen clones while every rebuild stayed in the history for g
 
 ## Rules kept from the original window
 
+- Dialogs are wide and flat, not tall (owner, 2026-11-02: at 175 % on a 1080p display the pack dialog ran off the
+  window, and once it fitted, its glow was cut at the edges): the pack dialog is two columns (`AskPack`: the model and
+  where it goes at the left, the new pack's name and the options at the right), a label and its field share a row
+  where that reads well (`Ui.Labelled`), notes are a size down (13 px, `Ui.NoteFontSize`; 12 read as strain), a touch heavier (`Ui.NoteFont`, weight 560:
+  the fonts are variable, so any weight goes, not only regular and bold) in `Ui.TextNote` (#cad5ea, a shade under the
+  text: the owner found `TextDim` and then #b4c3de too dark there) and wrapped to their column
+  (`Ui.Note(text, width)`), and a text field shows its edge without the focus (the theme's LineEdit `normal`: an empty
+  field on the dark card was invisible until clicked),
+  gaps are 2–6 px, and the damage report's text box asks for 240 px, not 380. As a safety net every `OcDialog` fits
+  itself to the window (`Fit`): one that would be taller goes into a scroll box sized to what is left, so OK and
+  Cancel stay in reach; and it is kept within the window with its glow whole, below the title bar and the frame's
+  shadow all round (`Keep`, `Glow`). Every dialog looked soft, "as if through a filter" (owner, 2026-11-02): an embedded window is a see-through viewport,
+  and glyphs drawn onto nothing get their antialiased edges blended twice (with transparent black, then over the frame),
+  a dark halo round every letter. `OcDialog` now draws an opaque ground inside (`PanelSolid`, rounded at the bottom as
+  the frame is), so text blends once; the viewport stays transparent so the frame's corners and glow show. Measured on
+  the same label: edge contrast 30 → 34, the halo gone. Not the cause, tried and dropped: font oversampling (already at
+  the display's scale; off made it worse), `Normal` hinting (uneven spacing), whole-pixel positioning, LCD antialiasing,
+  a dark rim. Check dialogs with `--scale=1.75 --screen=1920x1040` (`--dialog=packin` opens the
+  pack dialog in its + Pack in form without the native folder picker).
+
 Text is Unicode symbols where they say it (BMP only), else English; no localization. Dialogs: a bold first line, gray
 notes, a red line kept for errors, a path on a line of its own shortened from the middle, lists at most 5 names and
-"and N more", facts first and the question last, no "…" on buttons. One rule for button states: Refresh, Pack in and
-Add file always usable where the place can be changed; every other button acts on the selection and is off while
+"and N more", facts first and the question last, no "…" on buttons. One rule for button states: Refresh, Pack in,
+Add file, Turn folder into pack and New pack folder act on the place, so they are always usable where the place can be
+changed; every other button acts on the selection and is off while
 nothing is; nothing selected never means everything. The list watches one time stamp every 5 s and on mouse activity
 after that long, never while a job runs or a dialog is open; F5 lists again at once. − Remove in a folder goes to the
 Recycle Bin, never deletes for good. Verify's damage marks live in memory only and only while the pack's stamp is as

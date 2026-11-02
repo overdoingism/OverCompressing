@@ -11,13 +11,16 @@ namespace OverCompressingUI.Core;
 /// </summary>
 public static class T
 {
-    public const string GuiVersion = "0.6";
+    public const string GuiVersion = "0.7";
 
     private static readonly Dictionary<string, string> Texts = new()
     {
         ["up"] = "↑",
         ["drives"] = "Drives",
         ["pack_to"] = "+ Pack to",
+        ["new_pack"] = "+ New pack folder",
+        ["turn_pack"] = "+ Turn folder into pack",
+        ["name_pack"] = "✎ Rename pack",
         ["pack_in"] = "+ Pack in",
         ["add_file"] = "+ Add file",
         ["save"] = "⤓ Save .oczip",
@@ -28,6 +31,20 @@ public static class T
         ["refresh"] = "↻ Refresh",
         ["hint_keys"] = "F5 Force refresh · Ctrl+A Select all",
         ["mode_in_file"] = "in pack file",
+        ["unnamed"] = "unnamed",
+        ["new_pack_what"] = "A new pack folder in:",
+        ["turn_pack_what"] = "Turn this folder into a pack:",
+        ["folder_prompt"] = "Folder name:",
+        ["pack_name_prompt"] = "Pack name (optional):",
+        ["pack_name_note"] = "Only ever shown. Without one, the pack is shown by a short hash.",
+        ["pack_name_to"] = "Name of a new pack (optional):",
+        ["pack_name_held"] = "That pack folder has its name already: ✎ Rename pack changes it.",
+        ["need_folder"] = "Enter a name for the folder.",
+        ["folder_bad"] = "A folder name only, with no path in it.",
+        ["folder_exists"] = "That name is taken in this folder.",
+        ["making_pack"] = "▶ Making the pack {name}",
+        ["done_make_pack"] = "✔ {path} is a pack now. + Pack in puts models in it.",
+        ["naming_pack"] = "▶ Naming the pack",
         ["cancel"] = "✕ Cancel",
         ["stop_now"] = "✕ Stop now",
         ["ok"] = "OK",
@@ -57,6 +74,7 @@ public static class T
         ["removed"] = "{name} (removed)",
         ["shared"] = "= also in {models}",
         ["where_pack"] = "{kind} · {models} · {size} → {stored} ({ratio}) · {blobs}",
+        ["where_empty"] = "{kind} · no models yet",
         ["selected"] = "{count} selected: {size} → {stored} ({ratio})",
         ["selected_size"] = "{count} selected: {size}",
         ["selected_count"] = "{count} selected",
@@ -238,9 +256,21 @@ public static class T
         ["settings_sounds"] = "♪ Sounds",
         ["graph_hint"] = "Drag nodes · wheel zooms · drag the space to pan · double-click opens",
         ["graph_legend"] = "Arrow: feeds its bytes to (width: the share read)",
+        ["wclass_lossless"] = "≥ 16-bit",  // the graph's fill: by the weights' dtype (owner's classes; the bits only: a
+        ["wclass_near"] = "6–15-bit",      // model trained at that precision is not "lossy", the owner said)
+        ["wclass_low"] = "4–5-bit",
+        ["wclass_lossy"] = "< 4-bit",
+        ["wclass_other"] = "other",
+        ["ring_safetensors"] = "safetensors",  // the graph's ring: by the container
+        ["ring_gguf"] = "GGUF",
+        ["ring_other"] = "other",
+        ["graph_weights"] = "Weights",
         ["log_title"] = "Output",
         ["legend"] = "◧ Colors",
         ["legend_note"] = "Rows of the list are tinted by what they are:",
+        ["legend_graph"] = "A node is filled by the bits most of its weights are kept in:",  // the graph's key
+        ["legend_rings"] = "Its ring is the container:",
+        ["legend_rows_graph"] = "",
         ["legend_selected"] = "Selected",
         ["watch_gone"] = "The place shown is gone: showing the nearest one still there.",
         ["open_folder"] = "Open folder",

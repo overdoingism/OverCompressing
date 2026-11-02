@@ -105,11 +105,13 @@ public sealed class PackReader
 
     // ------------------------------------------------------------------------------------------ manifests
 
-    public sealed record ManifestFile(string Path, long Size, string Sha256);
+    public sealed record ManifestTensor(string Name, string Dtype, long Bytes, long Elements);
+    public sealed record ManifestFile(string Path, long Size, string Sha256, string? Format, List<ManifestTensor> Tensors);
     public sealed record Manifest(string Name, List<ManifestFile> Files);
 
-    /// <summary>The manifests of a pack folder or pack file, by model name: models/*.json read as plain JSON (name
-    /// and files only). Bad ones are left out, as the tool leaves them out of its listing.</summary>
+    /// <summary>The manifests of a pack folder or pack file, by model name: models/*.json read as plain JSON (name,
+    /// files, and each parsed file's format and tensor table: [name, dtype, start, end, shape], for the weight
+    /// classes). Bad ones are left out, as the tool leaves them out of its listing.</summary>
     public static Dictionary<string, Manifest> ReadManifests(string path)
     {
         var result = new Dictionary<string, Manifest>();
@@ -144,7 +146,20 @@ public sealed class PackReader
                 return;
             var m = new Manifest(o["name"]!.ToString(), new List<ManifestFile>());
             foreach (var f in files.OfType<JsonObject>())
-                m.Files.Add(new ManifestFile(f["path"]?.ToString() ?? "", Json.Long(f["size"]) ?? 0, f["sha256"]?.ToString() ?? ""));
+            {
+                var tensors = new List<ManifestTensor>();
+                if (f["tensors"] is JsonArray table)
+                    foreach (var t in table.OfType<JsonArray>())
+                        if (t.Count >= 4 && Json.Long(t[2]) is { } start && Json.Long(t[3]) is { } end)
+                        {
+                            long elements = 1;
+                            if (t.Count >= 5 && t[4] is JsonArray shape)
+                                foreach (var d in shape)
+                                    elements *= Math.Max(Json.Long(d) ?? 1, 1);
+                            tensors.Add(new ManifestTensor(t[0]?.ToString() ?? "", t[1]?.ToString() ?? "", Math.Max(end - start, 0), elements));
+                        }
+                m.Files.Add(new ManifestFile(f["path"]?.ToString() ?? "", Json.Long(f["size"]) ?? 0, f["sha256"]?.ToString() ?? "", f["format"]?.ToString(), tensors));
+            }
             result[m.Name] = m;
         }
         catch (Exception) { }
