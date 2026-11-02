@@ -41,13 +41,14 @@ own Python, packages and docs, in one folder) can travel with each pack, so it c
 All results are verified by decoding from disk and matching the original SHA-256 (for these tests, also the
 hashes Hugging Face publishes).
 
-![A pack of 11 models as a graph: arrows from each base to the models stored as deltas against it, each circle the share of its own size a model takes](img/graph.jpg)
+![A pack of 9 models as a graph: arrows from each base to the models stored against it, each circle the share of its own size a model takes](img/graph.jpg)
 
-A real pack, 11 models, packed by an earlier version: 60.4 GiB of files in 37.9 GiB (drawn by [OCUI2](#ocui2--第二視窗)). Each arrow runs from a
-base to a model stored as a delta against it; each circle is what that model takes, as a share of its own size.
-Qwen2.5-0.5B-Instruct (selected) reads 99 % of Qwen2.5-0.5B and takes 44.0 % (953.3 MiB → 419.5 MiB); three community
-fine-tunes are stored against it in turn, at 0.4 – 5.3 %. A quantized GGUF with no relative in the pack
-(granite-4.2-30b-GGUF) stands on its own and barely shrinks (99.6 %).
+A real pack, 9 models packed by this version: 9.0 GiB of files in 2.2 GiB (24.6 %), drawn by [OCUI2](#ocui2--第二視窗). Each
+arrow runs from a base to a model stored against it; each circle is what that model takes, as a share of its own size.
+Qwen2.5-0.5B alone takes 65.6 %, its Instruct as a delta 44.0 %. Against the Instruct, a BF16 re-upload takes 0.4 % and
+an abliterated copy 2.1 %; mradermacher's three GGUFs (selected; BF16, Q8_0 and Q4_K_M, 1.8 GiB) take 9.6 %, the BF16
+one matched to the safetensors, the quantized ones rebuilt from them. whisper-base has no relative in the pack and
+stands alone (42.0 %).
 
 → **[Benchmarks](docs/benchmarks.md)**
 
@@ -118,10 +119,10 @@ ever shown; without one, a pack is shown by a short id.
 
 ## The window / 視窗
 
-A small window (Tkinter) does most of what the commands do: browse folders and packs, pack, extract, verify, remove,
-rename, rebase, save a pack file.
+A small window (Tkinter) does most of what the commands do: browse folders and packs, make and name a pack, pack,
+extract, verify, remove, rename, rebase, save a pack file.
 
-![The window: a pack folder listed as its models, what each needs, and the log of a command it ran](img/TheGUI.jpg)
+![The window: the pack above, named Demo, listed as its models with what each needs, while one of them is verified](img/TheGUI.jpg)
 
 What it needs to start:
 
